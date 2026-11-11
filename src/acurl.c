@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include "structmember.h"
 
 #define NO_ACTIVE_TIMER_ID -1
@@ -62,8 +63,67 @@ typedef struct {
 } EventLoop;
 
 typedef struct {
+    CURLSH *share;
+    pthread_mutex_t locks[CURL_LOCK_DATA_LAST];
+    atomic_int refs;
+} Share;
+
+typedef struct {
+    CURL *curl;
+    Share *share;
+} CleanupItem;
+
+static void share_lock(CURL *handle, curl_lock_data data, curl_lock_access access, void *userptr) {
+    pthread_mutex_lock(&((Share *)userptr)->locks[data]);
+}
+
+static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
+    pthread_mutex_unlock(&((Share *)userptr)->locks[data]);
+}
+
+static Share *share_new(void) {
+    Share *share = calloc(1, sizeof(Share));
+    if (share == NULL) {
+        return NULL;
+    }
+    share->share = curl_share_init();
+    if (share->share == NULL) {
+        free(share);
+        return NULL;
+    }
+    for (int i = 0; i < CURL_LOCK_DATA_LAST; i++) {
+        pthread_mutex_init(&share->locks[i], NULL);
+    }
+    atomic_init(&share->refs, 1);
+    curl_share_setopt(share->share, CURLSHOPT_LOCKFUNC, share_lock);
+    curl_share_setopt(share->share, CURLSHOPT_UNLOCKFUNC, share_unlock);
+    curl_share_setopt(share->share, CURLSHOPT_USERDATA, share);
+    curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
+    curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    return share;
+}
+
+static void share_incref(Share *share) { atomic_fetch_add(&share->refs, 1); }
+
+static void share_decref(Share *share) {
+    if (atomic_fetch_sub(&share->refs, 1) != 1) {
+        return;
+    }
+    CURLSHcode rc = curl_share_cleanup(share->share);
+    if (rc != CURLSHE_OK) {
+        fprintf(stderr, "acurl: curl_share_cleanup failed: %s\n", curl_share_strerror(rc));
+        return;
+    }
+    for (int i = 0; i < CURL_LOCK_DATA_LAST; i++) {
+        pthread_mutex_destroy(&share->locks[i]);
+    }
+    free(share);
+}
+
+typedef struct {
     PyObject_HEAD EventLoop *loop;
-    CURLSH *shared;
+    Share *shared;
 } Session;
 
 /* Node in a linked list structure. Used for piecing together sections of resposnes e.g. headers and body.
@@ -119,7 +179,9 @@ static void Response_dealloc(Response *self) {
     DEBUG_PRINT("response=%p", self);
     free_buffer_nodes(self->header_buffer);
     free_buffer_nodes(self->body_buffer);
-    write(self->session->loop->curl_easy_cleanup_write, &self->curl, sizeof(CURL *));
+    CleanupItem item = {self->curl, self->session->shared};
+    share_incref(item.share);
+    write(self->session->loop->curl_easy_cleanup_write, &item, sizeof(item));
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -358,7 +420,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     REQUEST_TRACE_PRINT("start_request", rd);
     DEBUG_PRINT("read AcRequestData");
     rd->curl = curl_easy_init();
-    curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->session->shared);
+    curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->session->shared->share);
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
@@ -418,14 +480,15 @@ void stop_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int
 /* Used to cleanup curl handles by putting the handle back on a pipe to be picked up and cleaned up */
 
 void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
-    CURL *curl;
+    CleanupItem item;
     while (true) {
-        int b_read = read(fd, &curl, sizeof(CURL *));
+        int b_read = read(fd, &item, sizeof(item));
         if (b_read == -1) {
             break;
         }
-        DEBUG_PRINT("curl=%p", curl);
-        curl_easy_cleanup(curl);
+        DEBUG_PRINT("curl=%p", item.curl);
+        curl_easy_cleanup(item.curl);
+        share_decref(item.share);
     }
 }
 
@@ -624,7 +687,9 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyObject *error = PyUnicode_FromString(curl_easy_strerror(rd->result));
             free_buffer_nodes(rd->header_buffer_head);
             free_buffer_nodes(rd->body_buffer_head);
-            curl_easy_cleanup(rd->curl);
+            CleanupItem item = {rd->curl, rd->session->shared};
+            share_incref(item.share);
+            write(rd->session->loop->curl_easy_cleanup_write, &item, sizeof(item));
             Py_DECREF(rd->session);
 
             PyTuple_SET_ITEM(tuple, 0, error);
@@ -709,16 +774,19 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 
     Py_INCREF(loop);
     self->loop = loop;
-    self->shared = curl_share_init();
-    curl_share_setopt(self->shared, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
-    curl_share_setopt(self->shared, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-    curl_share_setopt(self->shared, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    self->shared = share_new();
+    if (self->shared == NULL) {
+        Py_DECREF(self);
+        return PyErr_NoMemory();
+    }
     return (PyObject *)self;
 }
 
 static void Session_dealloc(Session *self) {
     DEBUG_PRINT("response=%p", self);
-    curl_share_cleanup(self->shared);
+    if (self->shared != NULL) {
+        share_decref(self->shared);
+    }
     Py_XDECREF(self->loop);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
