@@ -139,3 +139,27 @@ def test_session_connection_limits(url, limits, hosts, queued):
     s.close()
     el.stop()
     loop.close()
+
+
+def test_context_managers(url):
+    loop = asyncio.new_event_loop()
+
+    async def main():
+        async with acurl.EventLoop(loop=loop) as el:
+            async with el.session(connections="session") as s:
+                assert (await s.get(url)).status_code == 200
+            with pytest.raises(RuntimeError):
+                await s.get(url)
+            assert wait_for_connections(0) == 0
+            with el.session() as s2:
+                assert (await s2.get(url)).status_code == 200
+        return el
+
+    el = loop.run_until_complete(main())
+    el._thread.join(2)
+    assert not el._thread.is_alive()
+    with acurl.EventLoop(loop=loop) as el:
+        pass
+    el._thread.join(2)
+    assert not el._thread.is_alive()
+    loop.close()

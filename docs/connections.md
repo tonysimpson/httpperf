@@ -69,10 +69,8 @@ session = el.session()
 A browser, new visitor, one session per journey:
 
 ```python
-el = acurl.EventLoop()
-session = el.session(connections="session", tls="session", max_host_connections=6)
-...
-session.close()
+async with el.session(connections="session", tls="session", max_host_connections=6) as session:
+    ...
 ```
 
 6 per host is the usual browser limit for HTTP/1.1. Over HTTP/2 the session uses one connection per host.

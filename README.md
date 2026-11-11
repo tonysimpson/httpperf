@@ -36,12 +36,10 @@ import acurl
 
 
 async def main():
-    el = acurl.EventLoop()
-    session = el.session()
-    r = await session.get("https://example.com/")
-    print(r.status_code, r.http_version, r.total_time, r.client_lag)
-    session.close()
-    el.stop()
+    async with acurl.EventLoop() as el:
+        async with el.session() as session:
+            r = await session.get("https://example.com/")
+            print(r.status_code, r.http_version, r.total_time, r.client_lag)
 
 
 asyncio.run(main())
@@ -62,7 +60,7 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 | `max_total_connections` | Process-wide cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 
-`el.stop()` stops the curl thread. Requests still in flight are abandoned.
+`el.stop()` stops the curl thread. Requests still in flight are abandoned. `with` and `async with` call `stop()` on exit.
 
 ### `el.session(...)`
 
@@ -83,7 +81,7 @@ Cookies always belong to the session, whatever the connection settings. See [doc
 
 - `await session.get(url, **kwargs)`, and likewise `post`, `put`, `patch`, `delete`, `head` and `options`.
 - `await session.request(method, url, **kwargs)`.
-- `session.close()`: closes the session's connections once its requests finish. Later requests raise `RuntimeError`.
+- `session.close()`: closes the session's connections once its requests finish. Later requests raise `RuntimeError`. `with` and `async with` call it on exit.
 - `session.cookies()`: the cookie jar as a dict.
 - `await session.get_cookie_list()`, `await session.add_cookie_list(cookies)`, `await session.erase_all_cookies()` and `await session.erase_session_cookies()`: work with `Cookie` objects.
 - `session.set_response_callback(callback)`: called with each `Response`, including each hop of a redirect.

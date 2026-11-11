@@ -395,6 +395,18 @@ class Session:
     def close(self):
         self._session.close()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        self.close()
+
     def cookies(self):
         return _cookie_list_to_cookie_dict(parse_cookie_string(c) for c in self._session.get_cookielist())
 
@@ -596,6 +608,18 @@ class EventLoop:
             self._ae_loop.stop()
 
     def __del__(self):
+        self.stop()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.stop()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
         self.stop()
 
     def _complete(self):
