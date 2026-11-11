@@ -27,9 +27,9 @@ def _await(awaitable):
 def test_get(httpbin):
     s = session()
     r = _await(s.get(httpbin.url + "/ip"))
-    r.status_code
-    r.headers
-    r.json
+    assert r.status_code == 200
+    assert r.headers["Content-Type"] == "application/json"
+    assert r.json()["origin"] == "127.0.0.1"
 
 
 def test_cookies(httpbin):
@@ -40,7 +40,7 @@ def test_cookies(httpbin):
 
 def test_session_cookies(httpbin):
     s = session()
-    r = _await(s.get(httpbin.url + "/cookies/set?name=value"))
+    _await(s.get(httpbin.url + "/cookies/set?name=value"))
     cookie_list = _await(s.get_cookie_list())
     assert len(cookie_list) == 1
     assert cookie_list[0].name == "name"

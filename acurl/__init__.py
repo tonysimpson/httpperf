@@ -1,7 +1,6 @@
 import asyncio
 import threading
 import time
-from collections import namedtuple
 from urllib.parse import urlparse
 
 import _acurl
@@ -307,7 +306,7 @@ class Response:
     @property
     def headers_tuple(self):
         if not hasattr(self, "_headers_tuple"):
-            self._headers_tuple = tuple(tuple(l.split(": ", 1)) for l in self.header.split("\r\n")[1:-2])
+            self._headers_tuple = tuple(tuple(line.split(": ", 1)) for line in self.header.split("\r\n")[1:-2])
         return self._headers_tuple
 
     @property
