@@ -738,7 +738,11 @@ static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
     ENTER();
-    write(((EventLoop *)self)->stop_write, '\0', 1);
+    if (write(((EventLoop *)self)->stop_write, "\0", 1) != 1) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        EXIT();
+        return NULL;
+    }
     Py_INCREF(Py_None);
     EXIT();
     return Py_None;

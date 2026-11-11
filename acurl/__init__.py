@@ -519,6 +519,8 @@ class EventLoop:
 
     def stop(self):
         if self._running:
+            if not self._loop.is_closed():
+                self._loop.remove_reader(self._ae_loop.get_out_fd())
             self._ae_loop.stop()
 
     def __del__(self):
