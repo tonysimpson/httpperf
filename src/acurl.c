@@ -217,6 +217,8 @@ typedef struct AcRequestData {
     char *auth;
     char *cert_file;
     char *key_file;
+    bool verify;
+    char *ca_file;
     PyObject *cookies;
     int cookies_len;
     char **cookies_str;
@@ -746,8 +748,14 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)rd->req_data_len);
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDS, (char *)rd->req_data_buf);
     }
-    curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    if (rd->verify) {
+        if (rd->ca_file != NULL) {
+            curl_easy_setopt(rd->curl, CURLOPT_CAINFO, rd->ca_file);
+        }
+    } else {
+        curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
     curl_easy_setopt(rd->curl, CURLOPT_PRIVATE, rd);
     curl_easy_setopt(rd->curl, CURLOPT_WRITEFUNCTION, body_callback);
     curl_easy_setopt(rd->curl, CURLOPT_WRITEDATA, rd);
@@ -768,6 +776,8 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     rd->cert_file = NULL;
     free(rd->key_file);
     rd->key_file = NULL;
+    free(rd->ca_file);
+    rd->ca_file = NULL;
     free(rd->cookies_str);
     if (rd->slot != NULL && !slot_free(rd->share, rd->slot)) {
         rd->queued_at = monotonic_time();
@@ -1238,11 +1248,12 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     Py_ssize_t req_data_len = 0;
     char *req_data_buf = NULL;
     PyObject *cert = Py_None;
+    PyObject *verify = Py_False;
 
-    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "cert", NULL};
+    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "cert", "verify", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|O", kwlist, &future, &method, &url, &headers, &auth,
-                                     &cookies, &req_data_buf, &req_data_len, &cert)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OO", kwlist, &future, &method, &url, &headers, &auth,
+                                     &cookies, &req_data_buf, &req_data_len, &cert, &verify)) {
         return NULL;
     }
 
@@ -1307,6 +1318,20 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         CHECK_ALLOC(rd->cert_file);
         CHECK_ALLOC(rd->key_file);
     }
+    if (verify == Py_True) {
+        rd->verify = true;
+    } else if (PyUnicode_CheckExact(verify)) {
+        const char *ca_file = PyUnicode_AsUTF8(verify);
+        if (ca_file == NULL) {
+            goto error_cleanup;
+        }
+        rd->verify = true;
+        rd->ca_file = strdup(ca_file);
+        CHECK_ALLOC(rd->ca_file);
+    } else if (verify != Py_False) {
+        PyErr_SetString(PyExc_ValueError, "verify should be True, False or a CA bundle path");
+        goto error_cleanup;
+    }
     if (cookies != Py_None) {
         Py_INCREF(cookies);
         rd->cookies = cookies;
@@ -1368,6 +1393,7 @@ error_cleanup:
     }
     free(rd->cert_file);
     free(rd->key_file);
+    free(rd->ca_file);
     if (rd->cookies) {
         Py_DECREF(rd->cookies);
         free(rd->cookies_str);

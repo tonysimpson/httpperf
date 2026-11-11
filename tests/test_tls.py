@@ -113,3 +113,27 @@ def test_client_certs(mtls_url, client_certs):
         who(user1, cert="user1.pem")
     el.stop()
     loop.close()
+
+
+def test_verify(tls_url):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    ca = pytest_httpbin.certs.where()
+
+    def get(session, **kwargs):
+        return loop.run_until_complete(session.get(tls_url, **kwargs)).status_code
+
+    unverified = el.session()
+    assert get(unverified) == 200
+    with pytest.raises(acurl.RequestError):
+        get(unverified, verify=True)
+    assert get(unverified, verify=ca) == 200
+    with pytest.raises(acurl.RequestError):
+        get(el.session(verify=True))
+    verified = el.session(verify=ca)
+    assert get(verified) == 200
+    assert get(verified, verify=False) == 200
+    with pytest.raises(ValueError):
+        get(verified, verify=1)
+    el.stop()
+    loop.close()

@@ -378,9 +378,11 @@ class Session:
         max_host_connections=0,
         max_connections=0,
         cert=None,
+        verify=False,
     ):
         self._loop = loop
         self._cert = cert
+        self._verify = verify
         self._session = _acurl.Session(
             ae_loop,
             connections,
@@ -447,6 +449,7 @@ class Session:
         allow_redirects=True,
         max_redirects=5,
         cert=None,
+        verify=None,
     ):
         if json is not None:
             if data is not None:
@@ -481,6 +484,7 @@ class Session:
             auth,
             data,
             cert if cert is not None else self._cert,
+            verify if verify is not None else self._verify,
             allow_redirects,
             max_redirects,
         )
@@ -489,7 +493,18 @@ class Session:
         self._response_callback = callback
 
     async def _request(
-        self, method, url, header_tuple, cookie_tuple, auth, data, cert, allow_redirects, remaining_redirects, prev=None
+        self,
+        method,
+        url,
+        header_tuple,
+        cookie_tuple,
+        auth,
+        data,
+        cert,
+        verify,
+        allow_redirects,
+        remaining_redirects,
+        prev=None,
     ):
         start_time = time.time()
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
@@ -504,6 +519,7 @@ class Session:
             auth=auth,
             data=data,
             cert=cert,
+            verify=verify,
         )
         response = Response(request, await future, start_time, time.time())
         if prev is not None:
@@ -523,6 +539,7 @@ class Session:
                     auth,
                     None,
                     cert,
+                    verify,
                     allow_redirects,
                     remaining_redirects - 1,
                     response,
@@ -536,6 +553,7 @@ class Session:
                     auth,
                     data,
                     cert,
+                    verify,
                     allow_redirects,
                     remaining_redirects - 1,
                     response,
@@ -633,6 +651,7 @@ class EventLoop:
         max_host_connections=0,
         max_connections=0,
         cert=None,
+        verify=False,
     ):
         return Session(
             self._ae_loop,
@@ -645,4 +664,5 @@ class EventLoop:
             max_host_connections,
             max_connections,
             cert,
+            verify,
         )

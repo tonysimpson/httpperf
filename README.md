@@ -74,6 +74,7 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 | `max_host_connections` | `0` | Per-session cap on connections per host. Needs `connections="session"` or `"none"`. |
 | `max_connections` | `0` | Per-session cap on connections in use. Needs `connections="session"` or `"none"`. |
 | `cert` | `None` | `(certfile, keyfile)` paths for a client certificate, used by every request unless the request overrides it. |
+| `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA store. A path: check against that CA bundle. Requests can override it. |
 
 Cookies always belong to the session, whatever the connection settings. See [docs/connections.md](docs/connections.md) for how these fit together.
 
@@ -98,6 +99,7 @@ Cookies always belong to the session, whatever the connection settings. See [doc
 | `data` | Request body, `str` or `bytes`. |
 | `json` | Object to send as JSON. Sets `Content-Type: application/json` unless you set it. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
+| `verify` | `True`, `False` or a CA bundle path, overriding the session's `verify`. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
 
@@ -144,7 +146,6 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 
 ## Known limitations
 
-- TLS certificates are never verified.
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `EventLoop.stop()` is called never complete.
 - HTTP/3 is not supported yet, though libcurl can do it.
