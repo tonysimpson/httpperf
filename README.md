@@ -153,12 +153,16 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 ## Development
 
 ```sh
-uv venv -p 3.13 .venv
-uv pip install -e . --group dev
+make test
 make lint               # ruff and clang-format, check only
 make lint-fix           # apply formatting and fixes
-.venv/bin/python -m pytest
+make clean              # remove build output, caches and profiler output (keeps .venv)
+make distclean          # also remove .venv
 ```
+
+Each target first creates `.venv` with uv, if needed, and installs acurl in editable mode with the dev tools. It reinstalls when `setup.py`, `pyproject.toml` or the C sources change, so C edits are rebuilt automatically. `make venv` does only that step.
+
+`make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 
 The tests run local servers: pytest-httpbin, small threaded `http.server` servers for connection counting and TLS, and hypercorn for HTTP/2. Client certificates are generated with `openssl`. The httpbin server is single-threaded, so keep concurrency in tests low.
 
