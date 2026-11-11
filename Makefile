@@ -9,6 +9,6 @@ lint:
 	clang-format --dry-run --Werror $(C_SOURCES)
 
 lint-fix:
-	$(PYTHON) -m ruff check --fix .
 	$(PYTHON) -m ruff format .
 	clang-format -i $(C_SOURCES)
+	$(PYTHON) -m ruff check --fix .
