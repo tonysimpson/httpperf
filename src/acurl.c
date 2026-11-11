@@ -122,6 +122,37 @@ static void share_decref(Share *share) {
     free(share);
 }
 
+static bool pipe_write(int fd, const void *buf, size_t len) {
+    ssize_t n;
+    do {
+        n = write(fd, buf, len);
+    } while (n == -1 && errno == EINTR);
+    return n == (ssize_t)len;
+}
+
+static int pipe_read(int fd, void *buf, size_t len) {
+    ssize_t n;
+    do {
+        n = read(fd, buf, len);
+    } while (n == -1 && errno == EINTR);
+    if (n == (ssize_t)len) {
+        return 1;
+    }
+    if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+    return -1;
+}
+
+static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
+    CleanupItem item = {curl, share};
+    share_incref(share);
+    if (!pipe_write(loop->curl_easy_cleanup_write, &item, sizeof(item))) {
+        curl_easy_cleanup(curl);
+        share_decref(share);
+    }
+}
+
 typedef struct {
     PyObject_HEAD EventLoop *loop;
     Share *shared;
@@ -180,9 +211,7 @@ static void Response_dealloc(Response *self) {
     DEBUG_PRINT("response=%p", self);
     free_buffer_nodes(self->header_buffer);
     free_buffer_nodes(self->body_buffer);
-    CleanupItem item = {self->curl, self->session->shared};
-    share_incref(item.share);
-    write(self->session->loop->curl_easy_cleanup_write, &item, sizeof(item));
+    queue_cleanup(self->session->loop, self->curl, self->session->shared);
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -342,6 +371,12 @@ static PyTypeObject ResponseType = {
 
 /* When at least one request has completed, write completed responses onto completion queue*/
 
+static void complete_request(EventLoop *loop, AcRequestData *rd) {
+    if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
+        perror("acurl: failed to return completed request");
+    }
+}
+
 void response_complete(EventLoop *loop) {
     DEBUG_PRINT("loop=%p", loop);
     int remaining_in_queue = 1;
@@ -364,7 +399,7 @@ void response_complete(EventLoop *loop) {
 
         DEBUG_PRINT("writing to req_out_write");
         REQUEST_TRACE_PRINT("response_complete", rd);
-        write(loop->req_out_write, &rd, sizeof(AcRequestData *));
+        complete_request(loop, rd);
     }
 }
 
@@ -417,7 +452,9 @@ size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     AcRequestData *rd;
     EventLoop *loop = (EventLoop *)clientData;
-    int b_read = read(loop->req_in_read, &rd, sizeof(AcRequestData *));
+    if (pipe_read(loop->req_in_read, &rd, sizeof(rd)) != 1) {
+        return;
+    }
     REQUEST_TRACE_PRINT("start_request", rd);
     DEBUG_PRINT("read AcRequestData");
     rd->curl = curl_easy_init();
@@ -464,7 +501,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         rd->result = CURLE_OK;
         curl_slist_free_all(rd->headers);
         rd->headers = NULL;
-        write(loop->req_out_write, &rd, sizeof(AcRequestData *));
+        complete_request(loop, rd);
     } else {
         DEBUG_PRINT("adding handle");
         curl_multi_add_handle(loop->multi, rd->curl);
@@ -472,9 +509,9 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
 }
 
 void stop_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
-    char buffer[1];
+    char buffer;
     EventLoop *loop = (EventLoop *)clientData;
-    read(loop->stop_read, buffer, sizeof(buffer));
+    pipe_read(loop->stop_read, &buffer, sizeof(buffer));
     loop->stop = true;
 }
 
@@ -482,11 +519,7 @@ void stop_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int
 
 void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     CleanupItem item;
-    while (true) {
-        int b_read = read(fd, &item, sizeof(item));
-        if (b_read == -1) {
-            break;
-        }
+    while (pipe_read(fd, &item, sizeof(item)) == 1) {
         DEBUG_PRINT("curl=%p", item.curl);
         curl_easy_cleanup(item.curl);
         share_decref(item.share);
@@ -672,7 +705,7 @@ static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
 }
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
-    if (write(((EventLoop *)self)->stop_write, "\0", 1) != 1) {
+    if (!pipe_write(((EventLoop *)self)->stop_write, "\0", 1)) {
         PyErr_SetFromErrno(PyExc_OSError);
         return NULL;
     }
@@ -689,11 +722,8 @@ static PyObject *Eventloop_get_out_fd(PyObject *self, PyObject *args) {
 static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
     AcRequestData *rd;
     PyObject *list = PyList_New(0);
-    while (true) {
-        int b_read = read(((EventLoop *)self)->req_out_read, &rd, sizeof(AcRequestData *));
-        if (b_read == -1) {
-            break;
-        }
+    int status;
+    while ((status = pipe_read(((EventLoop *)self)->req_out_read, &rd, sizeof(rd))) == 1) {
         REQUEST_TRACE_PRINT("Eventloop_get_completed", rd);
         DEBUG_PRINT("read AcRequestData; address=%p", rd);
         PyObject *tuple = PyTuple_New(3);
@@ -712,9 +742,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyObject *error = PyUnicode_FromString(curl_easy_strerror(rd->result));
             free_buffer_nodes(rd->header_buffer_head);
             free_buffer_nodes(rd->body_buffer_head);
-            CleanupItem item = {rd->curl, rd->session->shared};
-            share_incref(item.share);
-            write(rd->session->loop->curl_easy_cleanup_write, &item, sizeof(item));
+            queue_cleanup(rd->session->loop, rd->curl, rd->session->shared);
             Py_DECREF(rd->session);
 
             PyTuple_SET_ITEM(tuple, 0, error);
@@ -729,6 +757,10 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         }
         Py_XDECREF(rd->cookies);
         free(rd);
+    }
+    if (status == -1 && PyList_GET_SIZE(list) == 0) {
+        Py_DECREF(list);
+        return PyErr_SetFromErrno(PyExc_OSError);
     }
     return list;
 }
@@ -923,7 +955,12 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     Py_INCREF(future);
     rd->future = future;
 
-    write(self->loop->req_in_write, &rd, sizeof(AcRequestData *));
+    if (!pipe_write(self->loop->req_in_write, &rd, sizeof(rd))) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        Py_CLEAR(rd->session);
+        Py_CLEAR(rd->future);
+        goto error_cleanup;
+    }
     DEBUG_PRINT("scheduling request");
     Py_RETURN_NONE;
 
