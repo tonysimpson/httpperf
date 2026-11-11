@@ -79,3 +79,12 @@ def test_cookies_kwarg_sent(httpbin):
     s = session()
     r = _await(s.get(httpbin.url + "/cookies", cookies={"name": "value"}))
     assert r.json()["cookies"] == {"name": "value"}
+
+
+def test_set_encoding(httpbin):
+    s = session()
+    r = _await(s.get(httpbin.url + "/encoding/utf8"))
+    assert r.text == r.body.decode("utf-8")
+    r.encoding = "latin1"
+    assert r.encoding == "latin1"
+    assert r.text == r.body.decode("latin1")

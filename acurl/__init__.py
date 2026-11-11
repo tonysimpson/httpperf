@@ -283,8 +283,10 @@ class Response:
         return self._encoding
 
     @encoding.setter
-    def encoding_setter(self, encoding):
+    def encoding(self, encoding):
         self._encoding = encoding
+        if hasattr(self, "_text"):
+            del self._text
 
     @property
     def text(self):
