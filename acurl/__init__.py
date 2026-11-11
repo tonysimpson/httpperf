@@ -399,6 +399,9 @@ class Session:
     async def put(self, url, **kwargs):
         return await self.request("PUT", url, **kwargs)
 
+    async def patch(self, url, **kwargs):
+        return await self.request("PATCH", url, **kwargs)
+
     async def post(self, url, **kwargs):
         return await self.request("POST", url, **kwargs)
 

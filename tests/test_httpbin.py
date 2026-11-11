@@ -111,6 +111,14 @@ def test_head(httpbin):
     assert r.status_code == 302
 
 
+@pytest.mark.parametrize("method", ["put", "post", "patch", "delete"])
+def test_methods_with_body(httpbin, method):
+    s = session()
+    r = _await(getattr(s, method)(httpbin.url + "/" + method, json={"a": 1}))
+    assert r.status_code == 200
+    assert r.json()["json"] == {"a": 1}
+
+
 def test_post_binary(httpbin):
     s = session()
     data = bytes(range(256))
