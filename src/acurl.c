@@ -961,7 +961,9 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     rd->method = strdup(method);
     rd->url = strdup(url);
     if (req_data_buf != NULL) {
-        req_data_buf = strdup(req_data_buf);
+        char *copy = malloc(req_data_len + 1);
+        memcpy(copy, req_data_buf, req_data_len);
+        req_data_buf = copy;
     }
 
     rd->req_data_len = req_data_len;

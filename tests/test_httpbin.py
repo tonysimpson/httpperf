@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from urllib.parse import urlencode
 
 import pytest
@@ -108,3 +109,10 @@ def test_head(httpbin):
     assert int(r.headers["Content-Length"]) > 0
     r = _await(s.head(httpbin.url + "/redirect/1"))
     assert r.status_code == 302
+
+
+def test_post_binary(httpbin):
+    s = session()
+    data = bytes(range(256))
+    r = _await(s.post(httpbin.url + "/post", data=data, headers={"Content-Type": "application/octet-stream"}))
+    assert r.json()["data"] == "data:application/octet-stream;base64," + base64.b64encode(data).decode()
