@@ -118,3 +118,24 @@ def test_connection_expiry(url, options, wait):
     s.close()
     el.stop()
     loop.close()
+
+
+@pytest.mark.parametrize(
+    "limits, hosts, queued",
+    [({"max_host_connections": 2}, ["127.0.0.1"], 4), ({"max_connections": 3}, ["127.0.0.1", "localhost"], 3)],
+)
+def test_session_connection_limits(url, limits, hosts, queued):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    s = el.session(connections="session", http_version="HTTP/1.1", **limits)
+    urls = [url.replace("127.0.0.1", host) + "slow" for host in hosts for _ in range(6 // len(hosts))]
+
+    async def main():
+        return await asyncio.gather(*(s.get(u) for u in urls))
+
+    responses = loop.run_until_complete(main())
+    assert sum(r.queue_time > 0 for r in responses) == queued
+    assert all(r.client_lag < r.queue_time + 0.05 for r in responses)
+    s.close()
+    el.stop()
+    loop.close()

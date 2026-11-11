@@ -32,6 +32,12 @@ static inline double gettime(void) {
     return ((double)tp.tv_sec) + ((double)tp.tv_nsec / 1000000000.0);
 }
 
+static inline double monotonic_time(void) {
+    struct timespec tp;
+    clock_gettime(CLOCK_MONOTONIC, &tp);
+    return ((double)tp.tv_sec) + ((double)tp.tv_nsec / 1000000000.0);
+}
+
 /* Macro for debugging */
 
 #define REQUEST_TRACE 0
@@ -63,10 +69,26 @@ typedef struct {
     int curl_easy_cleanup_write;
 } EventLoop;
 
+typedef struct HostSlot {
+    char *key;
+    long active;
+    bool multiplexed;
+    struct HostSlot *next;
+} HostSlot;
+
+struct AcRequestData;
+
 typedef struct {
     CURLSH *share;
     pthread_mutex_t locks[CURL_LOCK_DATA_LAST];
     atomic_int refs;
+    long max_host_connections;
+    long max_connections;
+    long connections;
+    HostSlot *hosts;
+    struct AcRequestData *waiting_head;
+    struct AcRequestData *waiting_tail;
+    bool dispatching;
 } Share;
 
 typedef struct {
@@ -82,7 +104,7 @@ static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
     pthread_mutex_unlock(&((Share *)userptr)->locks[data]);
 }
 
-static Share *share_new(bool share_connections, bool share_tls) {
+static Share *share_new(bool share_connections, bool share_tls, long max_host_connections, long max_connections) {
     Share *share = calloc(1, sizeof(Share));
     if (share == NULL) {
         return NULL;
@@ -96,6 +118,8 @@ static Share *share_new(bool share_connections, bool share_tls) {
         pthread_mutex_init(&share->locks[i], NULL);
     }
     atomic_init(&share->refs, 1);
+    share->max_host_connections = max_host_connections;
+    share->max_connections = max_connections;
     curl_share_setopt(share->share, CURLSHOPT_LOCKFUNC, share_lock);
     curl_share_setopt(share->share, CURLSHOPT_UNLOCKFUNC, share_unlock);
     curl_share_setopt(share->share, CURLSHOPT_USERDATA, share);
@@ -120,6 +144,12 @@ static void share_decref(Share *share) {
     if (rc != CURLSHE_OK) {
         fprintf(stderr, "acurl: curl_share_cleanup failed: %s\n", curl_share_strerror(rc));
         return;
+    }
+    while (share->hosts != NULL) {
+        HostSlot *next = share->hosts->next;
+        free(share->hosts->key);
+        free(share->hosts);
+        share->hosts = next;
     }
     for (int i = 0; i < CURL_LOCK_DATA_LAST; i++) {
         pthread_mutex_destroy(&share->locks[i]);
@@ -179,7 +209,7 @@ struct BufferNode {
     struct BufferNode *next;
 };
 
-typedef struct {
+typedef struct AcRequestData {
     char *method;
     char *url;
     char *auth;
@@ -199,6 +229,10 @@ typedef struct {
     struct BufferNode *body_buffer_head;
     struct BufferNode *body_buffer_tail;
     int dummy;
+    HostSlot *slot;
+    struct AcRequestData *next_waiting;
+    double queued_at;
+    double queue_time;
 } AcRequestData;
 
 typedef struct {
@@ -206,6 +240,7 @@ typedef struct {
     struct BufferNode *body_buffer;
     Session *session;
     CURL *curl;
+    double queue_time;
 } Response;
 
 void free_buffer_nodes(struct BufferNode *start) {
@@ -301,6 +336,10 @@ RESPONSE_GETINFO(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
 RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
 RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
 
+static PyObject *Response_get_queue_time(Response *self, PyObject *args) {
+    return PyFloat_FromDouble(self->queue_time);
+}
+
 static PyObject *Response_get_http_version(Response *self, PyObject *args) {
     long version = 0;
     curl_easy_getinfo(self->curl, CURLINFO_HTTP_VERSION, &version);
@@ -365,6 +404,8 @@ static PyMethodDef Response_methods[] = {
     {"get_size_download", (PyCFunction)Response_get_size_download, METH_NOARGS, ""},
     {"get_primary_ip", (PyCFunction)Response_get_primary_ip, METH_NOARGS, ""},
     {"get_http_version", (PyCFunction)Response_get_http_version, METH_NOARGS, "Get the HTTP version used"},
+    {"get_queue_time", (PyCFunction)Response_get_queue_time, METH_NOARGS,
+     "Get the time spent waiting for a connection"},
     {"get_cookielist", (PyCFunction)Response_get_cookielist, METH_NOARGS, ""},
     {"get_redirect_url", (PyCFunction)Response_get_redirect_url, METH_NOARGS, "Get the redirect URL or None"},
     {"get_header", (PyCFunction)Response_get_header, METH_NOARGS, "Get the header"},
@@ -423,8 +464,126 @@ static void check_multi(EventLoop *loop, CURLMcode rc) {
     }
 }
 
+static void add_transfer(EventLoop *loop, AcRequestData *rd);
+
+static char *host_key(const char *url) {
+    CURLU *u = curl_url();
+    char *scheme = NULL;
+    char *host = NULL;
+    char *port = NULL;
+    char *key = NULL;
+    if (u != NULL && curl_url_set(u, CURLUPART_URL, url, 0) == CURLUE_OK &&
+        curl_url_get(u, CURLUPART_SCHEME, &scheme, 0) == CURLUE_OK &&
+        curl_url_get(u, CURLUPART_HOST, &host, 0) == CURLUE_OK &&
+        curl_url_get(u, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) == CURLUE_OK) {
+        size_t len = strlen(scheme) + strlen(host) + strlen(port) + 5;
+        key = malloc(len);
+        if (key != NULL) {
+            snprintf(key, len, "%s://%s:%s", scheme, host, port);
+        }
+    }
+    curl_free(scheme);
+    curl_free(host);
+    curl_free(port);
+    curl_url_cleanup(u);
+    return key;
+}
+
+static HostSlot *host_slot(Share *share, const char *url) {
+    char *key = host_key(url);
+    if (key == NULL) {
+        return NULL;
+    }
+    for (HostSlot *h = share->hosts; h != NULL; h = h->next) {
+        if (strcmp(h->key, key) == 0) {
+            free(key);
+            return h;
+        }
+    }
+    HostSlot *h = calloc(1, sizeof(HostSlot));
+    if (h == NULL) {
+        free(key);
+        return NULL;
+    }
+    h->key = key;
+    h->next = share->hosts;
+    share->hosts = h;
+    return h;
+}
+
+static bool slot_free(Share *share, HostSlot *h) {
+    if (h->multiplexed && h->active > 0) {
+        return true;
+    }
+    if (share->max_host_connections && h->active >= share->max_host_connections) {
+        return false;
+    }
+    return !share->max_connections || share->connections < share->max_connections;
+}
+
+static void slot_acquire(Share *share, HostSlot *h) {
+    if (!h->multiplexed || h->active == 0) {
+        share->connections++;
+    }
+    h->active++;
+}
+
+static void slot_release(Share *share, HostSlot *h, bool multiplexed) {
+    if (multiplexed && !h->multiplexed) {
+        h->multiplexed = true;
+        share->connections -= h->active - 1;
+    }
+    h->active--;
+    if (!h->multiplexed || h->active == 0) {
+        share->connections--;
+    }
+}
+
+static void dispatch_waiting(EventLoop *loop, Share *share) {
+    if (share->dispatching) {
+        return;
+    }
+    share_incref(share);
+    share->dispatching = true;
+    bool started = true;
+    while (started) {
+        started = false;
+        AcRequestData *prev = NULL;
+        for (AcRequestData *rd = share->waiting_head; rd != NULL; prev = rd, rd = rd->next_waiting) {
+            if (!slot_free(share, rd->slot)) {
+                continue;
+            }
+            if (prev != NULL) {
+                prev->next_waiting = rd->next_waiting;
+            } else {
+                share->waiting_head = rd->next_waiting;
+            }
+            if (share->waiting_tail == rd) {
+                share->waiting_tail = prev;
+            }
+            rd->next_waiting = NULL;
+            rd->queue_time = monotonic_time() - rd->queued_at;
+            slot_acquire(share, rd->slot);
+            add_transfer(loop, rd);
+            started = true;
+            break;
+        }
+    }
+    share->dispatching = false;
+    share_decref(share);
+}
+
 static void complete_request(EventLoop *loop, AcRequestData *rd) {
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
+    if (rd->slot != NULL) {
+        long version = 0;
+        if (rd->result == CURLE_OK) {
+            curl_easy_getinfo(rd->curl, CURLINFO_HTTP_VERSION, &version);
+        }
+        slot_release(rd->share, rd->slot, version == CURL_HTTP_VERSION_2_0 || version == CURL_HTTP_VERSION_3);
+        rd->slot = NULL;
+        dispatch_waiting(loop, rd->share);
+    }
     share_decref(rd->share);
     rd->share = NULL;
     if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
@@ -553,6 +712,9 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_WRITEDATA, rd);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERDATA, rd);
+    if (!rd->dummy && (rd->share->max_host_connections || rd->share->max_connections)) {
+        rd->slot = host_slot(rd->share, rd->url);
+    }
     free(rd->method);
     rd->method = NULL;
     free(rd->url);
@@ -567,17 +729,32 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_slist_free_all(rd->headers);
         rd->headers = NULL;
         complete_request(loop, rd);
-    } else {
-        DEBUG_PRINT("adding handle");
-        CURLMcode rc = curl_multi_add_handle(loop->multi, rd->curl);
-        if (rc != CURLM_OK) {
-            check_multi(loop, rc);
-            rd->result = CURLE_FAILED_INIT;
-            curl_slist_free_all(rd->headers);
-            rd->headers = NULL;
-            complete_request(loop, rd);
-            response_complete(loop);
+    } else if (rd->slot != NULL && !slot_free(rd->share, rd->slot)) {
+        rd->queued_at = monotonic_time();
+        if (rd->share->waiting_tail != NULL) {
+            rd->share->waiting_tail->next_waiting = rd;
+        } else {
+            rd->share->waiting_head = rd;
         }
+        rd->share->waiting_tail = rd;
+    } else {
+        if (rd->slot != NULL) {
+            slot_acquire(rd->share, rd->slot);
+        }
+        add_transfer(loop, rd);
+    }
+}
+
+static void add_transfer(EventLoop *loop, AcRequestData *rd) {
+    DEBUG_PRINT("adding handle");
+    CURLMcode rc = curl_multi_add_handle(loop->multi, rd->curl);
+    if (rc != CURLM_OK) {
+        check_multi(loop, rc);
+        rd->result = CURLE_FAILED_INIT;
+        curl_slist_free_all(rd->headers);
+        rd->headers = NULL;
+        complete_request(loop, rd);
+        response_complete(loop);
     }
 }
 
@@ -832,6 +1009,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             response->body_buffer = rd->body_buffer_head;
             response->curl = rd->curl;
             response->session = rd->session;
+            response->queue_time = rd->queue_time;
 
             Py_INCREF(Py_None);
             PyTuple_SET_ITEM(tuple, 0, Py_None);
@@ -923,10 +1101,24 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     const char *http_version = "HTTP/2";
     long idle_timeout = 118;
     long max_connection_age = 0;
+    long max_host_connections = 0;
+    long max_connections = 0;
 
-    static char *kwlist[] = {"loop", "connections", "tls", "http_version", "idle_timeout", "max_connection_age", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|sssll", kwlist, &loop, &connections, &tls, &http_version,
-                                     &idle_timeout, &max_connection_age)) {
+    static char *kwlist[] = {"loop",
+                             "connections",
+                             "tls",
+                             "http_version",
+                             "idle_timeout",
+                             "max_connection_age",
+                             "max_host_connections",
+                             "max_connections",
+                             NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|sssllll", kwlist, &loop, &connections, &tls, &http_version,
+                                     &idle_timeout, &max_connection_age, &max_host_connections, &max_connections)) {
+        return NULL;
+    }
+    if (max_host_connections < 0 || max_connections < 0) {
+        PyErr_SetString(PyExc_ValueError, "connection limits must not be negative");
         return NULL;
     }
     if (idle_timeout < 0 || max_connection_age < 0) {
@@ -937,6 +1129,11 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     bool fresh_connect = strcmp(connections, "none") == 0;
     if (!share_connections && !fresh_connect && strcmp(connections, "shared") != 0) {
         PyErr_Format(PyExc_ValueError, "connections must be 'shared', 'session' or 'none', not '%s'", connections);
+        return NULL;
+    }
+    if (!share_connections && !fresh_connect && (max_host_connections || max_connections)) {
+        PyErr_SetString(PyExc_ValueError, "session connection limits need connections='session' or 'none'; "
+                                          "set limits for the shared pool on the EventLoop");
         return NULL;
     }
     bool share_tls = strcmp(tls, "session") == 0;
@@ -965,7 +1162,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->http_version = curl_http_version;
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;
-    self->shared = share_new(share_connections, share_tls);
+    self->shared = share_new(share_connections, share_tls, max_host_connections, max_connections);
     if (self->shared == NULL) {
         Py_DECREF(self);
         return PyErr_NoMemory();

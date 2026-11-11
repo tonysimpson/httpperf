@@ -246,8 +246,12 @@ class Response:
         return self._end_time
 
     @property
+    def queue_time(self):
+        return self._resp.get_queue_time()
+
+    @property
     def client_lag(self):
-        return self._end_time - self._start_time - self._resp.get_total_time()
+        return self._end_time - self._start_time - self._resp.get_total_time() - self._resp.get_queue_time()
 
     @property
     def total_time(self):
@@ -370,9 +374,20 @@ class Session:
         http_version="HTTP/2",
         idle_timeout=118,
         max_connection_age=0,
+        max_host_connections=0,
+        max_connections=0,
     ):
         self._loop = loop
-        self._session = _acurl.Session(ae_loop, connections, tls, http_version, idle_timeout, max_connection_age)
+        self._session = _acurl.Session(
+            ae_loop,
+            connections,
+            tls,
+            http_version,
+            idle_timeout,
+            max_connection_age,
+            max_host_connections,
+            max_connections,
+        )
         self._response_callback = None
 
     def close(self):
@@ -578,6 +593,23 @@ class EventLoop:
                 future.set_exception(RequestError(error))
 
     def session(
-        self, connections="shared", tls="shared", http_version="HTTP/2", idle_timeout=118, max_connection_age=0
+        self,
+        connections="shared",
+        tls="shared",
+        http_version="HTTP/2",
+        idle_timeout=118,
+        max_connection_age=0,
+        max_host_connections=0,
+        max_connections=0,
     ):
-        return Session(self._ae_loop, self._loop, connections, tls, http_version, idle_timeout, max_connection_age)
+        return Session(
+            self._ae_loop,
+            self._loop,
+            connections,
+            tls,
+            http_version,
+            idle_timeout,
+            max_connection_age,
+            max_host_connections,
+            max_connections,
+        )

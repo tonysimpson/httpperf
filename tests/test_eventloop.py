@@ -9,7 +9,13 @@ import acurl
 
 
 def open_fds():
-    return len(os.listdir("/proc/self/fd"))
+    fds = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            fds += not os.readlink("/proc/self/fd/" + fd).startswith("socket:")
+        except OSError:
+            pass
+    return fds
 
 
 def test_stop_releases_thread_and_fds():

@@ -83,3 +83,17 @@ def test_concurrent_requests_share_a_connection(h2_url, version, connects):
         return responses
 
     assert sum(r.connect_time > 0 for r in run(main)) == connects
+
+
+def test_session_host_limit_with_multiplexing(h2_url):
+    async def main(el):
+        s = el.session(connections="session", max_host_connections=2)
+        first = await asyncio.gather(*(s.get(h2_url) for _ in range(6)))
+        second = await asyncio.gather(*(s.get(h2_url) for _ in range(6)))
+        el.stop()
+        return first, second
+
+    first, second = run(main)
+    assert sum(r.connect_time > 0 for r in first + second) == 1
+    assert sum(r.queue_time > 0 for r in first) == 4
+    assert all(r.queue_time == 0 for r in second)

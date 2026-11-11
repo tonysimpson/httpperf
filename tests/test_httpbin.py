@@ -153,6 +153,12 @@ def test_max_idle_connections_invalid():
         acurl.EventLoop(max_idle_connections=0)
 
 
+@pytest.mark.parametrize("options", [{"max_host_connections": 2}, {"connections": "session", "max_connections": -1}])
+def test_session_connection_limits_invalid(options):
+    with pytest.raises(ValueError):
+        acurl.EventLoop().session(**options)
+
+
 def test_http_version_invalid():
     with pytest.raises(ValueError):
         acurl.EventLoop().session(http_version="HTTP/0.9")
