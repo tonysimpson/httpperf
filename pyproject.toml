@@ -1,5 +1,6 @@
 [dependency-groups]
 dev = [
+    "hypercorn",
     "pytest",
     "pytest-httpbin",
     "pytest-timeout",

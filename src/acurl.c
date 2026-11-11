@@ -165,6 +165,7 @@ typedef struct {
     PyObject_HEAD EventLoop *loop;
     Share *shared;
     bool fresh_connect;
+    long http_version;
 } Session;
 
 /* Node in a linked list structure. Used for piecing together sections of resposnes e.g. headers and body.
@@ -298,6 +299,22 @@ RESPONSE_GETINFO(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
 RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
 RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
 
+static PyObject *Response_get_http_version(Response *self, PyObject *args) {
+    long version = 0;
+    curl_easy_getinfo(self->curl, CURLINFO_HTTP_VERSION, &version);
+    switch (version) {
+    case CURL_HTTP_VERSION_1_0:
+        return PyUnicode_FromString("HTTP/1.0");
+    case CURL_HTTP_VERSION_1_1:
+        return PyUnicode_FromString("HTTP/1.1");
+    case CURL_HTTP_VERSION_2_0:
+        return PyUnicode_FromString("HTTP/2");
+    case CURL_HTTP_VERSION_3:
+        return PyUnicode_FromString("HTTP/3");
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
     struct curl_slist *start = NULL;
     struct curl_slist *node = NULL;
@@ -345,6 +362,7 @@ static PyMethodDef Response_methods[] = {
     {"get_size_upload", (PyCFunction)Response_get_size_upload, METH_NOARGS, ""},
     {"get_size_download", (PyCFunction)Response_get_size_download, METH_NOARGS, ""},
     {"get_primary_ip", (PyCFunction)Response_get_primary_ip, METH_NOARGS, ""},
+    {"get_http_version", (PyCFunction)Response_get_http_version, METH_NOARGS, "Get the HTTP version used"},
     {"get_cookielist", (PyCFunction)Response_get_cookielist, METH_NOARGS, ""},
     {"get_redirect_url", (PyCFunction)Response_get_redirect_url, METH_NOARGS, "Get the redirect URL or None"},
     {"get_header", (PyCFunction)Response_get_header, METH_NOARGS, "Get the header"},
@@ -497,6 +515,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->session->fresh_connect) {
         curl_easy_setopt(rd->curl, CURLOPT_FRESH_CONNECT, 1L);
         curl_easy_setopt(rd->curl, CURLOPT_FORBID_REUSE, 1L);
+    }
+    curl_easy_setopt(rd->curl, CURLOPT_HTTP_VERSION, rd->session->http_version);
+    if (rd->session->http_version == CURL_HTTP_VERSION_2TLS) {
+        curl_easy_setopt(rd->curl, CURLOPT_PIPEWAIT, 1L);
     }
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
@@ -876,9 +898,10 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 
     const char *connections = "shared";
     const char *tls = "shared";
+    const char *http_version = "HTTP/2";
 
-    static char *kwlist[] = {"loop", "connections", "tls", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|ss", kwlist, &loop, &connections, &tls)) {
+    static char *kwlist[] = {"loop", "connections", "tls", "http_version", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|sss", kwlist, &loop, &connections, &tls, &http_version)) {
         return NULL;
     }
     bool share_connections = strcmp(connections, "session") == 0;
@@ -892,6 +915,15 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         PyErr_Format(PyExc_ValueError, "tls must be 'shared' or 'session', not '%s'", tls);
         return NULL;
     }
+    long curl_http_version;
+    if (strcmp(http_version, "HTTP/2") == 0) {
+        curl_http_version = CURL_HTTP_VERSION_2TLS;
+    } else if (strcmp(http_version, "HTTP/1.1") == 0) {
+        curl_http_version = CURL_HTTP_VERSION_1_1;
+    } else {
+        PyErr_Format(PyExc_ValueError, "http_version must be 'HTTP/2' or 'HTTP/1.1', not '%s'", http_version);
+        return NULL;
+    }
 
     self = (Session *)type->tp_alloc(type, 0);
     if (self == NULL) {
@@ -901,6 +933,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     Py_INCREF(loop);
     self->loop = loop;
     self->fresh_connect = fresh_connect;
+    self->http_version = curl_http_version;
     self->shared = share_new(share_connections, share_tls);
     if (self->shared == NULL) {
         Py_DECREF(self);

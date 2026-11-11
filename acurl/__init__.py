@@ -286,6 +286,10 @@ class Response:
         return self._resp.get_primary_ip()
 
     @property
+    def http_version(self):
+        return self._resp.get_http_version()
+
+    @property
     def cookielist(self):
         return [parse_cookie_string(cookie) for cookie in self._resp.get_cookielist()]
 
@@ -357,9 +361,9 @@ class Response:
 
 
 class Session:
-    def __init__(self, ae_loop, loop, connections="shared", tls="shared"):
+    def __init__(self, ae_loop, loop, connections="shared", tls="shared", http_version="HTTP/2"):
         self._loop = loop
-        self._session = _acurl.Session(ae_loop, connections, tls)
+        self._session = _acurl.Session(ae_loop, connections, tls, http_version)
         self._response_callback = None
 
     def close(self):
@@ -557,5 +561,5 @@ class EventLoop:
             else:
                 future.set_exception(RequestError(error))
 
-    def session(self, connections="shared", tls="shared"):
-        return Session(self._ae_loop, self._loop, connections, tls)
+    def session(self, connections="shared", tls="shared", http_version="HTTP/2"):
+        return Session(self._ae_loop, self._loop, connections, tls, http_version)
