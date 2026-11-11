@@ -148,7 +148,9 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
     if (fd >= eventLoop->setsize) {
-        aeResizeSetSize(eventLoop, (int)(eventLoop->setsize * 1.5) + 1);
+        int setsize = eventLoop->setsize + eventLoop->setsize / 2 + 1;
+        if (setsize <= fd) setsize = fd + 1;
+        if (aeResizeSetSize(eventLoop, setsize) == AE_ERR) return AE_ERR;
     }
     aeFileEvent *fe = &eventLoop->events[fd];
 
