@@ -371,6 +371,14 @@ static PyTypeObject ResponseType = {
 
 /* When at least one request has completed, write completed responses onto completion queue*/
 
+static void check_multi(EventLoop *loop, CURLMcode rc) {
+    if (rc == CURLM_ABORTED_BY_CALLBACK) {
+        int running_handles;
+        fprintf(stderr, "acurl: event loop error, aborting all requests\n");
+        curl_multi_perform(loop->multi, &running_handles);
+    }
+}
+
 static void complete_request(EventLoop *loop, AcRequestData *rd) {
     if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
         perror("acurl: failed to return completed request");
@@ -389,7 +397,7 @@ void response_complete(EventLoop *loop) {
             break;
         }
         curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (void **)&rd);
-        curl_multi_remove_handle(loop->multi, rd->curl);
+        check_multi(loop, curl_multi_remove_handle(loop->multi, rd->curl));
         rd->result = msg->data.result;
         curl_slist_free_all(rd->headers);
         rd->headers = NULL;
@@ -406,7 +414,7 @@ void response_complete(EventLoop *loop) {
 void socket_action_and_response_complete(EventLoop *loop, curl_socket_t socket, int ev_bitmask) {
     DEBUG_PRINT("loop=%p socket=%d ev_bitmask=%d", loop, socket, ev_bitmask);
     int running_handles;
-    curl_multi_socket_action(loop->multi, socket, ev_bitmask, &running_handles);
+    check_multi(loop, curl_multi_socket_action(loop->multi, socket, ev_bitmask, &running_handles));
     DEBUG_PRINT("after running_handlesr=%d", running_handles);
     response_complete(loop);
 }
@@ -504,7 +512,15 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         complete_request(loop, rd);
     } else {
         DEBUG_PRINT("adding handle");
-        curl_multi_add_handle(loop->multi, rd->curl);
+        CURLMcode rc = curl_multi_add_handle(loop->multi, rd->curl);
+        if (rc != CURLM_OK) {
+            check_multi(loop, rc);
+            rd->result = CURLE_FAILED_INIT;
+            curl_slist_free_all(rd->headers);
+            rd->headers = NULL;
+            complete_request(loop, rd);
+            response_complete(loop);
+        }
     }
 }
 
@@ -541,6 +557,7 @@ void socket_event(struct aeEventLoop *eventLoop, int fd, void *clientData, int m
 
 int socket_callback(CURL *easy, curl_socket_t s, int what, void *userp, void *socketp) {
     EventLoop *loop = (EventLoop *)userp;
+    int rc = AE_OK;
     switch (what) {
     case CURL_POLL_NONE:
         DEBUG_PRINT("NONE socket=%d what=%d easy=%p", s, what, easy);
@@ -548,24 +565,24 @@ int socket_callback(CURL *easy, curl_socket_t s, int what, void *userp, void *so
         break;
     case CURL_POLL_IN:
         DEBUG_PRINT("IN socket=%d what=%d easy=%p", s, what, easy);
-        aeCreateFileEvent(loop->event_loop, (int)s, AE_READABLE, socket_event, (void *)loop);
+        rc = aeCreateFileEvent(loop->event_loop, (int)s, AE_READABLE, socket_event, (void *)loop);
         aeDeleteFileEvent(loop->event_loop, (int)s, AE_WRITABLE);
         break;
     case CURL_POLL_OUT:
         DEBUG_PRINT("OUT socket=%d what=%d easy=%p", s, what, easy);
-        aeCreateFileEvent(loop->event_loop, (int)s, AE_WRITABLE, socket_event, (void *)loop);
+        rc = aeCreateFileEvent(loop->event_loop, (int)s, AE_WRITABLE, socket_event, (void *)loop);
         aeDeleteFileEvent(loop->event_loop, (int)s, AE_READABLE);
         break;
     case CURL_POLL_INOUT:
         DEBUG_PRINT("INOUT socket=%d what=%d easy=%p", s, what, easy);
-        aeCreateFileEvent(loop->event_loop, (int)s, AE_READABLE | AE_WRITABLE, socket_event, (void *)loop);
+        rc = aeCreateFileEvent(loop->event_loop, (int)s, AE_READABLE | AE_WRITABLE, socket_event, (void *)loop);
         break;
     case CURL_POLL_REMOVE:
         DEBUG_PRINT("REMOVE socket=%d what=%d easy=%p", s, what, easy);
         aeDeleteFileEvent(loop->event_loop, (int)s, AE_READABLE | AE_WRITABLE);
         break;
     };
-    return 0;
+    return rc == AE_ERR ? -1 : 0;
 }
 
 int timeout(struct aeEventLoop *eventLoop, long long id, void *clientData) {
@@ -588,8 +605,8 @@ int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
     }
     if (timeout_ms >= 0) {
         if ((loop->timer_id = aeCreateTimeEvent(loop->event_loop, timeout_ms, timeout, userp, NULL)) == AE_ERR) {
-            fprintf(stderr, "timer_callback failed\n");
-            exit(1);
+            loop->timer_id = NO_ACTIVE_TIMER_ID;
+            return -1;
         }
         DEBUG_PRINT("CREATE timer_id=%ld", loop->timer_id);
     }
