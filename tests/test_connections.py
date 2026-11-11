@@ -158,6 +158,7 @@ def test_context_managers(url):
     el = loop.run_until_complete(main())
     el._thread.join(2)
     assert not el._thread.is_alive()
+    assert wait_for_connections(0) == 0
     with acurl.EventLoop(loop=loop) as el:
         pass
     el._thread.join(2)

@@ -60,7 +60,7 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 | `max_total_connections` | Process-wide cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 
-`el.stop()` stops the curl thread. Requests still in flight are abandoned. `with` and `async with` call `stop()` on exit.
+`el.stop()` stops the curl thread and closes the shared pool's connections. Requests still in flight are abandoned. `with` and `async with` call `stop()` on exit.
 
 ### `el.session(...)`
 

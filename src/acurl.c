@@ -1026,6 +1026,8 @@ static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
         aeProcessEvents(self->event_loop, AE_ALL_EVENTS);
         DEBUG_PRINT("End of aeProcessEvents");
     } while (!self->stop);
+    curl_multi_cleanup(self->multi);
+    self->multi = NULL;
     PyEval_RestoreThread(self->thread_state);
     DEBUG_PRINT("Ended");
     Py_RETURN_NONE;

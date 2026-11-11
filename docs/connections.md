@@ -50,6 +50,7 @@ Idle connections do not count towards `max_connections`, so a session can hold m
 | `idle_timeout` (session, default 118 s) | A connection idle for longer is not reused. |
 | `max_connection_age` (session, default none) | A connection older than this is not reused, however busy. Useful for spreading load across new load-balancer back ends. |
 | `session.close()` | Closes the session's own connections once its requests finish. |
+| `EventLoop.stop()` | Closes the shared pool's connections. |
 
 Both times are whole seconds. curl does not close expired connections on a timer: it notices them the next time that pool needs a connection, or when the session is closed. So the client stops reusing a connection at the right time, but the server only sees it close later.
 
