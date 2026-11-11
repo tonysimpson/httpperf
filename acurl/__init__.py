@@ -131,6 +131,21 @@ def session_cookie_for_url(
     return Cookie(http_only, "." + parsed.hostname, include_subdomains, path, is_secure, 0, name, value)
 
 
+def _encoding_from_content_type(content_type):
+    if content_type is None:
+        return "latin1"
+    mime, _, params = content_type.partition(";")
+    for param in params.split(";"):
+        key, _, value = param.partition("=")
+        value = value.strip().strip("'\"")
+        if key.strip().lower() == "charset" and value:
+            return value
+    mime = mime.strip().lower()
+    if mime == "application/json" or mime.endswith("+json"):
+        return "utf-8"
+    return "latin1"
+
+
 def _cookie_list_to_cookie_dict(cookie_list):
     return {cookie.name: cookie.value for cookie in cookie_list}
 
@@ -276,10 +291,12 @@ class Response:
     @property
     def encoding(self):
         if not hasattr(self, "_encoding"):
-            if "Content-Type" in self.headers and "charset=" in self.headers["Content-Type"]:
-                self._encoding = self.headers["Content-Type"].split("charset=")[-1].split()[0]
-            else:
-                self._encoding = "latin1"
+            content_type = None
+            for header in self.headers_tuple:
+                if len(header) == 2 and header[0].lower() == "content-type":
+                    content_type = header[1]
+                    break
+            self._encoding = _encoding_from_content_type(content_type)
         return self._encoding
 
     @encoding.setter
@@ -296,7 +313,7 @@ class Response:
 
     def json(self):
         if not hasattr(self, "_json"):
-            self._json = ujson.loads(self.text)
+            self._json = ujson.loads(self.body)
         return self._json
 
     @property
