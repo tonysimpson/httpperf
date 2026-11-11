@@ -354,6 +354,7 @@ class Session:
         return await self.request("DELETE", url, **kwargs)
 
     async def head(self, url, **kwargs):
+        kwargs.setdefault("allow_redirects", False)
         return await self.request("HEAD", url, **kwargs)
 
     async def options(self, url, **kwargs):

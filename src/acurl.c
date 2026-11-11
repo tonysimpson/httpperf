@@ -493,6 +493,9 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
+    if (strcmp(rd->method, "HEAD") == 0) {
+        curl_easy_setopt(rd->curl, CURLOPT_NOBODY, 1L);
+    }
     // curl_easy_setopt(rd->curl, CURLOPT_VERBOSE, 1L); //DEBUG
     curl_easy_setopt(rd->curl, CURLOPT_ENCODING, "");
     if (rd->headers != NULL) {

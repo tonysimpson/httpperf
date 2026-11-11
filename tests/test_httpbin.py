@@ -98,3 +98,13 @@ def test_redirect_history(httpbin):
         httpbin.url + "/relative-redirect/2",
         httpbin.url + "/relative-redirect/1",
     ]
+
+
+def test_head(httpbin):
+    s = session()
+    r = _await(s.head(httpbin.url + "/get"))
+    assert r.status_code == 200
+    assert r.body == b""
+    assert int(r.headers["Content-Length"]) > 0
+    r = _await(s.head(httpbin.url + "/redirect/1"))
+    assert r.status_code == 302
