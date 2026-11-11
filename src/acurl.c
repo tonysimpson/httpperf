@@ -155,7 +155,9 @@ static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
         if (curl != NULL) {
             curl_easy_cleanup(curl);
         }
-        share_decref(share);
+        if (share != NULL) {
+            share_decref(share);
+        }
     }
 }
 
@@ -186,6 +188,7 @@ typedef struct {
     Py_ssize_t req_data_len;
     char *req_data_buf;
     Session *session;
+    Share *share;
     CURL *curl;
     CURLcode result;
     struct BufferNode *header_buffer_head;
@@ -218,8 +221,7 @@ static void Response_dealloc(Response *self) {
     DEBUG_PRINT("response=%p", self);
     free_buffer_nodes(self->header_buffer);
     free_buffer_nodes(self->body_buffer);
-    share_incref(self->session->shared);
-    queue_cleanup(self->session->loop, self->curl, self->session->shared);
+    queue_cleanup(self->session->loop, self->curl, NULL);
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -302,7 +304,15 @@ static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
     int len = 0;
     int i = 0;
     PyObject *list = NULL;
-    curl_easy_getinfo(self->curl, CURLINFO_COOKIELIST, &start);
+    if (self->session->shared != NULL) {
+        CURL *curl = curl_easy_init();
+        if (curl == NULL) {
+            return PyErr_NoMemory();
+        }
+        curl_easy_setopt(curl, CURLOPT_SHARE, self->session->shared->share);
+        curl_easy_getinfo(curl, CURLINFO_COOKIELIST, &start);
+        curl_easy_cleanup(curl);
+    }
     node = start;
     while (node != NULL) {
         len++;
@@ -394,6 +404,9 @@ static void check_multi(EventLoop *loop, CURLMcode rc) {
 }
 
 static void complete_request(EventLoop *loop, AcRequestData *rd) {
+    curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
+    share_decref(rd->share);
+    rd->share = NULL;
     if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
         perror("acurl: failed to return completed request");
     }
@@ -480,7 +493,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     REQUEST_TRACE_PRINT("start_request", rd);
     DEBUG_PRINT("read AcRequestData");
     rd->curl = curl_easy_init();
-    curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->session->shared->share);
+    curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->share->share);
     if (rd->session->fresh_connect) {
         curl_easy_setopt(rd->curl, CURLOPT_FRESH_CONNECT, 1L);
         curl_easy_setopt(rd->curl, CURLOPT_FORBID_REUSE, 1L);
@@ -558,7 +571,9 @@ void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void 
         if (item.curl != NULL) {
             curl_easy_cleanup(item.curl);
         }
-        share_decref(item.share);
+        if (item.share != NULL) {
+            share_decref(item.share);
+        }
     }
 }
 
@@ -782,8 +797,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyObject *error = PyUnicode_FromString(curl_easy_strerror(rd->result));
             free_buffer_nodes(rd->header_buffer_head);
             free_buffer_nodes(rd->body_buffer_head);
-            share_incref(rd->session->shared);
-            queue_cleanup(rd->session->loop, rd->curl, rd->session->shared);
+            queue_cleanup(rd->session->loop, rd->curl, NULL);
             Py_DECREF(rd->session);
 
             PyTuple_SET_ITEM(tuple, 0, error);
@@ -930,6 +944,11 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         return NULL;
     }
 
+    if (self->shared == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "session is closed");
+        return NULL;
+    }
+
     AcRequestData *rd = (AcRequestData *)calloc(1, sizeof(AcRequestData));
     if (rd == NULL) {
         PyErr_NoMemory();
@@ -1010,11 +1029,14 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     rd->session = self;
     Py_INCREF(future);
     rd->future = future;
+    share_incref(self->shared);
+    rd->share = self->shared;
 
     if (!pipe_write(self->loop->req_in_write, &rd, sizeof(rd))) {
         PyErr_SetFromErrno(PyExc_OSError);
         Py_CLEAR(rd->session);
         Py_CLEAR(rd->future);
+        share_decref(rd->share);
         goto error_cleanup;
     }
     DEBUG_PRINT("scheduling request");
@@ -1038,8 +1060,18 @@ error_cleanup:
     return NULL;
 }
 
+static PyObject *Session_close(Session *self, PyObject *args) {
+    if (self->shared != NULL) {
+        queue_cleanup(self->loop, NULL, self->shared);
+        self->shared = NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef Session_methods[] = {
-    {"request", (PyCFunction)Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"}, {NULL, NULL, 0, NULL}};
+    {"request", (PyCFunction)Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"},
+    {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
+    {NULL, NULL, 0, NULL}};
 
 static PyTypeObject SessionType = {
     PyVarObject_HEAD_INIT(NULL, 0) "acurl.Session", /* tp_name */

@@ -15,6 +15,7 @@ def open_fds():
 def test_stop_releases_thread_and_fds():
     loop = asyncio.new_event_loop()
     try:
+        gc.collect()
         before = open_fds()
         el = acurl.EventLoop(loop=loop)
         thread = el._thread

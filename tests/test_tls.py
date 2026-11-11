@@ -34,6 +34,7 @@ def tls_url():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield "https://127.0.0.1:%d/" % server.server_address[1]
     server.shutdown()
+    server.server_close()
 
 
 @pytest.mark.parametrize("tls, resumed", [("shared", "True"), ("session", "False")])

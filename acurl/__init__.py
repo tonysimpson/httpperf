@@ -362,6 +362,9 @@ class Session:
         self._session = _acurl.Session(ae_loop, connections, tls)
         self._response_callback = None
 
+    def close(self):
+        self._session.close()
+
     async def get(self, url, **kwargs):
         return await self.request("GET", url, **kwargs)
 
