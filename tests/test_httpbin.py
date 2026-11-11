@@ -116,3 +116,14 @@ def test_post_binary(httpbin):
     data = bytes(range(256))
     r = _await(s.post(httpbin.url + "/post", data=data, headers={"Content-Type": "application/octet-stream"}))
     assert r.json()["data"] == "data:application/octet-stream;base64," + base64.b64encode(data).decode()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"auth": ("\ud800", "password")}, {"headers": {"X-Test": "\ud800"}}, {"cookies": {"name": "\ud800"}}],
+)
+def test_unencodable_strings_raise(httpbin, kwargs):
+    s = session()
+    with pytest.raises(UnicodeEncodeError):
+        _await(s.get(httpbin.url + "/get", **kwargs))
+    assert _await(s.get(httpbin.url + "/get")).status_code == 200

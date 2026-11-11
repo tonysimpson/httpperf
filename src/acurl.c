@@ -16,8 +16,8 @@
 #define DEBUG 0
 #if defined(DEBUG) && DEBUG > 0
 #include <sys/syscall.h>
-#define DEBUG_PRINT(fmt, args...)                                                                                      \
-    fprintf(stderr, "DEBUG: %s:%d:%s() tid=%ld: " fmt "\n", __FILE__, __LINE__, __func__, (long)syscall(SYS_gettid),   \
+#define DEBUG_PRINT(fmt, args...)                                                                                    \
+    fprintf(stderr, "DEBUG: %s:%d:%s() tid=%ld: " fmt "\n", __FILE__, __LINE__, __func__, (long)syscall(SYS_gettid), \
             ##args)
 #else
 #define DEBUG_PRINT(fmt, args...)
@@ -55,9 +55,9 @@ static inline int getmem(void) {
 #define PROFILE 0
 #if defined(PROFILE) && PROFILE == 1
 #include <sys/syscall.h>
-#define ENTER()                                                                                                        \
+#define ENTER() \
     fprintf(stderr, "ENTER %ld:%s:%d:%s %.9f\n", (long)syscall(SYS_gettid), __FILE__, __LINE__, __func__, gettime())
-#define EXIT()                                                                                                         \
+#define EXIT() \
     fprintf(stderr, "EXIT %ld:%s:%d:%s %.9f\n", (long)syscall(SYS_gettid), __FILE__, __LINE__, __func__, gettime())
 #elif defined(PROFILE) && PROFILE == 2
 #include <sys/syscall.h>
@@ -887,6 +887,14 @@ static void Session_dealloc(Session *self) {
     EXIT();
 }
 
+#define CHECK_ALLOC(p)          \
+    do {                        \
+        if ((p) == NULL) {      \
+            PyErr_NoMemory();   \
+            goto error_cleanup; \
+        }                       \
+    } while (0)
+
 static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
     ENTER();
     char *method;
@@ -907,9 +915,13 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         return NULL;
     }
 
-    AcRequestData *rd = (AcRequestData *)malloc(sizeof(AcRequestData));
+    AcRequestData *rd = (AcRequestData *)calloc(1, sizeof(AcRequestData));
+    if (rd == NULL) {
+        PyErr_NoMemory();
+        EXIT();
+        return NULL;
+    }
     REQUEST_TRACE_PRINT("Session_request", rd);
-    memset(rd, 0, sizeof(AcRequestData));
     if (headers != Py_None) {
         if (!PyTuple_CheckExact(headers)) {
             PyErr_SetString(PyExc_ValueError, "headers should be a tuple of strings or None");
@@ -920,7 +932,13 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
                 PyErr_SetString(PyExc_ValueError, "headers should be a tuple of strings or None");
                 goto error_cleanup;
             }
-            rd->headers = curl_slist_append(rd->headers, PyUnicode_AsUTF8(PyTuple_GET_ITEM(headers, i)));
+            const char *header = PyUnicode_AsUTF8(PyTuple_GET_ITEM(headers, i));
+            if (header == NULL) {
+                goto error_cleanup;
+            }
+            struct curl_slist *appended = curl_slist_append(rd->headers, header);
+            CHECK_ALLOC(appended);
+            rd->headers = appended;
         }
     }
     if (auth != Py_None) {
@@ -929,9 +947,13 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
             PyErr_SetString(PyExc_ValueError, "auth should be a tuple of strings (username, password) or None");
             goto error_cleanup;
         }
-        char *username = PyUnicode_AsUTF8(PyTuple_GET_ITEM(auth, 0));
-        char *password = PyUnicode_AsUTF8(PyTuple_GET_ITEM(auth, 1));
+        const char *username = PyUnicode_AsUTF8(PyTuple_GET_ITEM(auth, 0));
+        const char *password = PyUnicode_AsUTF8(PyTuple_GET_ITEM(auth, 1));
+        if (username == NULL || password == NULL) {
+            goto error_cleanup;
+        }
         rd->auth = (char *)malloc(strlen(username) + 1 + strlen(password) + 1);
+        CHECK_ALLOC(rd->auth);
         sprintf(rd->auth, "%s:%s", username, password);
     }
     if (cookies != Py_None) {
@@ -944,31 +966,36 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         rd->cookies_len = PyTuple_GET_SIZE(cookies);
         if (rd->cookies_len > 0) {
             rd->cookies_str = (char **)calloc(PyTuple_GET_SIZE(cookies), sizeof(char *));
+            CHECK_ALLOC(rd->cookies_str);
             for (int i = 0; i < PyTuple_GET_SIZE(cookies); i++) {
                 if (!PyUnicode_CheckExact(PyTuple_GET_ITEM(cookies, i))) {
                     PyErr_SetString(PyExc_ValueError, "cookies should be a tuple of strings or None");
                     goto error_cleanup;
                 }
-                rd->cookies_str[i] = PyUnicode_AsUTF8(PyTuple_GET_ITEM(cookies, i));
+                rd->cookies_str[i] = (char *)PyUnicode_AsUTF8(PyTuple_GET_ITEM(cookies, i));
+                if (rd->cookies_str[i] == NULL) {
+                    goto error_cleanup;
+                }
             }
         }
     }
+
+    rd->method = strdup(method);
+    rd->url = strdup(url);
+    CHECK_ALLOC(rd->method);
+    CHECK_ALLOC(rd->url);
+    if (req_data_buf != NULL) {
+        rd->req_data_buf = malloc(req_data_len + 1);
+        CHECK_ALLOC(rd->req_data_buf);
+        memcpy(rd->req_data_buf, req_data_buf, req_data_len);
+    }
+    rd->req_data_len = req_data_len;
+    rd->dummy = dummy;
 
     Py_INCREF(self);
     rd->session = self;
     Py_INCREF(future);
     rd->future = future;
-    rd->method = strdup(method);
-    rd->url = strdup(url);
-    if (req_data_buf != NULL) {
-        char *copy = malloc(req_data_len + 1);
-        memcpy(copy, req_data_buf, req_data_len);
-        req_data_buf = copy;
-    }
-
-    rd->req_data_len = req_data_len;
-    rd->req_data_buf = req_data_buf;
-    rd->dummy = dummy;
 
     write(self->loop->req_in_write, &rd, sizeof(AcRequestData *));
     DEBUG_PRINT("scheduling request");
@@ -987,6 +1014,9 @@ error_cleanup:
         Py_DECREF(rd->cookies);
         free(rd->cookies_str);
     }
+    free(rd->method);
+    free(rd->url);
+    free(rd->req_data_buf);
     free(rd);
     EXIT();
     return NULL;
