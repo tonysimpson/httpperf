@@ -376,8 +376,10 @@ class Session:
         max_connection_age=0,
         max_host_connections=0,
         max_connections=0,
+        cert=None,
     ):
         self._loop = loop
+        self._cert = cert
         self._session = _acurl.Session(
             ae_loop,
             connections,
@@ -428,6 +430,7 @@ class Session:
         json=None,
         allow_redirects=True,
         max_redirects=5,
+        cert=None,
     ):
         if json is not None:
             if data is not None:
@@ -461,6 +464,7 @@ class Session:
             tuple(cookie_list) if cookie_list else None,
             auth,
             data,
+            cert if cert is not None else self._cert,
             allow_redirects,
             max_redirects,
         )
@@ -469,7 +473,7 @@ class Session:
         self._response_callback = callback
 
     async def _request(
-        self, method, url, header_tuple, cookie_tuple, auth, data, allow_redirects, remaining_redirects, prev=None
+        self, method, url, header_tuple, cookie_tuple, auth, data, cert, allow_redirects, remaining_redirects, prev=None
     ):
         start_time = time.time()
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
@@ -484,6 +488,7 @@ class Session:
             auth=auth,
             data=data,
             dummy=False,
+            cert=cert,
         )
         response = Response(request, await future, start_time, time.time())
         if prev is not None:
@@ -502,6 +507,7 @@ class Session:
                     None,
                     auth,
                     None,
+                    cert,
                     allow_redirects,
                     remaining_redirects - 1,
                     response,
@@ -514,6 +520,7 @@ class Session:
                     None,
                     auth,
                     data,
+                    cert,
                     allow_redirects,
                     remaining_redirects - 1,
                     response,
@@ -604,6 +611,7 @@ class EventLoop:
         max_connection_age=0,
         max_host_connections=0,
         max_connections=0,
+        cert=None,
     ):
         return Session(
             self._ae_loop,
@@ -615,4 +623,5 @@ class EventLoop:
             max_connection_age,
             max_host_connections,
             max_connections,
+            cert,
         )

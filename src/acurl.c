@@ -213,6 +213,8 @@ typedef struct AcRequestData {
     char *method;
     char *url;
     char *auth;
+    char *cert_file;
+    char *key_file;
     PyObject *cookies;
     int cookies_len;
     char **cookies_str;
@@ -697,6 +699,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->auth != NULL) {
         curl_easy_setopt(rd->curl, CURLOPT_USERPWD, rd->auth);
     }
+    if (rd->cert_file != NULL) {
+        curl_easy_setopt(rd->curl, CURLOPT_SSLCERT, rd->cert_file);
+        curl_easy_setopt(rd->curl, CURLOPT_SSLKEY, rd->key_file);
+    }
     for (int i = 0; i < rd->cookies_len; i++) {
         DEBUG_PRINT("set cookie [%s]", rd->cookies_str[i]);
         curl_easy_setopt(rd->curl, CURLOPT_COOKIELIST, rd->cookies_str[i]);
@@ -723,6 +729,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         free(rd->auth);
         rd->auth = NULL;
     }
+    free(rd->cert_file);
+    rd->cert_file = NULL;
+    free(rd->key_file);
+    rd->key_file = NULL;
     free(rd->cookies_str);
     if (rd->dummy) {
         rd->result = CURLE_OK;
@@ -1197,11 +1207,12 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     Py_ssize_t req_data_len = 0;
     char *req_data_buf = NULL;
     int dummy;
+    PyObject *cert = Py_None;
 
-    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "dummy", NULL};
+    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "dummy", "cert", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#p", kwlist, &future, &method, &url, &headers, &auth, &cookies,
-                                     &req_data_buf, &req_data_len, &dummy)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#p|O", kwlist, &future, &method, &url, &headers, &auth,
+                                     &cookies, &req_data_buf, &req_data_len, &dummy, &cert)) {
         return NULL;
     }
 
@@ -1249,6 +1260,22 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         rd->auth = (char *)malloc(strlen(username) + 1 + strlen(password) + 1);
         CHECK_ALLOC(rd->auth);
         sprintf(rd->auth, "%s:%s", username, password);
+    }
+    if (cert != Py_None) {
+        if (!PyTuple_CheckExact(cert) || PyTuple_GET_SIZE(cert) != 2 ||
+            !PyUnicode_CheckExact(PyTuple_GET_ITEM(cert, 0)) || !PyUnicode_CheckExact(PyTuple_GET_ITEM(cert, 1))) {
+            PyErr_SetString(PyExc_ValueError, "cert should be a tuple of strings (certfile, keyfile) or None");
+            goto error_cleanup;
+        }
+        const char *cert_file = PyUnicode_AsUTF8(PyTuple_GET_ITEM(cert, 0));
+        const char *key_file = PyUnicode_AsUTF8(PyTuple_GET_ITEM(cert, 1));
+        if (cert_file == NULL || key_file == NULL) {
+            goto error_cleanup;
+        }
+        rd->cert_file = strdup(cert_file);
+        rd->key_file = strdup(key_file);
+        CHECK_ALLOC(rd->cert_file);
+        CHECK_ALLOC(rd->key_file);
     }
     if (cookies != Py_None) {
         Py_INCREF(cookies);
@@ -1310,6 +1337,8 @@ error_cleanup:
     if (rd->auth) {
         free(rd->auth);
     }
+    free(rd->cert_file);
+    free(rd->key_file);
     if (rd->cookies) {
         Py_DECREF(rd->cookies);
         free(rd->cookies_str);
