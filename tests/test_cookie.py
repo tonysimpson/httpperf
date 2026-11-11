@@ -4,7 +4,7 @@ import acurl
 
 
 def cookie(expiration):
-    return acurl.Cookie(False, 'example.com', False, '/', False, expiration, 'name', 'value')
+    return acurl.Cookie(False, "example.com", False, "/", False, expiration, "name", "value")
 
 
 def test_has_expired():
