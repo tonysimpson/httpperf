@@ -514,7 +514,7 @@ class Session:
 
 
 class EventLoop:
-    def __init__(self, loop=None, same_thread=False):
+    def __init__(self, loop=None, same_thread=False, max_host_connections=0, max_total_connections=0):
         self._running = False
         if loop is None:
             try:
@@ -522,7 +522,7 @@ class EventLoop:
             except RuntimeError:
                 loop = asyncio.get_event_loop()
         self._loop = loop
-        self._ae_loop = _acurl.EventLoop()
+        self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections)
         # Completed requests end up on the fd pipe, complete callback called
         self._loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
         if same_thread:

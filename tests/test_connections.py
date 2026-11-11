@@ -21,6 +21,8 @@ class CountingHandler(http.server.BaseHTTPRequestHandler):
         CountingHandler.open_connections -= 1
 
     def do_GET(self):
+        if self.path == "/slow":
+            time.sleep(0.05)
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.send_header("Set-Cookie", "name=value")
@@ -70,5 +72,20 @@ def test_connection_reuse(url, connections, new):
     s = el.session(connections=connections)
     assert [loop.run_until_complete(s.get(url)).connect_time > 0 for _ in new] == new
     s.close()
+    el.stop()
+    loop.close()
+
+
+@pytest.mark.parametrize("limits, connects", [({"max_host_connections": 2}, 2), ({"max_total_connections": 3}, 3)])
+def test_event_loop_connection_limits(url, limits, connects):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop, **limits)
+    s = el.session(http_version="HTTP/1.1")
+
+    async def main():
+        return await asyncio.gather(*(s.get(url + "slow") for _ in range(6)))
+
+    responses = loop.run_until_complete(main())
+    assert sum(r.connect_time > 0 for r in responses) == connects
     el.stop()
     loop.close()

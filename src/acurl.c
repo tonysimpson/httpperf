@@ -688,6 +688,16 @@ static int make_pipe(int *read_fd, int *write_fd, bool nonblocking_read) {
 }
 
 static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
+    long max_host_connections = 0;
+    long max_total_connections = 0;
+    static char *kwlist[] = {"max_host_connections", "max_total_connections", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ll", kwlist, &max_host_connections, &max_total_connections)) {
+        return NULL;
+    }
+    if (max_host_connections < 0 || max_total_connections < 0) {
+        PyErr_SetString(PyExc_ValueError, "connection limits must not be negative");
+        return NULL;
+    }
     EventLoop *self = (EventLoop *)type->tp_alloc(type, 0);
     if (self == NULL) {
         return NULL;
@@ -704,6 +714,8 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
         goto error;
     }
     curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, 1000);
+    curl_multi_setopt(self->multi, CURLMOPT_MAX_HOST_CONNECTIONS, max_host_connections);
+    curl_multi_setopt(self->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_total_connections);
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETFUNCTION, socket_callback);
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETDATA, self);
     curl_multi_setopt(self->multi, CURLMOPT_TIMERFUNCTION, timer_callback);

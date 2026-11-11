@@ -137,6 +137,11 @@ def test_tls_invalid():
         acurl.EventLoop().session(tls="pooled")
 
 
+def test_connection_limits_invalid():
+    with pytest.raises(ValueError):
+        acurl.EventLoop(max_host_connections=-1)
+
+
 def test_http_version_invalid():
     with pytest.raises(ValueError):
         acurl.EventLoop().session(http_version="HTTP/0.9")
