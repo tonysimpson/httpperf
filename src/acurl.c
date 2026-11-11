@@ -257,6 +257,12 @@ PyObject *resp_get_info_double(Response *self, CURLINFO info) {
     return PyFloat_FromDouble(value);
 }
 
+PyObject *resp_get_info_off_t(Response *self, CURLINFO info) {
+    curl_off_t value;
+    curl_easy_getinfo(self->curl, info, &value);
+    return PyLong_FromLongLong(value);
+}
+
 PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
     char *value = NULL;
     curl_easy_getinfo(self->curl, info, &value);
@@ -277,8 +283,8 @@ RESPONSE_GETINFO(connect_time, double, CURLINFO_CONNECT_TIME)
 RESPONSE_GETINFO(appconnect_time, double, CURLINFO_APPCONNECT_TIME)
 RESPONSE_GETINFO(pretransfer_time, double, CURLINFO_PRETRANSFER_TIME)
 RESPONSE_GETINFO(starttransfer_time, double, CURLINFO_STARTTRANSFER_TIME)
-RESPONSE_GETINFO(size_upload, double, CURLINFO_SIZE_UPLOAD)
-RESPONSE_GETINFO(size_download, double, CURLINFO_SIZE_DOWNLOAD)
+RESPONSE_GETINFO(size_upload, off_t, CURLINFO_SIZE_UPLOAD_T)
+RESPONSE_GETINFO(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
 RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
 RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
 

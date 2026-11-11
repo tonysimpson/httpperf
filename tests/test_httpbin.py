@@ -116,6 +116,8 @@ def test_post_binary(httpbin):
     data = bytes(range(256))
     r = _await(s.post(httpbin.url + "/post", data=data, headers={"Content-Type": "application/octet-stream"}))
     assert r.json()["data"] == "data:application/octet-stream;base64," + base64.b64encode(data).decode()
+    assert (r.upload_size, r.download_size) == (256, len(r.body))
+    assert isinstance(r.upload_size, int) and isinstance(r.download_size, int)
 
 
 @pytest.mark.parametrize(
