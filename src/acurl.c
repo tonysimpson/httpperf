@@ -462,7 +462,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->dummy) {
         rd->result = CURLE_OK;
         curl_slist_free_all(rd->headers);
-        free(rd->req_data_buf);
+        rd->headers = NULL;
         write(loop->req_out_write, &rd, sizeof(AcRequestData *));
     } else {
         DEBUG_PRINT("adding handle");
