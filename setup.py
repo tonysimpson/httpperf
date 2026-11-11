@@ -26,7 +26,7 @@ if os.environ.get("ACURL_PROFILE"):
 
 # Building without nanoconfig
 cpy_extension = Extension(
-    "_acurl",
+    "acurl._acurl",
     sources=["src/acurl.c", "src/ae/ae.c", "src/ae/zmalloc.c"],
     libraries=["curl"],
     extra_compile_args=compile_args,

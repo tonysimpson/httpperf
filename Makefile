@@ -27,7 +27,7 @@ lint-fix: $(INSTALLED)
 	$(PYTHON) -m ruff check --fix .
 
 clean:
-	rm -rf build dist *.egg-info _acurl*.so .pytest_cache .ruff_cache uftrace.data massif.out* *.zst $(INSTALLED)
+	rm -rf build dist *.egg-info acurl/_acurl*.so .pytest_cache .ruff_cache uftrace.data massif.out* *.zst $(INSTALLED)
 	find acurl tests -name __pycache__ -prune -exec rm -rf {} +
 
 distclean: clean

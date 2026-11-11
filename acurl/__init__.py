@@ -3,8 +3,9 @@ import threading
 import time
 from urllib.parse import urlparse
 
-import _acurl
 import ujson
+
+from acurl import _acurl
 
 
 class RequestError(Exception):
