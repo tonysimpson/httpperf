@@ -53,6 +53,8 @@ static inline double monotonic_time(void) {
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
+struct AcRequestData;
+
 typedef struct {
     PyObject_HEAD aeEventLoop *event_loop;
     PyThreadState *thread_state;
@@ -67,6 +69,8 @@ typedef struct {
     int stop_write;
     int curl_easy_cleanup_read;
     int curl_easy_cleanup_write;
+    struct AcRequestData *unsent_head;
+    struct AcRequestData *unsent_tail;
 } EventLoop;
 
 typedef struct HostSlot {
@@ -75,8 +79,6 @@ typedef struct HostSlot {
     bool multiplexed;
     struct HostSlot *next;
 } HostSlot;
-
-struct AcRequestData;
 
 typedef struct {
     CURLSH *share;
@@ -232,6 +234,7 @@ typedef struct AcRequestData {
     struct BufferNode *body_buffer_tail;
     HostSlot *slot;
     struct AcRequestData *next_waiting;
+    struct AcRequestData *next_unsent;
     double queued_at;
     double queue_time;
 } AcRequestData;
@@ -468,6 +471,7 @@ static void check_multi(EventLoop *loop, CURLMcode rc) {
 }
 
 static void add_transfer(EventLoop *loop, AcRequestData *rd);
+static void send_completed(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask);
 
 static char *host_key(const char *url) {
     CURLU *u = curl_url();
@@ -589,9 +593,39 @@ static void complete_request(EventLoop *loop, AcRequestData *rd) {
     }
     share_decref(rd->share);
     rd->share = NULL;
-    if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
-        perror("acurl: failed to return completed request");
+    if (loop->unsent_head == NULL) {
+        if (pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
+            return;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("acurl: failed to return completed request");
+            return;
+        }
+        if (aeCreateFileEvent(loop->event_loop, loop->req_out_write, AE_WRITABLE, send_completed, loop) == AE_ERR) {
+            fprintf(stderr, "acurl: failed to watch the completed request pipe\n");
+        }
+        loop->unsent_head = rd;
+    } else {
+        loop->unsent_tail->next_unsent = rd;
     }
+    loop->unsent_tail = rd;
+}
+
+static void send_completed(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
+    EventLoop *loop = (EventLoop *)clientData;
+    while (loop->unsent_head != NULL) {
+        AcRequestData *rd = loop->unsent_head;
+        if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            perror("acurl: failed to return completed request");
+        }
+        loop->unsent_head = rd->next_unsent;
+        rd->next_unsent = NULL;
+    }
+    loop->unsent_tail = NULL;
+    aeDeleteFileEvent(loop->event_loop, loop->req_out_write, AE_WRITABLE);
 }
 
 void response_complete(EventLoop *loop) {
@@ -857,12 +891,13 @@ int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
     return 0;
 }
 
-static int make_pipe(int *read_fd, int *write_fd, bool nonblocking_read) {
+static int make_pipe(int *read_fd, int *write_fd, bool nonblocking_read, bool nonblocking_write) {
     int fds[2];
     if (pipe(fds) == -1) {
         return -1;
     }
-    if (nonblocking_read && fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK) == -1) {
+    if ((nonblocking_read && fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK) == -1) ||
+        (nonblocking_write && fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK) == -1)) {
         int saved_errno = errno;
         close(fds[0]);
         close(fds[1]);
@@ -919,10 +954,10 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
         PyErr_SetFromErrno(PyExc_OSError);
         goto error;
     }
-    if (make_pipe(&self->req_in_read, &self->req_in_write, true) == -1 ||
-        make_pipe(&self->req_out_read, &self->req_out_write, true) == -1 ||
-        make_pipe(&self->stop_read, &self->stop_write, false) == -1 ||
-        make_pipe(&self->curl_easy_cleanup_read, &self->curl_easy_cleanup_write, true) == -1) {
+    if (make_pipe(&self->req_in_read, &self->req_in_write, true, false) == -1 ||
+        make_pipe(&self->req_out_read, &self->req_out_write, true, true) == -1 ||
+        make_pipe(&self->stop_read, &self->stop_write, false, false) == -1 ||
+        make_pipe(&self->curl_easy_cleanup_read, &self->curl_easy_cleanup_write, true, true) == -1) {
         PyErr_SetFromErrno(PyExc_OSError);
         goto error;
     }

@@ -57,3 +57,32 @@ except OSError as e:
     p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     assert p.returncode == 0, p.stderr
     assert p.stdout.split() == ["OSError", str(errno.EMFILE)]
+
+
+def test_many_requests_and_sessions_do_not_block_pipes():
+    code = """
+import asyncio, socket
+import acurl
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+url = "http://127.0.0.1:%d/" % sock.getsockname()[1]
+sock.close()
+
+
+async def main():
+    el = acurl.EventLoop()
+    session = el.session()
+    results = await asyncio.gather(*(session.get(url) for _ in range(20000)), return_exceptions=True)
+    sessions = [el.session(connections="session") for _ in range(20000)]
+    el.stop()
+    el._thread.join()
+    del sessions
+    print(sum(isinstance(r, acurl.RequestError) for r in results))
+
+
+asyncio.run(main())
+"""
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.split() == ["20000"]
