@@ -27,3 +27,8 @@ env/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+
+# Profiling output
+uftrace.data/
+*.zst
+massif.out*

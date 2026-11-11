@@ -30,16 +30,6 @@ static inline double gettime(void) {
     return ((double)tp.tv_sec) + ((double)tp.tv_nsec / 1000000000.0);
 }
 
-/* For finding memory used by the program */
-
-static inline int getmem(void) {
-    int mem;
-    FILE *f = fopen("/proc/self/statm", "rb");
-    fscanf(f, "%*d %d", &mem);
-    fclose(f);
-    return mem * 4096;
-}
-
 /* Macro for debugging */
 
 #define REQUEST_TRACE 0
@@ -48,24 +38,6 @@ static inline int getmem(void) {
 #define REQUEST_TRACE_PRINT(location, pointer) fprintf(stderr, "%s %p %f\n", location, pointer, gettime())
 #else
 #define REQUEST_TRACE_PRINT(location, pointer) /* Don't do anything in release builds */
-#endif
-
-/* Can be enabled to trace time or memory usage*/
-
-#define PROFILE 0
-#if defined(PROFILE) && PROFILE == 1
-#include <sys/syscall.h>
-#define ENTER() \
-    fprintf(stderr, "ENTER %ld:%s:%d:%s %.9f\n", (long)syscall(SYS_gettid), __FILE__, __LINE__, __func__, gettime())
-#define EXIT() \
-    fprintf(stderr, "EXIT %ld:%s:%d:%s %.9f\n", (long)syscall(SYS_gettid), __FILE__, __LINE__, __func__, gettime())
-#elif defined(PROFILE) && PROFILE == 2
-#include <sys/syscall.h>
-#define ENTER() fprintf(stderr, "ENTER %s:%d:%s %d\n", __FILE__, __LINE__, __func__, getmem())
-#define EXIT() fprintf(stderr, "EXIT %s:%d:%s %d\n", __FILE__, __LINE__, __func__, getmem())
-#else
-#define ENTER()
-#define EXIT()
 #endif
 
 /* Used to tell gcc about expected code branches, likely not necessary */
@@ -132,7 +104,6 @@ typedef struct {
 } Response;
 
 void free_buffer_nodes(struct BufferNode *start) {
-    ENTER();
     struct BufferNode *node = start;
     while (node != NULL) {
         struct BufferNode *next = node->next;
@@ -140,24 +111,20 @@ void free_buffer_nodes(struct BufferNode *start) {
         free(node);
         node = next;
     };
-    EXIT();
 }
 
 /* Python deallocator for Response Object. For GC */
 
 static void Response_dealloc(Response *self) {
-    ENTER();
     DEBUG_PRINT("response=%p", self);
     free_buffer_nodes(self->header_buffer);
     free_buffer_nodes(self->body_buffer);
     write(self->session->loop->curl_easy_cleanup_write, &self->curl, sizeof(CURL *));
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
-    EXIT();
 }
 
 PyObject *get_buffer_as_pylist(struct BufferNode *start) {
-    ENTER();
     int i = 0, len = 0;
     PyObject *list;
     struct BufferNode *node = start;
@@ -173,46 +140,36 @@ PyObject *get_buffer_as_pylist(struct BufferNode *start) {
         node = node->next;
     };
     DEBUG_PRINT("list=%p", list);
-    EXIT();
     return list;
 }
 
 static PyObject *Response_get_header(Response *self, PyObject *args) {
-    ENTER();
     DEBUG_PRINT("");
     PyObject *rtn = get_buffer_as_pylist(self->header_buffer);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_body(Response *self, PyObject *args) {
-    ENTER();
     DEBUG_PRINT("");
     PyObject *rtn = get_buffer_as_pylist(self->body_buffer);
-    EXIT();
     return rtn;
 }
 
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
-    ENTER();
     long value;
     curl_easy_getinfo(self->curl, info, &value);
     PyObject *rtn = PyLong_FromLong(value);
-    EXIT();
     return rtn;
 }
 
 PyObject *resp_get_info_double(Response *self, CURLINFO info) {
-    ENTER();
     double value;
     curl_easy_getinfo(self->curl, info, &value);
     PyObject *rtn = PyFloat_FromDouble(value);
-    EXIT();
     return rtn;
 }
 
 PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
-    ENTER();
     char *value = NULL;
     curl_easy_getinfo(self->curl, info, &value);
     PyObject *rtn;
@@ -222,89 +179,65 @@ PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
         Py_INCREF(Py_None);
         rtn = Py_None;
     }
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_effective_url(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_unicode(self, CURLINFO_EFFECTIVE_URL);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_response_code(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_long(self, CURLINFO_RESPONSE_CODE);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_total_time(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_TOTAL_TIME);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_namelookup_time(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_NAMELOOKUP_TIME);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_connect_time(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_CONNECT_TIME);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_appconnect_time(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_APPCONNECT_TIME);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_pretransfer_time(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_PRETRANSFER_TIME);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_starttransfer_time(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_STARTTRANSFER_TIME);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_size_upload(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_SIZE_UPLOAD);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_size_download(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_double(self, CURLINFO_SIZE_DOWNLOAD);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_primary_ip(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_unicode(self, CURLINFO_PRIMARY_IP);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
-    ENTER();
     struct curl_slist *start = NULL;
     struct curl_slist *node = NULL;
     int len = 0;
@@ -323,14 +256,11 @@ static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
         node = node->next;
     };
     curl_slist_free_all(start);
-    EXIT();
     return list;
 }
 
 static PyObject *Response_get_redirect_url(Response *self, PyObject *args) {
-    ENTER();
     PyObject *rtn = resp_get_info_unicode(self, CURLINFO_REDIRECT_URL);
-    EXIT();
     return rtn;
 }
 
@@ -402,7 +332,6 @@ static PyTypeObject ResponseType = {
 /* When at least one request has completed, write completed responses onto completion queue*/
 
 void response_complete(EventLoop *loop) {
-    ENTER();
     DEBUG_PRINT("loop=%p", loop);
     int remaining_in_queue = 1;
     AcRequestData *rd;
@@ -426,23 +355,19 @@ void response_complete(EventLoop *loop) {
         REQUEST_TRACE_PRINT("response_complete", rd);
         write(loop->req_out_write, &rd, sizeof(AcRequestData *));
     }
-    EXIT();
 }
 
 void socket_action_and_response_complete(EventLoop *loop, curl_socket_t socket, int ev_bitmask) {
-    ENTER();
     DEBUG_PRINT("loop=%p socket=%d ev_bitmask=%d", loop, socket, ev_bitmask);
     int running_handles;
     curl_multi_socket_action(loop->multi, socket, ev_bitmask, &running_handles);
     DEBUG_PRINT("after running_handlesr=%d", running_handles);
     response_complete(loop);
-    EXIT();
 }
 
 /* See docs for CURLOPT_HEADERFUNCTION */
 
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
-    ENTER();
     AcRequestData *rd = (AcRequestData *)userdata;
     struct BufferNode *node = (struct BufferNode *)malloc(sizeof(struct BufferNode));
     node->len = size * nmemb;
@@ -456,14 +381,12 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
         rd->header_buffer_tail->next = node;
     }
     rd->header_buffer_tail = node;
-    EXIT();
     return node->len;
 }
 
 /* See docs for CURLOPT_WTIE_FUNCTION */
 
 size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
-    ENTER();
     AcRequestData *rd = (AcRequestData *)userdata;
     struct BufferNode *node = (struct BufferNode *)malloc(sizeof(struct BufferNode));
     node->len = size * nmemb;
@@ -477,12 +400,10 @@ size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
         rd->body_buffer_tail->next = node;
     }
     rd->body_buffer_tail = node;
-    EXIT();
     return node->len;
 }
 
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
-    ENTER();
     AcRequestData *rd;
     EventLoop *loop = (EventLoop *)clientData;
     int b_read = read(loop->req_in_read, &rd, sizeof(AcRequestData *));
@@ -537,22 +458,18 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         DEBUG_PRINT("adding handle");
         curl_multi_add_handle(loop->multi, rd->curl);
     }
-    EXIT();
 }
 
 void stop_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
-    ENTER();
     char buffer[1];
     EventLoop *loop = (EventLoop *)clientData;
     read(loop->stop_read, buffer, sizeof(buffer));
     loop->stop = true;
-    EXIT();
 }
 
 /* Used to cleanup curl handles by putting the handle back on a pipe to be picked up and cleaned up */
 
 void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
-    ENTER();
     CURL *curl;
     while (true) {
         int b_read = read(fd, &curl, sizeof(CURL *));
@@ -562,11 +479,9 @@ void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void 
         DEBUG_PRINT("curl=%p", curl);
         curl_easy_cleanup(curl);
     }
-    EXIT();
 }
 
 void socket_event(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
-    ENTER();
     DEBUG_PRINT("eventloop=%p fd=%d clientData=%p mask=%d (readable=%d writable=%d)", eventLoop, fd, clientData, mask,
                 mask & AE_READABLE, mask & AE_WRITABLE);
     int ev_bitmask = 0;
@@ -577,11 +492,9 @@ void socket_event(struct aeEventLoop *eventLoop, int fd, void *clientData, int m
         ev_bitmask |= CURL_CSELECT_OUT;
     }
     socket_action_and_response_complete((EventLoop *)clientData, (curl_socket_t)fd, ev_bitmask);
-    EXIT();
 }
 
 int socket_callback(CURL *easy, curl_socket_t s, int what, void *userp, void *socketp) {
-    ENTER();
     EventLoop *loop = (EventLoop *)userp;
     switch (what) {
     case CURL_POLL_NONE:
@@ -607,24 +520,20 @@ int socket_callback(CURL *easy, curl_socket_t s, int what, void *userp, void *so
         aeDeleteFileEvent(loop->event_loop, (int)s, AE_READABLE | AE_WRITABLE);
         break;
     };
-    EXIT();
     return 0;
 }
 
 int timeout(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    ENTER();
     DEBUG_PRINT("");
     EventLoop *loop = (EventLoop *)clientData;
     loop->timer_id = NO_ACTIVE_TIMER_ID;
     socket_action_and_response_complete(loop, CURL_SOCKET_TIMEOUT, 0);
-    EXIT();
     return AE_NOMORE;
 }
 
 /* See docs for CURLMOPT_TIMERFUNCTION */
 
 int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
-    ENTER();
     DEBUG_PRINT("timeout_ms=%ld", timeout_ms);
     EventLoop *loop = (EventLoop *)userp;
     if (loop->timer_id != NO_ACTIVE_TIMER_ID) {
@@ -639,7 +548,6 @@ int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
         }
         DEBUG_PRINT("CREATE timer_id=%ld", loop->timer_id);
     }
-    EXIT();
     return 0;
 }
 
@@ -651,7 +559,6 @@ void set_none_blocking(int fd) {
 }
 
 static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
-    ENTER();
     EventLoop *self = (EventLoop *)type->tp_alloc(type, 0);
     int req_in[2];
     int req_out[2];
@@ -692,12 +599,10 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
             exit(1);
         }
     }
-    EXIT();
     return (PyObject *)self;
 }
 
 static void EventLoop_dealloc(EventLoop *self) {
-    ENTER();
     DEBUG_PRINT("response=%p", self);
     curl_multi_cleanup(self->multi);
     aeDeleteEventLoop(self->event_loop);
@@ -713,15 +618,12 @@ static void EventLoop_dealloc(EventLoop *self) {
 }
 
 static PyObject *EventLoop_once(EventLoop *self, PyObject *args) {
-    ENTER();
     aeProcessEvents(self->event_loop, AE_ALL_EVENTS | AE_DONT_WAIT);
     Py_INCREF(Py_None);
-    EXIT();
     return Py_None;
 }
 
 static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
-    ENTER();
     DEBUG_PRINT("Started");
     self->thread_state = PyEval_SaveThread();
     do {
@@ -732,34 +634,27 @@ static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
     PyEval_RestoreThread(self->thread_state);
     DEBUG_PRINT("Ended");
     Py_INCREF(Py_None);
-    EXIT();
     return Py_None;
 }
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
-    ENTER();
     if (write(((EventLoop *)self)->stop_write, "\0", 1) != 1) {
         PyErr_SetFromErrno(PyExc_OSError);
-        EXIT();
         return NULL;
     }
     Py_INCREF(Py_None);
-    EXIT();
     return Py_None;
 }
 
 /* Get the out pipe */
 
 static PyObject *Eventloop_get_out_fd(PyObject *self, PyObject *args) {
-    ENTER();
     DEBUG_PRINT("");
     PyObject *rtn = Py_BuildValue("i", ((EventLoop *)self)->req_out_read);
-    EXIT();
     return rtn;
 }
 
 static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
-    ENTER();
     AcRequestData *rd;
     PyObject *list = PyList_New(0);
     while (true) {
@@ -801,7 +696,6 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         Py_XDECREF(rd->cookies);
         free(rd);
     }
-    EXIT();
     return list;
 }
 
@@ -856,19 +750,16 @@ static PyTypeObject EventLoopType = {
 };
 
 static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
-    ENTER();
     Session *self;
     EventLoop *loop;
 
     static char *kwlist[] = {"loop", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &loop)) {
-        EXIT();
         return NULL;
     }
 
     self = (Session *)type->tp_alloc(type, 0);
     if (self == NULL) {
-        EXIT();
         return NULL;
     }
 
@@ -878,17 +769,14 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     curl_share_setopt(self->shared, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
     curl_share_setopt(self->shared, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
     curl_share_setopt(self->shared, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-    EXIT();
     return (PyObject *)self;
 }
 
 static void Session_dealloc(Session *self) {
-    ENTER();
     DEBUG_PRINT("response=%p", self);
     curl_share_cleanup(self->shared);
     Py_XDECREF(self->loop);
     Py_TYPE(self)->tp_free((PyObject *)self);
-    EXIT();
 }
 
 #define CHECK_ALLOC(p)          \
@@ -900,7 +788,6 @@ static void Session_dealloc(Session *self) {
     } while (0)
 
 static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
-    ENTER();
     char *method;
     char *url;
     PyObject *future;
@@ -915,14 +802,12 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#p", kwlist, &future, &method, &url, &headers, &auth, &cookies,
                                      &req_data_buf, &req_data_len, &dummy)) {
-        EXIT();
         return NULL;
     }
 
     AcRequestData *rd = (AcRequestData *)calloc(1, sizeof(AcRequestData));
     if (rd == NULL) {
         PyErr_NoMemory();
-        EXIT();
         return NULL;
     }
     REQUEST_TRACE_PRINT("Session_request", rd);
@@ -1004,7 +889,6 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     write(self->loop->req_in_write, &rd, sizeof(AcRequestData *));
     DEBUG_PRINT("scheduling request");
     Py_INCREF(Py_None);
-    EXIT();
     return Py_None;
 
 error_cleanup:
@@ -1022,7 +906,6 @@ error_cleanup:
     free(rd->url);
     free(rd->req_data_buf);
     free(rd);
-    EXIT();
     return NULL;
 }
 

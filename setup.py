@@ -9,18 +9,27 @@ with open(os.path.join("acurl", "version.py")) as f:
     exec(f.read())
 
 
+compile_args = [
+    "-Wall",
+    "-Wextra",
+    "-Wno-unused-parameter",
+    "-Wno-missing-field-initializers",
+    "-Wno-cast-function-type",
+]
+if os.environ.get("ACURL_PROFILE"):
+    compile_args += [
+        "-g",
+        "-fno-omit-frame-pointer",
+        "-finstrument-functions",
+        "-finstrument-functions-exclude-file-list=src/ae/,/usr/include/,include/python",
+    ]
+
 # Building without nanoconfig
 cpy_extension = Extension(
     "_acurl",
     sources=["src/acurl.c", "src/ae/ae.c", "src/ae/zmalloc.c"],
     libraries=["curl"],
-    extra_compile_args=[
-        "-Wall",
-        "-Wextra",
-        "-Wno-unused-parameter",
-        "-Wno-missing-field-initializers",
-        "-Wno-cast-function-type",
-    ],
+    extra_compile_args=compile_args,
     # extra_compile_args=['-g', '-fno-omit-frame-pointer', '-O0'], # used for performance/debug
 )
 
