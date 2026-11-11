@@ -82,7 +82,7 @@ static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
     pthread_mutex_unlock(&((Share *)userptr)->locks[data]);
 }
 
-static Share *share_new(void) {
+static Share *share_new(bool share_connections) {
     Share *share = calloc(1, sizeof(Share));
     if (share == NULL) {
         return NULL;
@@ -102,6 +102,9 @@ static Share *share_new(void) {
     curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
     curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
     curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    if (share_connections) {
+        curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    }
     return share;
 }
 
@@ -146,9 +149,10 @@ static int pipe_read(int fd, void *buf, size_t len) {
 
 static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
     CleanupItem item = {curl, share};
-    share_incref(share);
     if (!pipe_write(loop->curl_easy_cleanup_write, &item, sizeof(item))) {
-        curl_easy_cleanup(curl);
+        if (curl != NULL) {
+            curl_easy_cleanup(curl);
+        }
         share_decref(share);
     }
 }
@@ -156,6 +160,7 @@ static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
 typedef struct {
     PyObject_HEAD EventLoop *loop;
     Share *shared;
+    bool fresh_connect;
 } Session;
 
 /* Node in a linked list structure. Used for piecing together sections of resposnes e.g. headers and body.
@@ -211,6 +216,7 @@ static void Response_dealloc(Response *self) {
     DEBUG_PRINT("response=%p", self);
     free_buffer_nodes(self->header_buffer);
     free_buffer_nodes(self->body_buffer);
+    share_incref(self->session->shared);
     queue_cleanup(self->session->loop, self->curl, self->session->shared);
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
@@ -473,6 +479,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     DEBUG_PRINT("read AcRequestData");
     rd->curl = curl_easy_init();
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->session->shared->share);
+    if (rd->session->fresh_connect) {
+        curl_easy_setopt(rd->curl, CURLOPT_FRESH_CONNECT, 1L);
+        curl_easy_setopt(rd->curl, CURLOPT_FORBID_REUSE, 1L);
+    }
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
@@ -543,7 +553,9 @@ void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void 
     CleanupItem item;
     while (pipe_read(fd, &item, sizeof(item)) == 1) {
         DEBUG_PRINT("curl=%p", item.curl);
-        curl_easy_cleanup(item.curl);
+        if (item.curl != NULL) {
+            curl_easy_cleanup(item.curl);
+        }
         share_decref(item.share);
     }
 }
@@ -692,6 +704,9 @@ static void close_fd(int fd) {
 
 static void EventLoop_dealloc(EventLoop *self) {
     DEBUG_PRINT("response=%p", self);
+    if (self->curl_easy_cleanup_read != -1) {
+        curl_easy_cleanup_in_eventloop(NULL, self->curl_easy_cleanup_read, self, 0);
+    }
     if (self->multi != NULL) {
         curl_multi_cleanup(self->multi);
     }
@@ -765,6 +780,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyObject *error = PyUnicode_FromString(curl_easy_strerror(rd->result));
             free_buffer_nodes(rd->header_buffer_head);
             free_buffer_nodes(rd->body_buffer_head);
+            share_incref(rd->session->shared);
             queue_cleanup(rd->session->loop, rd->curl, rd->session->shared);
             Py_DECREF(rd->session);
 
@@ -842,8 +858,16 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     Session *self;
     EventLoop *loop;
 
-    static char *kwlist[] = {"loop", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &loop)) {
+    const char *connections = "shared";
+
+    static char *kwlist[] = {"loop", "connections", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|s", kwlist, &loop, &connections)) {
+        return NULL;
+    }
+    bool share_connections = strcmp(connections, "session") == 0;
+    bool fresh_connect = strcmp(connections, "none") == 0;
+    if (!share_connections && !fresh_connect && strcmp(connections, "shared") != 0) {
+        PyErr_Format(PyExc_ValueError, "connections must be 'shared', 'session' or 'none', not '%s'", connections);
         return NULL;
     }
 
@@ -854,7 +878,8 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 
     Py_INCREF(loop);
     self->loop = loop;
-    self->shared = share_new();
+    self->fresh_connect = fresh_connect;
+    self->shared = share_new(share_connections);
     if (self->shared == NULL) {
         Py_DECREF(self);
         return PyErr_NoMemory();
@@ -865,7 +890,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 static void Session_dealloc(Session *self) {
     DEBUG_PRINT("response=%p", self);
     if (self->shared != NULL) {
-        share_decref(self->shared);
+        queue_cleanup(self->loop, NULL, self->shared);
     }
     Py_XDECREF(self->loop);
     Py_TYPE(self)->tp_free((PyObject *)self);

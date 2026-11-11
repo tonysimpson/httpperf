@@ -120,6 +120,18 @@ def test_post_binary(httpbin):
     assert isinstance(r.upload_size, int) and isinstance(r.download_size, int)
 
 
+@pytest.mark.parametrize("connections", ["shared", "session", "none"])
+def test_connections(httpbin, connections):
+    s = acurl.EventLoop().session(connections=connections)
+    for _ in range(2):
+        assert _await(s.get(httpbin.url + "/get")).status_code == 200
+
+
+def test_connections_invalid():
+    with pytest.raises(ValueError):
+        acurl.EventLoop().session(connections="pooled")
+
+
 def test_client_lag(httpbin):
     s = session()
     r = _await(s.get(httpbin.url + "/delay/0"))
