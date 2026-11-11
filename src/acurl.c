@@ -82,7 +82,7 @@ static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
     pthread_mutex_unlock(&((Share *)userptr)->locks[data]);
 }
 
-static Share *share_new(bool share_connections) {
+static Share *share_new(bool share_connections, bool share_tls) {
     Share *share = calloc(1, sizeof(Share));
     if (share == NULL) {
         return NULL;
@@ -101,7 +101,9 @@ static Share *share_new(bool share_connections) {
     curl_share_setopt(share->share, CURLSHOPT_USERDATA, share);
     curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE);
     curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-    curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    if (share_tls) {
+        curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    }
     if (share_connections) {
         curl_share_setopt(share->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
     }
@@ -859,15 +861,21 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     EventLoop *loop;
 
     const char *connections = "shared";
+    const char *tls = "shared";
 
-    static char *kwlist[] = {"loop", "connections", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|s", kwlist, &loop, &connections)) {
+    static char *kwlist[] = {"loop", "connections", "tls", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|ss", kwlist, &loop, &connections, &tls)) {
         return NULL;
     }
     bool share_connections = strcmp(connections, "session") == 0;
     bool fresh_connect = strcmp(connections, "none") == 0;
     if (!share_connections && !fresh_connect && strcmp(connections, "shared") != 0) {
         PyErr_Format(PyExc_ValueError, "connections must be 'shared', 'session' or 'none', not '%s'", connections);
+        return NULL;
+    }
+    bool share_tls = strcmp(tls, "session") == 0;
+    if (!share_tls && strcmp(tls, "shared") != 0) {
+        PyErr_Format(PyExc_ValueError, "tls must be 'shared' or 'session', not '%s'", tls);
         return NULL;
     }
 
@@ -879,7 +887,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     Py_INCREF(loop);
     self->loop = loop;
     self->fresh_connect = fresh_connect;
-    self->shared = share_new(share_connections);
+    self->shared = share_new(share_connections, share_tls);
     if (self->shared == NULL) {
         Py_DECREF(self);
         return PyErr_NoMemory();

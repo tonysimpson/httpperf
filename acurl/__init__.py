@@ -357,9 +357,9 @@ class Response:
 
 
 class Session:
-    def __init__(self, ae_loop, loop, connections="shared"):
+    def __init__(self, ae_loop, loop, connections="shared", tls="shared"):
         self._loop = loop
-        self._session = _acurl.Session(ae_loop, connections)
+        self._session = _acurl.Session(ae_loop, connections, tls)
         self._response_callback = None
 
     async def get(self, url, **kwargs):
@@ -554,5 +554,5 @@ class EventLoop:
             else:
                 future.set_exception(RequestError(error))
 
-    def session(self, connections="shared"):
-        return Session(self._ae_loop, self._loop, connections)
+    def session(self, connections="shared", tls="shared"):
+        return Session(self._ae_loop, self._loop, connections, tls)

@@ -132,6 +132,11 @@ def test_connections_invalid():
         acurl.EventLoop().session(connections="pooled")
 
 
+def test_tls_invalid():
+    with pytest.raises(ValueError):
+        acurl.EventLoop().session(tls="pooled")
+
+
 def test_client_lag(httpbin):
     s = session()
     r = _await(s.get(httpbin.url + "/delay/0"))
