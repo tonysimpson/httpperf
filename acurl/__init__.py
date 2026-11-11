@@ -412,7 +412,9 @@ class Session:
     def set_response_callback(self, callback):
         self._response_callback = callback
 
-    async def _request(self, method, url, header_tuple, cookie_tuple, auth, data, allow_redirects, remaining_redirects):
+    async def _request(
+        self, method, url, header_tuple, cookie_tuple, auth, data, allow_redirects, remaining_redirects, prev=None
+    ):
         start_time = time.time()
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
 
@@ -428,6 +430,8 @@ class Session:
             dummy=False,
         )
         response = Response(request, await future, start_time)
+        if prev is not None:
+            response._prev = prev
 
         if self._response_callback:
             self._response_callback(response)
@@ -444,6 +448,7 @@ class Session:
                     None,
                     allow_redirects,
                     remaining_redirects - 1,
+                    response,
                 )
             else:
                 redir_response = await self._request(
@@ -455,8 +460,8 @@ class Session:
                     data,
                     allow_redirects,
                     remaining_redirects - 1,
+                    response,
                 )
-            redir_response._prev = response
             return redir_response
         return response
 

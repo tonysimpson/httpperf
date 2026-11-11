@@ -88,3 +88,13 @@ def test_set_encoding(httpbin):
     r.encoding = "latin1"
     assert r.encoding == "latin1"
     assert r.text == r.body.decode("latin1")
+
+
+def test_redirect_history(httpbin):
+    s = session()
+    r = _await(s.get(httpbin.url + "/redirect/3"))
+    assert [h.url for h in r.history] == [
+        httpbin.url + "/redirect/3",
+        httpbin.url + "/relative-redirect/2",
+        httpbin.url + "/relative-redirect/1",
+    ]
