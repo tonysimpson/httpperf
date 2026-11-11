@@ -145,97 +145,50 @@ PyObject *get_buffer_as_pylist(struct BufferNode *start) {
 
 static PyObject *Response_get_header(Response *self, PyObject *args) {
     DEBUG_PRINT("");
-    PyObject *rtn = get_buffer_as_pylist(self->header_buffer);
-    return rtn;
+    return get_buffer_as_pylist(self->header_buffer);
 }
 
 static PyObject *Response_get_body(Response *self, PyObject *args) {
     DEBUG_PRINT("");
-    PyObject *rtn = get_buffer_as_pylist(self->body_buffer);
-    return rtn;
+    return get_buffer_as_pylist(self->body_buffer);
 }
 
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
     long value;
     curl_easy_getinfo(self->curl, info, &value);
-    PyObject *rtn = PyLong_FromLong(value);
-    return rtn;
+    return PyLong_FromLong(value);
 }
 
 PyObject *resp_get_info_double(Response *self, CURLINFO info) {
     double value;
     curl_easy_getinfo(self->curl, info, &value);
-    PyObject *rtn = PyFloat_FromDouble(value);
-    return rtn;
+    return PyFloat_FromDouble(value);
 }
 
 PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
     char *value = NULL;
     curl_easy_getinfo(self->curl, info, &value);
-    PyObject *rtn;
-    if (value != NULL) {
-        rtn = PyUnicode_FromString(value);
-    } else {
-        Py_INCREF(Py_None);
-        rtn = Py_None;
+    if (value == NULL) {
+        Py_RETURN_NONE;
     }
-    return rtn;
+    return PyUnicode_FromString(value);
 }
 
-static PyObject *Response_get_effective_url(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_unicode(self, CURLINFO_EFFECTIVE_URL);
-    return rtn;
-}
+#define RESPONSE_GETINFO(name, kind, info) \
+    static PyObject *Response_get_##name(Response *self, PyObject *args) { return resp_get_info_##kind(self, info); }
 
-static PyObject *Response_get_response_code(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_long(self, CURLINFO_RESPONSE_CODE);
-    return rtn;
-}
-
-static PyObject *Response_get_total_time(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_TOTAL_TIME);
-    return rtn;
-}
-
-static PyObject *Response_get_namelookup_time(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_NAMELOOKUP_TIME);
-    return rtn;
-}
-
-static PyObject *Response_get_connect_time(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_CONNECT_TIME);
-    return rtn;
-}
-
-static PyObject *Response_get_appconnect_time(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_APPCONNECT_TIME);
-    return rtn;
-}
-
-static PyObject *Response_get_pretransfer_time(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_PRETRANSFER_TIME);
-    return rtn;
-}
-
-static PyObject *Response_get_starttransfer_time(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_STARTTRANSFER_TIME);
-    return rtn;
-}
-
-static PyObject *Response_get_size_upload(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_SIZE_UPLOAD);
-    return rtn;
-}
-
-static PyObject *Response_get_size_download(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_double(self, CURLINFO_SIZE_DOWNLOAD);
-    return rtn;
-}
-
-static PyObject *Response_get_primary_ip(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_unicode(self, CURLINFO_PRIMARY_IP);
-    return rtn;
-}
+RESPONSE_GETINFO(effective_url, unicode, CURLINFO_EFFECTIVE_URL)
+RESPONSE_GETINFO(response_code, long, CURLINFO_RESPONSE_CODE)
+RESPONSE_GETINFO(total_time, double, CURLINFO_TOTAL_TIME)
+RESPONSE_GETINFO(namelookup_time, double, CURLINFO_NAMELOOKUP_TIME)
+RESPONSE_GETINFO(connect_time, double, CURLINFO_CONNECT_TIME)
+RESPONSE_GETINFO(appconnect_time, double, CURLINFO_APPCONNECT_TIME)
+RESPONSE_GETINFO(pretransfer_time, double, CURLINFO_PRETRANSFER_TIME)
+RESPONSE_GETINFO(starttransfer_time, double, CURLINFO_STARTTRANSFER_TIME)
+RESPONSE_GETINFO(size_upload, double, CURLINFO_SIZE_UPLOAD)
+RESPONSE_GETINFO(size_download, double, CURLINFO_SIZE_DOWNLOAD)
+RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
+RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
 
 static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
     struct curl_slist *start = NULL;
@@ -257,11 +210,6 @@ static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
     };
     curl_slist_free_all(start);
     return list;
-}
-
-static PyObject *Response_get_redirect_url(Response *self, PyObject *args) {
-    PyObject *rtn = resp_get_info_unicode(self, CURLINFO_REDIRECT_URL);
-    return rtn;
 }
 
 static PyMethodDef Response_methods[] = {
@@ -619,8 +567,7 @@ static void EventLoop_dealloc(EventLoop *self) {
 
 static PyObject *EventLoop_once(EventLoop *self, PyObject *args) {
     aeProcessEvents(self->event_loop, AE_ALL_EVENTS | AE_DONT_WAIT);
-    Py_INCREF(Py_None);
-    return Py_None;
+    Py_RETURN_NONE;
 }
 
 static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
@@ -633,8 +580,7 @@ static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
     } while (!self->stop);
     PyEval_RestoreThread(self->thread_state);
     DEBUG_PRINT("Ended");
-    Py_INCREF(Py_None);
-    return Py_None;
+    Py_RETURN_NONE;
 }
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
@@ -642,16 +588,14 @@ static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
         PyErr_SetFromErrno(PyExc_OSError);
         return NULL;
     }
-    Py_INCREF(Py_None);
-    return Py_None;
+    Py_RETURN_NONE;
 }
 
 /* Get the out pipe */
 
 static PyObject *Eventloop_get_out_fd(PyObject *self, PyObject *args) {
     DEBUG_PRINT("");
-    PyObject *rtn = Py_BuildValue("i", ((EventLoop *)self)->req_out_read);
-    return rtn;
+    return Py_BuildValue("i", ((EventLoop *)self)->req_out_read);
 }
 
 static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
@@ -888,8 +832,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
 
     write(self->loop->req_in_write, &rd, sizeof(AcRequestData *));
     DEBUG_PRINT("scheduling request");
-    Py_INCREF(Py_None);
-    return Py_None;
+    Py_RETURN_NONE;
 
 error_cleanup:
     if (rd->headers) {
