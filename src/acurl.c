@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -562,69 +563,93 @@ int timer_callback(CURLM *multi, long timeout_ms, void *userp) {
     return 0;
 }
 
-void set_none_blocking(int fd) {
-    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)) {
-        fprintf(stderr, "Failed to set O_NONBLOCK on fd %d\n", fd);
-        exit(1);
+static int make_pipe(int *read_fd, int *write_fd, bool nonblocking_read) {
+    int fds[2];
+    if (pipe(fds) == -1) {
+        return -1;
     }
+    if (nonblocking_read && fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK) == -1) {
+        int saved_errno = errno;
+        close(fds[0]);
+        close(fds[1]);
+        errno = saved_errno;
+        return -1;
+    }
+    *read_fd = fds[0];
+    *write_fd = fds[1];
+    return 0;
 }
 
 static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     EventLoop *self = (EventLoop *)type->tp_alloc(type, 0);
-    int req_in[2];
-    int req_out[2];
-    int stop[2];
-    int curl_easy_cleanup[2];
+    if (self == NULL) {
+        return NULL;
+    }
     self->timer_id = NO_ACTIVE_TIMER_ID;
+    self->req_in_read = self->req_in_write = -1;
+    self->req_out_read = self->req_out_write = -1;
+    self->stop_read = self->stop_write = -1;
+    self->curl_easy_cleanup_read = self->curl_easy_cleanup_write = -1;
+
     self->multi = curl_multi_init();
+    if (self->multi == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "curl_multi_init failed");
+        goto error;
+    }
     curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, 1000);
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETFUNCTION, socket_callback);
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETDATA, self);
     curl_multi_setopt(self->multi, CURLMOPT_TIMERFUNCTION, timer_callback);
     curl_multi_setopt(self->multi, CURLMOPT_TIMERDATA, self);
-    if (self != NULL) {
-        self->event_loop = aeCreateEventLoop(200);
-        pipe(req_in);
-        self->req_in_read = req_in[0];
-        set_none_blocking(self->req_in_read);
-        self->req_in_write = req_in[1];
-        pipe(req_out);
-        self->req_out_read = req_out[0];
-        set_none_blocking(self->req_out_read);
-        self->req_out_write = req_out[1];
-        pipe(stop);
-        self->stop_read = stop[0];
-        self->stop_write = stop[1];
-        pipe(curl_easy_cleanup);
-        self->curl_easy_cleanup_read = curl_easy_cleanup[0];
-        set_none_blocking(self->curl_easy_cleanup_read);
-        self->curl_easy_cleanup_write = curl_easy_cleanup[1];
-        if (aeCreateFileEvent(self->event_loop, self->req_in_read, AE_READABLE, start_request, self) == AE_ERR) {
-            exit(1);
-        }
-        if (aeCreateFileEvent(self->event_loop, self->stop_read, AE_READABLE, stop_eventloop, self) == AE_ERR) {
-            exit(1);
-        }
-        if (aeCreateFileEvent(self->event_loop, self->curl_easy_cleanup_read, AE_READABLE,
-                              curl_easy_cleanup_in_eventloop, NULL) == AE_ERR) {
-            exit(1);
-        }
+
+    self->event_loop = aeCreateEventLoop(200);
+    if (self->event_loop == NULL) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        goto error;
+    }
+    if (make_pipe(&self->req_in_read, &self->req_in_write, true) == -1 ||
+        make_pipe(&self->req_out_read, &self->req_out_write, true) == -1 ||
+        make_pipe(&self->stop_read, &self->stop_write, false) == -1 ||
+        make_pipe(&self->curl_easy_cleanup_read, &self->curl_easy_cleanup_write, true) == -1) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        goto error;
+    }
+    if (aeCreateFileEvent(self->event_loop, self->req_in_read, AE_READABLE, start_request, self) == AE_ERR ||
+        aeCreateFileEvent(self->event_loop, self->stop_read, AE_READABLE, stop_eventloop, self) == AE_ERR ||
+        aeCreateFileEvent(self->event_loop, self->curl_easy_cleanup_read, AE_READABLE, curl_easy_cleanup_in_eventloop,
+                          NULL) == AE_ERR) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        goto error;
     }
     return (PyObject *)self;
+
+error:
+    Py_DECREF(self);
+    return NULL;
+}
+
+static void close_fd(int fd) {
+    if (fd != -1) {
+        close(fd);
+    }
 }
 
 static void EventLoop_dealloc(EventLoop *self) {
     DEBUG_PRINT("response=%p", self);
-    curl_multi_cleanup(self->multi);
-    aeDeleteEventLoop(self->event_loop);
-    close(self->req_in_read);
-    close(self->req_in_write);
-    close(self->req_out_read);
-    close(self->req_out_write);
-    close(self->stop_read);
-    close(self->stop_write);
-    close(self->curl_easy_cleanup_read);
-    close(self->curl_easy_cleanup_write);
+    if (self->multi != NULL) {
+        curl_multi_cleanup(self->multi);
+    }
+    if (self->event_loop != NULL) {
+        aeDeleteEventLoop(self->event_loop);
+    }
+    close_fd(self->req_in_read);
+    close_fd(self->req_in_write);
+    close_fd(self->req_out_read);
+    close_fd(self->req_out_write);
+    close_fd(self->stop_read);
+    close_fd(self->stop_write);
+    close_fd(self->curl_easy_cleanup_read);
+    close_fd(self->curl_easy_cleanup_write);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
