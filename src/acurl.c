@@ -230,7 +230,6 @@ typedef struct AcRequestData {
     struct BufferNode *header_buffer_tail;
     struct BufferNode *body_buffer_head;
     struct BufferNode *body_buffer_tail;
-    int dummy;
     HostSlot *slot;
     struct AcRequestData *next_waiting;
     double queued_at;
@@ -720,7 +719,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_WRITEDATA, rd);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERDATA, rd);
-    if (!rd->dummy && (rd->share->max_host_connections || rd->share->max_connections)) {
+    if (rd->share->max_host_connections || rd->share->max_connections) {
         rd->slot = host_slot(rd->share, rd->url);
     }
     free(rd->method);
@@ -736,12 +735,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     free(rd->key_file);
     rd->key_file = NULL;
     free(rd->cookies_str);
-    if (rd->dummy) {
-        rd->result = CURLE_OK;
-        curl_slist_free_all(rd->headers);
-        rd->headers = NULL;
-        complete_request(loop, rd);
-    } else if (rd->slot != NULL && !slot_free(rd->share, rd->slot)) {
+    if (rd->slot != NULL && !slot_free(rd->share, rd->slot)) {
         rd->queued_at = monotonic_time();
         if (rd->share->waiting_tail != NULL) {
             rd->share->waiting_tail->next_waiting = rd;
@@ -1208,13 +1202,12 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     PyObject *cookies;
     Py_ssize_t req_data_len = 0;
     char *req_data_buf = NULL;
-    int dummy;
     PyObject *cert = Py_None;
 
-    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "dummy", "cert", NULL};
+    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "cert", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#p|O", kwlist, &future, &method, &url, &headers, &auth,
-                                     &cookies, &req_data_buf, &req_data_len, &dummy, &cert)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|O", kwlist, &future, &method, &url, &headers, &auth,
+                                     &cookies, &req_data_buf, &req_data_len, &cert)) {
         return NULL;
     }
 
@@ -1313,7 +1306,6 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         memcpy(rd->req_data_buf, req_data_buf, req_data_len);
     }
     rd->req_data_len = req_data_len;
-    rd->dummy = dummy;
 
     Py_INCREF(self);
     rd->session = self;
@@ -1362,9 +1354,41 @@ static PyObject *Session_close(Session *self, PyObject *args) {
 
 static PyObject *Session_get_cookielist(Session *self, PyObject *args) { return session_cookielist(self); }
 
+static PyObject *Session_apply_cookielist(Session *self, PyObject *args) {
+    PyObject *lines;
+    if (!PyArg_ParseTuple(args, "O!", &PyTuple_Type, &lines)) {
+        return NULL;
+    }
+    if (self->shared == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "session is closed");
+        return NULL;
+    }
+    CURL *curl = curl_easy_init();
+    if (curl == NULL) {
+        return PyErr_NoMemory();
+    }
+    curl_easy_setopt(curl, CURLOPT_SHARE, self->shared->share);
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(lines); i++) {
+        if (!PyUnicode_CheckExact(PyTuple_GET_ITEM(lines, i))) {
+            PyErr_SetString(PyExc_ValueError, "cookie lines should be strings");
+            curl_easy_cleanup(curl);
+            return NULL;
+        }
+        const char *line = PyUnicode_AsUTF8(PyTuple_GET_ITEM(lines, i));
+        if (line == NULL) {
+            curl_easy_cleanup(curl);
+            return NULL;
+        }
+        curl_easy_setopt(curl, CURLOPT_COOKIELIST, line);
+    }
+    curl_easy_cleanup(curl);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef Session_methods[] = {
     {"request", (PyCFunction)Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"},
     {"get_cookielist", (PyCFunction)Session_get_cookielist, METH_NOARGS, "Get the session's cookies"},
+    {"apply_cookielist", (PyCFunction)Session_apply_cookielist, METH_VARARGS, "Apply CURLOPT_COOKIELIST lines"},
     {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
     {NULL, NULL, 0, NULL}};
 

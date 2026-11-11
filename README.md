@@ -145,7 +145,6 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 ## Known limitations
 
 - TLS certificates are never verified.
-- `get_cookie_list`, `add_cookie_list` and the erase methods make a round trip through the curl thread. `session.cookies()` does not.
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `EventLoop.stop()` is called never complete.
 - HTTP/3 is not supported yet, though libcurl can do it.

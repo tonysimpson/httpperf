@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import time
 from urllib.parse import urlencode
 
 import pytest
@@ -57,6 +58,19 @@ def test_set_cookies(httpbin):
     r = _await(s.get(httpbin.url + "/cookies/set?name=value"))
     r = _await(s.get(httpbin.url + "/cookies/set?name2=value", cookies={"name3": "value"}))
     assert r.cookies == {"name": "value", "name2": "value", "name3": "value"}
+
+
+def test_add_and_erase_session_cookies(httpbin):
+    s = session()
+    lasting = acurl.session_cookie_for_url(httpbin.url, "lasting", "1")
+    lasting = acurl.Cookie(False, lasting.domain, True, "/", False, int(time.time()) + 3600, "lasting", "1")
+    _await(s.add_cookie_list([acurl.session_cookie_for_url(httpbin.url, "brief", "1"), lasting]))
+    assert _await(s.get(httpbin.url + "/cookies")).json()["cookies"] == {"brief": "1", "lasting": "1"}
+    _await(s.erase_session_cookies())
+    assert s.cookies() == {"lasting": "1"}
+    s.close()
+    with pytest.raises(RuntimeError):
+        _await(s.erase_all_cookies())
 
 
 def test_basic_auth(httpbin):
