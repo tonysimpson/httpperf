@@ -395,6 +395,9 @@ class Session:
     def close(self):
         self._session.close()
 
+    def cookies(self):
+        return _cookie_list_to_cookie_dict(parse_cookie_string(c) for c in self._session.get_cookielist())
+
     async def get(self, url, **kwargs):
         return await self.request("GET", url, **kwargs)
 

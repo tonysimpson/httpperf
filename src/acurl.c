@@ -358,18 +358,18 @@ static PyObject *Response_get_http_version(Response *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
+static PyObject *session_cookielist(Session *session) {
     struct curl_slist *start = NULL;
     struct curl_slist *node = NULL;
     int len = 0;
     int i = 0;
     PyObject *list = NULL;
-    if (self->session->shared != NULL) {
+    if (session->shared != NULL) {
         CURL *curl = curl_easy_init();
         if (curl == NULL) {
             return PyErr_NoMemory();
         }
-        curl_easy_setopt(curl, CURLOPT_SHARE, self->session->shared->share);
+        curl_easy_setopt(curl, CURLOPT_SHARE, session->shared->share);
         curl_easy_getinfo(curl, CURLINFO_COOKIELIST, &start);
         curl_easy_cleanup(curl);
     }
@@ -387,6 +387,8 @@ static PyObject *Response_get_cookielist(Response *self, PyObject *args) {
     curl_slist_free_all(start);
     return list;
 }
+
+static PyObject *Response_get_cookielist(Response *self, PyObject *args) { return session_cookielist(self->session); }
 
 static PyMethodDef Response_methods[] = {
     {"get_effective_url", (PyCFunction)Response_get_effective_url, METH_NOARGS, ""},
@@ -1358,8 +1360,11 @@ static PyObject *Session_close(Session *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *Session_get_cookielist(Session *self, PyObject *args) { return session_cookielist(self); }
+
 static PyMethodDef Session_methods[] = {
     {"request", (PyCFunction)Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"},
+    {"get_cookielist", (PyCFunction)Session_get_cookielist, METH_NOARGS, "Get the session's cookies"},
     {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
     {NULL, NULL, 0, NULL}};
 

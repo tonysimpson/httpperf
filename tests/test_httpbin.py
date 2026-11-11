@@ -45,9 +45,11 @@ def test_session_cookies(httpbin):
     cookie_list = _await(s.get_cookie_list())
     assert len(cookie_list) == 1
     assert cookie_list[0].name == "name"
+    assert s.cookies() == {"name": "value"}
     _await(s.erase_all_cookies())
     cookie_list = _await(s.get_cookie_list())
     assert len(cookie_list) == 0
+    assert s.cookies() == {}
 
 
 def test_set_cookies(httpbin):
