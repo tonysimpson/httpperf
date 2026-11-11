@@ -119,11 +119,9 @@ def parse_cookie_list_string(cookie_list_string):
 
 
 def session_cookie_for_url(url, name, value, http_only=False, include_subdomains=True, is_secure=False, include_url_path=False):
-    scheme, netloc, path, params, query, fragment = urlparse(url)
-    if not include_url_path:
-        path = '/'
-    #TODO do we need to sanitize netloc for IP and ports?
-    return Cookie(http_only, '.' + netloc, include_subdomains, path, is_secure, 0, name, value)
+    parsed = urlparse(url)
+    path = parsed.path if include_url_path else '/'
+    return Cookie(http_only, '.' + parsed.hostname, include_subdomains, path, is_secure, 0, name, value)
 
 
 def _cookie_list_to_cookie_dict(cookie_list):

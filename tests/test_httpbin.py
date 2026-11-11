@@ -72,4 +72,8 @@ def test_redirect(httpbin):
     r = _await(s.get(httpbin.url + '/redirect-to?' + urlencode({'url': url})))
     assert r.url == url
 
-    
+
+def test_cookies_kwarg_sent(httpbin):
+    s = session()
+    r = _await(s.get(httpbin.url + '/cookies', cookies={'name': 'value'}))
+    assert r.json()['cookies'] == {'name': 'value'}
