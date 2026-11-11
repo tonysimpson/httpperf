@@ -31,7 +31,7 @@ class CountingHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def url():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CountingHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -59,5 +59,16 @@ def test_close_closes_connections(url):
     assert r.status_code == 200
     with pytest.raises(RuntimeError):
         loop.run_until_complete(s.get(url))
+    el.stop()
+    loop.close()
+
+
+@pytest.mark.parametrize("connections, new", [("session", [True, False]), ("none", [True, True])])
+def test_connection_reuse(url, connections, new):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    s = el.session(connections=connections)
+    assert [loop.run_until_complete(s.get(url)).connect_time > 0 for _ in new] == new
+    s.close()
     el.stop()
     loop.close()
