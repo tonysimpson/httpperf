@@ -196,13 +196,26 @@ class Request:
 
 class Response:
     __slots__ = (
-        "_req _resp _start_time _redirect_url _prev _body _text _header _headers_tuple _headers _encoding _json".split()
+        "_req",
+        "_resp",
+        "_start_time",
+        "_end_time",
+        "_redirect_url",
+        "_prev",
+        "_body",
+        "_text",
+        "_header",
+        "_headers_tuple",
+        "_headers",
+        "_encoding",
+        "_json",
     )
 
-    def __init__(self, req, resp, start_time):
+    def __init__(self, req, resp, start_time, end_time):
         self._req = req
         self._resp = resp
         self._start_time = start_time
+        self._end_time = end_time
 
     @property
     def request(self):
@@ -227,6 +240,14 @@ class Response:
     @property
     def start_time(self):
         return self._start_time
+
+    @property
+    def end_time(self):
+        return self._end_time
+
+    @property
+    def client_lag(self):
+        return self._end_time - self._start_time - self._resp.get_total_time()
 
     @property
     def total_time(self):
@@ -430,7 +451,7 @@ class Session:
             data=data,
             dummy=False,
         )
-        response = Response(request, await future, start_time)
+        response = Response(request, await future, start_time, time.time())
         if prev is not None:
             response._prev = prev
 

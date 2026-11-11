@@ -16,7 +16,7 @@ class FakeResponse:
 
 
 def response(content_type, body=b""):
-    return acurl.Response(None, FakeResponse(content_type, body), 0)
+    return acurl.Response(None, FakeResponse(content_type, body), 0, 0)
 
 
 @pytest.mark.parametrize(

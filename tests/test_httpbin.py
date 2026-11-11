@@ -120,6 +120,13 @@ def test_post_binary(httpbin):
     assert isinstance(r.upload_size, int) and isinstance(r.download_size, int)
 
 
+def test_client_lag(httpbin):
+    s = session()
+    r = _await(s.get(httpbin.url + "/delay/0"))
+    assert r.start_time <= r.end_time
+    assert 0 <= r.client_lag < r.end_time - r.start_time
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [{"auth": ("\ud800", "password")}, {"headers": {"X-Test": "\ud800"}}, {"cookies": {"name": "\ud800"}}],
