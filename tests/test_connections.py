@@ -89,3 +89,32 @@ def test_event_loop_connection_limits(url, limits, connects):
     assert sum(r.connect_time > 0 for r in responses) == connects
     el.stop()
     loop.close()
+
+
+def test_max_idle_connections(url):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop, max_idle_connections=1)
+    s = el.session(http_version="HTTP/1.1")
+
+    async def batch():
+        return await asyncio.gather(*(s.get(url + "slow") for _ in range(3)))
+
+    assert sum(r.connect_time > 0 for r in loop.run_until_complete(batch())) == 3
+    assert sum(r.connect_time > 0 for r in loop.run_until_complete(batch())) == 2
+    el.stop()
+    loop.close()
+
+
+@pytest.mark.parametrize("options, wait", [({"idle_timeout": 0}, 1.1), ({"max_connection_age": 1}, 2.1)])
+def test_connection_expiry(url, options, wait):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    s = el.session(connections="session", **options)
+    first = loop.run_until_complete(s.get(url))
+    time.sleep(wait)
+    second = loop.run_until_complete(s.get(url))
+    assert first.connect_time > 0
+    assert second.connect_time > 0
+    s.close()
+    el.stop()
+    loop.close()

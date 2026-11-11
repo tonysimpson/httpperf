@@ -361,9 +361,18 @@ class Response:
 
 
 class Session:
-    def __init__(self, ae_loop, loop, connections="shared", tls="shared", http_version="HTTP/2"):
+    def __init__(
+        self,
+        ae_loop,
+        loop,
+        connections="shared",
+        tls="shared",
+        http_version="HTTP/2",
+        idle_timeout=118,
+        max_connection_age=0,
+    ):
         self._loop = loop
-        self._session = _acurl.Session(ae_loop, connections, tls, http_version)
+        self._session = _acurl.Session(ae_loop, connections, tls, http_version, idle_timeout, max_connection_age)
         self._response_callback = None
 
     def close(self):
@@ -514,7 +523,14 @@ class Session:
 
 
 class EventLoop:
-    def __init__(self, loop=None, same_thread=False, max_host_connections=0, max_total_connections=0):
+    def __init__(
+        self,
+        loop=None,
+        same_thread=False,
+        max_host_connections=0,
+        max_total_connections=0,
+        max_idle_connections=1000,
+    ):
         self._running = False
         if loop is None:
             try:
@@ -522,7 +538,7 @@ class EventLoop:
             except RuntimeError:
                 loop = asyncio.get_event_loop()
         self._loop = loop
-        self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections)
+        self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
         # Completed requests end up on the fd pipe, complete callback called
         self._loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
         if same_thread:
@@ -561,5 +577,7 @@ class EventLoop:
             else:
                 future.set_exception(RequestError(error))
 
-    def session(self, connections="shared", tls="shared", http_version="HTTP/2"):
-        return Session(self._ae_loop, self._loop, connections, tls, http_version)
+    def session(
+        self, connections="shared", tls="shared", http_version="HTTP/2", idle_timeout=118, max_connection_age=0
+    ):
+        return Session(self._ae_loop, self._loop, connections, tls, http_version, idle_timeout, max_connection_age)

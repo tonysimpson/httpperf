@@ -142,6 +142,17 @@ def test_connection_limits_invalid():
         acurl.EventLoop(max_host_connections=-1)
 
 
+@pytest.mark.parametrize("options", [{"idle_timeout": -1}, {"max_connection_age": -1}])
+def test_expiry_invalid(options):
+    with pytest.raises(ValueError):
+        acurl.EventLoop().session(**options)
+
+
+def test_max_idle_connections_invalid():
+    with pytest.raises(ValueError):
+        acurl.EventLoop(max_idle_connections=0)
+
+
 def test_http_version_invalid():
     with pytest.raises(ValueError):
         acurl.EventLoop().session(http_version="HTTP/0.9")

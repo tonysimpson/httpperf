@@ -166,6 +166,8 @@ typedef struct {
     Share *shared;
     bool fresh_connect;
     long http_version;
+    long idle_timeout;
+    long max_connection_age;
 } Session;
 
 /* Node in a linked list structure. Used for piecing together sections of resposnes e.g. headers and body.
@@ -517,6 +519,8 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_FORBID_REUSE, 1L);
     }
     curl_easy_setopt(rd->curl, CURLOPT_HTTP_VERSION, rd->session->http_version);
+    curl_easy_setopt(rd->curl, CURLOPT_MAXAGE_CONN, rd->session->idle_timeout);
+    curl_easy_setopt(rd->curl, CURLOPT_MAXLIFETIME_CONN, rd->session->max_connection_age);
     if (rd->session->http_version == CURL_HTTP_VERSION_2TLS) {
         curl_easy_setopt(rd->curl, CURLOPT_PIPEWAIT, 1L);
     }
@@ -690,12 +694,18 @@ static int make_pipe(int *read_fd, int *write_fd, bool nonblocking_read) {
 static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     long max_host_connections = 0;
     long max_total_connections = 0;
-    static char *kwlist[] = {"max_host_connections", "max_total_connections", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ll", kwlist, &max_host_connections, &max_total_connections)) {
+    long max_idle_connections = 1000;
+    static char *kwlist[] = {"max_host_connections", "max_total_connections", "max_idle_connections", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|lll", kwlist, &max_host_connections, &max_total_connections,
+                                     &max_idle_connections)) {
         return NULL;
     }
     if (max_host_connections < 0 || max_total_connections < 0) {
         PyErr_SetString(PyExc_ValueError, "connection limits must not be negative");
+        return NULL;
+    }
+    if (max_idle_connections < 1) {
+        PyErr_SetString(PyExc_ValueError, "max_idle_connections must be at least 1");
         return NULL;
     }
     EventLoop *self = (EventLoop *)type->tp_alloc(type, 0);
@@ -713,7 +723,7 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
         PyErr_SetString(PyExc_RuntimeError, "curl_multi_init failed");
         goto error;
     }
-    curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, 1000);
+    curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, max_idle_connections);
     curl_multi_setopt(self->multi, CURLMOPT_MAX_HOST_CONNECTIONS, max_host_connections);
     curl_multi_setopt(self->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_total_connections);
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETFUNCTION, socket_callback);
@@ -911,9 +921,16 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     const char *connections = "shared";
     const char *tls = "shared";
     const char *http_version = "HTTP/2";
+    long idle_timeout = 118;
+    long max_connection_age = 0;
 
-    static char *kwlist[] = {"loop", "connections", "tls", "http_version", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|sss", kwlist, &loop, &connections, &tls, &http_version)) {
+    static char *kwlist[] = {"loop", "connections", "tls", "http_version", "idle_timeout", "max_connection_age", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|sssll", kwlist, &loop, &connections, &tls, &http_version,
+                                     &idle_timeout, &max_connection_age)) {
+        return NULL;
+    }
+    if (idle_timeout < 0 || max_connection_age < 0) {
+        PyErr_SetString(PyExc_ValueError, "idle_timeout and max_connection_age must not be negative");
         return NULL;
     }
     bool share_connections = strcmp(connections, "session") == 0;
@@ -946,6 +963,8 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->loop = loop;
     self->fresh_connect = fresh_connect;
     self->http_version = curl_http_version;
+    self->idle_timeout = idle_timeout;
+    self->max_connection_age = max_connection_age;
     self->shared = share_new(share_connections, share_tls);
     if (self->shared == NULL) {
         Py_DECREF(self);
