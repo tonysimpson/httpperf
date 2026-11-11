@@ -1,20 +1,29 @@
-# Distribution and packaging
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
+# Python
+__pycache__/
+*.py[cod]
 
-# C
+# Build and packaging
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# C extension build output
 *.so
+*.o
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing and tooling caches
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/

@@ -1,6 +1,7 @@
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
 #include "ae/ae.h"
 #include <curl/multi.h>
-#include <Python.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -111,7 +112,7 @@ typedef struct {
     char** cookies_str;
     PyObject* future;
     struct curl_slist* headers;
-    int req_data_len;
+    Py_ssize_t req_data_len;
     char* req_data_buf;
     Session* session;
     CURL *curl;
@@ -530,6 +531,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     DEBUG_PRINT("read AcRequestData");
     rd->curl = curl_easy_init();
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->session->shared);
+    curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
     //curl_easy_setopt(rd->curl, CURLOPT_VERBOSE, 1L); //DEBUG
@@ -545,7 +547,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_COOKIELIST, rd->cookies_str[i]);
     }
     if(rd->req_data_buf != NULL) {
-        curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE, rd->req_data_len);
+        curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)rd->req_data_len);
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDS, (char*)rd->req_data_buf);
     }
     curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -981,7 +983,7 @@ Session_request(Session *self, PyObject *args, PyObject *kwds)
     PyObject *headers;
     PyObject *auth;
     PyObject *cookies;
-    int req_data_len = 0;
+    Py_ssize_t req_data_len = 0;
     char *req_data_buf = NULL;
     int dummy;
     

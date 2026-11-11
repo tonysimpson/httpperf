@@ -76,7 +76,7 @@ class Cookie:
 
     @property
     def has_expired(self):
-        return self.expiration != 0 or time.time() > self.expiration
+        return self.expiration != 0 and time.time() > self.expiration
 
     def format(self):
         bits = []
@@ -405,9 +405,14 @@ class Session:
 
 class EventLoop:
     def __init__(self, loop=None, same_thread=False):
-        self._loop = loop if loop is not None else asyncio.get_event_loop()
-        self._ae_loop =  _acurl.EventLoop()
         self._running = False
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+        self._loop = loop
+        self._ae_loop =  _acurl.EventLoop()
         # Completed requests end up on the fd pipe, complete callback called
         self._loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
         if same_thread:
