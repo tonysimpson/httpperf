@@ -4,6 +4,7 @@
 #include <curl/multi.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/types.h>
@@ -719,7 +720,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_HTTP_VERSION, rd->session->http_version);
     curl_easy_setopt(rd->curl, CURLOPT_MAXAGE_CONN, rd->session->idle_timeout);
     curl_easy_setopt(rd->curl, CURLOPT_MAXLIFETIME_CONN, rd->session->max_connection_age);
-    if (rd->session->http_version != CURL_HTTP_VERSION_1_1) {
+    if (rd->session->http_version != CURL_HTTP_VERSION_1_1 && strncasecmp(rd->url, "https:", 6) == 0) {
         curl_easy_setopt(rd->curl, CURLOPT_PIPEWAIT, 1L);
     }
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
