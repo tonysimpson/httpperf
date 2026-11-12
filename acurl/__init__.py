@@ -10,7 +10,16 @@ _json_encoder = _json.JSONEncoder(separators=(",", ":"), check_circular=False)
 
 
 class RequestError(Exception):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class Timeout(RequestError):
     pass
+
+
+CURLE_OPERATION_TIMEDOUT = 28
 
 
 _FALSE_TRUE = ["FALSE", "TRUE"]
@@ -380,10 +389,11 @@ class Session:
         max_connections=0,
         cert=None,
         verify=False,
+        timeout=None,
+        connect_timeout=None,
     ):
         self._loop = loop
-        self._cert = cert
-        self._verify = verify
+        self._options = {"cert": cert, "verify": verify, "timeout": timeout, "connect_timeout": connect_timeout}
         self._session = _acurl.Session(
             ae_loop,
             connections,
@@ -451,7 +461,20 @@ class Session:
         max_redirects=5,
         cert=None,
         verify=None,
+        timeout=None,
+        connect_timeout=None,
     ):
+        options = self._options
+        if cert is not None or verify is not None or timeout is not None or connect_timeout is not None:
+            options = dict(options)
+            if cert is not None:
+                options["cert"] = cert
+            if verify is not None:
+                options["verify"] = verify
+            if timeout is not None:
+                options["timeout"] = timeout
+            if connect_timeout is not None:
+                options["connect_timeout"] = connect_timeout
         if json is not None:
             if data is not None:
                 raise ValueError("use only one or none of data or json")
@@ -484,8 +507,7 @@ class Session:
             tuple(cookie_list) if cookie_list else None,
             auth,
             data,
-            cert if cert is not None else self._cert,
-            verify if verify is not None else self._verify,
+            options,
             allow_redirects,
             max_redirects,
         )
@@ -501,8 +523,7 @@ class Session:
         cookie_tuple,
         auth,
         data,
-        cert,
-        verify,
+        options,
         allow_redirects,
         remaining_redirects,
         prev=None,
@@ -519,8 +540,7 @@ class Session:
             cookies=tuple(c.format() for c in cookie_tuple) if cookie_tuple else None,
             auth=auth,
             data=data,
-            cert=cert,
-            verify=verify,
+            **options,
         )
         response = Response(request, await future, start_time, time.time())
         if prev is not None:
@@ -539,8 +559,7 @@ class Session:
                     None,
                     auth,
                     None,
-                    cert,
-                    verify,
+                    options,
                     allow_redirects,
                     remaining_redirects - 1,
                     response,
@@ -553,8 +572,7 @@ class Session:
                     None,
                     auth,
                     data,
-                    cert,
-                    verify,
+                    options,
                     allow_redirects,
                     remaining_redirects - 1,
                     response,
@@ -640,7 +658,8 @@ class EventLoop:
             if response is not None:
                 future.set_result(response)
             else:
-                future.set_exception(RequestError(error))
+                code, message = error
+                future.set_exception((Timeout if code == CURLE_OPERATION_TIMEDOUT else RequestError)(message, code))
 
     def session(
         self,
@@ -653,6 +672,8 @@ class EventLoop:
         max_connections=0,
         cert=None,
         verify=False,
+        timeout=None,
+        connect_timeout=None,
     ):
         return Session(
             self._ae_loop,
@@ -666,4 +687,6 @@ class EventLoop:
             max_connections,
             cert,
             verify,
+            timeout,
+            connect_timeout,
         )

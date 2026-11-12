@@ -1,5 +1,6 @@
 import asyncio
 import http.server
+import socket
 import threading
 import time
 
@@ -163,4 +164,66 @@ def test_context_managers(url):
         pass
     el._thread.join(2)
     assert not el._thread.is_alive()
+    loop.close()
+
+
+def test_timeouts(url):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(8)
+    full = socket.socket()
+    full.bind(("127.0.0.1", 0))
+    full.listen(0)
+    filler = socket.create_connection(full.getsockname())
+
+    def get(session, target, **kwargs):
+        start = time.monotonic()
+        try:
+            return loop.run_until_complete(session.get(target, **kwargs)).status_code
+        except acurl.RequestError as e:
+            return type(e), e.code, str(e).split(" after ")[0], round(time.monotonic() - start, 1)
+
+    unlimited = el.session()
+    assert get(unlimited, "http://127.0.0.1:%d/" % silent.getsockname()[1], timeout=0.2) == (
+        acurl.Timeout,
+        28,
+        "Operation timed out",
+        0.2,
+    )
+    assert get(unlimited, "http://127.0.0.1:%d/" % full.getsockname()[1], connect_timeout=0.2) == (
+        acurl.Timeout,
+        28,
+        "Connection timed out",
+        0.2,
+    )
+    impatient = el.session(timeout=0.01)
+    assert get(impatient, url + "slow")[0] is acurl.Timeout
+    assert get(impatient, url + "slow", timeout=0) == 200
+    assert get(impatient, url + "slow", timeout=1) == 200
+    for bad in (-1, float("nan")):
+        with pytest.raises(ValueError):
+            get(unlimited, url, timeout=bad)
+    with pytest.raises(TypeError):
+        get(unlimited, url, connect_timeout="1")
+    el.stop()
+    loop.close()
+    for s in (silent, full, filler):
+        s.close()
+
+
+def test_error_messages_are_specific():
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    with pytest.raises(acurl.RequestError) as e:
+        loop.run_until_complete(el.session().get("http://127.0.0.1:%d/" % port))
+    assert type(e.value) is acurl.RequestError
+    assert e.value.code == 7
+    assert "port %d" % port in str(e.value)
+    el.stop()
     loop.close()

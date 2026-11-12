@@ -220,6 +220,9 @@ typedef struct AcRequestData {
     char *key_file;
     bool verify;
     char *ca_file;
+    long timeout_ms;
+    long connect_timeout_ms;
+    char error[CURL_ERROR_SIZE];
     PyObject *cookies;
     int cookies_len;
     char **cookies_str;
@@ -585,6 +588,7 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
 
 static void complete_request(EventLoop *loop, AcRequestData *rd) {
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
+    curl_easy_setopt(rd->curl, CURLOPT_ERRORBUFFER, NULL);
     if (rd->slot != NULL) {
         long version = 0;
         if (rd->result == CURLE_OK) {
@@ -757,6 +761,13 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
+    if (rd->timeout_ms > 0) {
+        curl_easy_setopt(rd->curl, CURLOPT_TIMEOUT_MS, rd->timeout_ms);
+    }
+    if (rd->connect_timeout_ms > 0) {
+        curl_easy_setopt(rd->curl, CURLOPT_CONNECTTIMEOUT_MS, rd->connect_timeout_ms);
+    }
+    curl_easy_setopt(rd->curl, CURLOPT_ERRORBUFFER, rd->error);
     curl_easy_setopt(rd->curl, CURLOPT_PRIVATE, rd);
     curl_easy_setopt(rd->curl, CURLOPT_WRITEFUNCTION, body_callback);
     curl_easy_setopt(rd->curl, CURLOPT_WRITEDATA, rd);
@@ -1070,7 +1081,8 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyTuple_SET_ITEM(tuple, 1, (PyObject *)response);
             PyTuple_SET_ITEM(tuple, 2, rd->future);
         } else {
-            PyObject *error = PyUnicode_FromString(curl_easy_strerror(rd->result));
+            PyObject *error =
+                Py_BuildValue("(is)", rd->result, rd->error[0] ? rd->error : curl_easy_strerror(rd->result));
             free_buffer_nodes(rd->header_buffer_head);
             free_buffer_nodes(rd->body_buffer_head);
             queue_cleanup(rd->session->loop, rd->curl, NULL);
@@ -1247,6 +1259,26 @@ static void Session_dealloc(Session *self) {
         }                       \
     } while (0)
 
+static int parse_timeout(PyObject *value, const char *name, long *ms) {
+    *ms = 0;
+    if (value == Py_None) {
+        return 0;
+    }
+    double seconds = PyFloat_AsDouble(value);
+    if (seconds == -1.0 && PyErr_Occurred()) {
+        return -1;
+    }
+    if (!(seconds >= 0 && seconds <= 1e9)) {
+        PyErr_Format(PyExc_ValueError, "%s must be between 0 and 1e9 seconds, or None", name);
+        return -1;
+    }
+    *ms = (long)(seconds * 1000);
+    if (seconds > 0 && *ms == 0) {
+        *ms = 1;
+    }
+    return 0;
+}
+
 static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
     char *method;
     char *url;
@@ -1258,11 +1290,20 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     char *req_data_buf = NULL;
     PyObject *cert = Py_None;
     PyObject *verify = Py_False;
+    PyObject *timeout = Py_None;
+    PyObject *connect_timeout = Py_None;
 
-    static char *kwlist[] = {"future", "method", "url", "headers", "auth", "cookies", "data", "cert", "verify", NULL};
+    static char *kwlist[] = {"future", "method", "url",     "headers",         "auth", "cookies", "data",
+                             "cert",   "verify", "timeout", "connect_timeout", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OO", kwlist, &future, &method, &url, &headers, &auth,
-                                     &cookies, &req_data_buf, &req_data_len, &cert, &verify)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOO", kwlist, &future, &method, &url, &headers, &auth,
+                                     &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout,
+                                     &connect_timeout)) {
+        return NULL;
+    }
+    long timeout_ms, connect_timeout_ms;
+    if (parse_timeout(timeout, "timeout", &timeout_ms) ||
+        parse_timeout(connect_timeout, "connect_timeout", &connect_timeout_ms)) {
         return NULL;
     }
 
@@ -1277,6 +1318,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         return NULL;
     }
     REQUEST_TRACE_PRINT("Session_request", rd);
+    rd->timeout_ms = timeout_ms;
+    rd->connect_timeout_ms = connect_timeout_ms;
     if (headers != Py_None) {
         if (!PyTuple_CheckExact(headers)) {
             PyErr_SetString(PyExc_ValueError, "headers should be a tuple of strings or None");

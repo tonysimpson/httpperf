@@ -74,6 +74,8 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 | `max_host_connections` | `0` | Per-session cap on connections per host. Needs `connections="session"` or `"none"`. |
 | `max_connections` | `0` | Per-session cap on connections in use. Needs `connections="session"` or `"none"`. |
 | `cert` | `None` | `(certfile, keyfile)` paths for a client certificate, used by every request unless the request overrides it. |
+| `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. |
+| `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
 | `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA store. A path: check against that CA bundle. Requests can override it. |
 
 Cookies always belong to the session, whatever the connection settings. See [docs/connections.md](docs/connections.md) for how these fit together.
@@ -100,10 +102,11 @@ Cookies always belong to the session, whatever the connection settings. See [doc
 | `json` | Object to send as JSON, encoded compactly with the standard library. Sets `Content-Type: application/json` unless you set it. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
 | `verify` | `True`, `False` or a CA bundle path, overriding the session's `verify`. |
+| `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
 
-Failed transfers raise `acurl.RequestError` with curl's error message.
+Failed transfers raise `acurl.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `acurl.Timeout`, a subclass, so they can be counted separately.
 
 ### Response
 
@@ -130,7 +133,7 @@ acurl uses the standard library's `json`, which has no extra dependency and the 
 
 - Encode request bodies once and reuse the bytes, where the payload allows.
 - Encode with a faster library and send the bytes yourself: `session.post(url, data=orjson.dumps(obj), headers={"Content-Type": "application/json"})`. orjson is about 8 times faster on larger payloads, but turns `NaN` into `null` and refuses integers over 64 bits.
-- To read a few fields from a large response, parse lazily with [pysimdjson](https://github.com/TkTech/pysimdjson): `doc = simdjson.Parser().parse(r.body)`, then `doc["items"][3]["name"]`. Only the values you touch become Python objects, which was about 8 times faster than `json.loads` for one field of a 500 KB document. The result is read-only and not a real `dict`; `doc.as_dict()` converts it.
+- To read a few fields from a large response, parse lazily with [pysimdjson](https://github.com/TkTech/pysimdjson). Create one `parser = simdjson.Parser()` and reuse it, since it keeps its buffers between documents. Then `doc = parser.parse(r.body)` and `doc["items"][3]["name"]`. Only the values you touch become Python objects, which was about 8 times faster than `json.loads` for one field of a 500 KB document. The result is read-only and not a real `dict`; `doc.as_dict()` converts it.
 
 ## Timings
 
