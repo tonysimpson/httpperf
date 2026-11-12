@@ -56,7 +56,7 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 | Argument | Meaning |
 |---|---|
 | `same_thread` | Run the curl loop on the asyncio thread instead, polling every millisecond. Only for debugging and profiling with Python tools. |
-| `max_host_connections` | Process-wide cap on connections per host for sessions using the shared pool or no pool. 0 means no limit. curl queues requests above it. |
+| `max_host_connections` | Process-wide cap on connections per host for sessions using the shared pool or no pool. 0 means no limit. acurl queues requests above it and reports the wait as `queue_time`. |
 | `max_total_connections` | Process-wide cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 
@@ -152,10 +152,11 @@ All in seconds.
 | `connect_time` | TCP connect complete. 0 when the connection was reused. |
 | `appconnect_time` | TLS handshake complete. 0 for plain http and reused connections. |
 | `pretransfer_time` | Ready to send. |
+| `posttransfer_time` | Request fully sent. `starttransfer_time − posttransfer_time` is the server's time to first byte, without connection setup or upload. `None` with libcurl older than 8.10. |
 | `starttransfer_time` | First byte received. |
 | `total_time` | Transfer complete. |
-| `queue_time` | Time waiting in acurl's per-session queue for a connection (see `max_host_connections`). 0 if the request did not wait. |
-| `client_lag` | `end_time − start_time − total_time − queue_time`: time the request spent waiting on Python, before it was sent and after it finished. |
+| `queue_time` | Time waiting in acurl's queue for a connection, under the EventLoop or session limits. 0 if the request did not wait. curl's timings start after it. |
+| `client_lag` | `end_time − start_time − total_time − queue_time`: time the request spent waiting on Python, before it was sent and after it finished. Measured with the monotonic clock, so clock changes don't affect it. |
 
 curl measures its timings on the curl thread, so a busy Python process does not inflate them. `client_lag` is how you see that Python is the bottleneck: if it grows, the client cannot keep up, and achieved request rates describe the client rather than the server. Report it alongside response times (p50, p99, max).
 

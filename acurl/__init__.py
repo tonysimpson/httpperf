@@ -392,6 +392,10 @@ class Response:
         return self._resp.get_pretransfer_time()
 
     @property
+    def posttransfer_time(self):
+        return self._resp.get_posttransfer_time()
+
+    @property
     def starttransfer_time(self):
         return self._resp.get_starttransfer_time()
 
@@ -646,6 +650,7 @@ class Session:
         prev=None,
     ):
         start_time = time.time()
+        start = time.monotonic()
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
 
         future = self._loop.create_future()
@@ -659,7 +664,8 @@ class Session:
             data=data,
             **options,
         )
-        response = Response(request, await future, start_time, time.time())
+        resp = await future
+        response = Response(request, resp, start_time, start_time + time.monotonic() - start)
         if prev is not None:
             response._prev = prev
 

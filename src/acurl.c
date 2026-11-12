@@ -72,6 +72,7 @@ typedef struct {
     int curl_easy_cleanup_write;
     struct AcRequestData *unsent_head;
     struct AcRequestData *unsent_tail;
+    struct Share *limiter;
 } EventLoop;
 
 typedef struct HostSlot {
@@ -81,7 +82,7 @@ typedef struct HostSlot {
     struct HostSlot *next;
 } HostSlot;
 
-typedef struct {
+typedef struct Share {
     CURLSH *share;
     pthread_mutex_t locks[CURL_LOCK_DATA_LAST];
     atomic_int refs;
@@ -198,6 +199,7 @@ typedef struct {
     PyObject_HEAD EventLoop *loop;
     Share *shared;
     bool fresh_connect;
+    bool own_pool;
     long http_version;
     long idle_timeout;
     long max_connection_age;
@@ -232,6 +234,7 @@ typedef struct AcRequestData {
     char *req_data_buf;
     Session *session;
     Share *share;
+    Share *limiter;
     CURL *curl;
     CURLcode result;
     struct BufferNode *header_buffer_head;
@@ -346,6 +349,16 @@ RESPONSE_GETINFO(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
 RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
 RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
 
+static PyObject *Response_get_posttransfer_time(Response *self, PyObject *args) {
+#if LIBCURL_VERSION_NUM >= 0x080a00
+    curl_off_t value = 0;
+    curl_easy_getinfo(self->curl, CURLINFO_POSTTRANSFER_TIME_T, &value);
+    return PyFloat_FromDouble(value / 1e6);
+#else
+    Py_RETURN_NONE;
+#endif
+}
+
 static PyObject *Response_get_queue_time(Response *self, PyObject *args) {
     return PyFloat_FromDouble(self->queue_time);
 }
@@ -412,6 +425,8 @@ static PyMethodDef Response_methods[] = {
      "Get elapsed time from start of request we've started to send the request"},
     {"get_starttransfer_time", (PyCFunction)Response_get_starttransfer_time, METH_NOARGS,
      "Get elapsed time from start of request until the first byte is recieved in seconds"},
+    {"get_posttransfer_time", (PyCFunction)Response_get_posttransfer_time, METH_NOARGS,
+     "Get elapsed time from start of request until the request was sent in seconds"},
     {"get_size_upload", (PyCFunction)Response_get_size_upload, METH_NOARGS, ""},
     {"get_size_download", (PyCFunction)Response_get_size_download, METH_NOARGS, ""},
     {"get_primary_ip", (PyCFunction)Response_get_primary_ip, METH_NOARGS, ""},
@@ -594,9 +609,9 @@ static void complete_request(EventLoop *loop, AcRequestData *rd) {
         if (rd->result == CURLE_OK) {
             curl_easy_getinfo(rd->curl, CURLINFO_HTTP_VERSION, &version);
         }
-        slot_release(rd->share, rd->slot, version == CURL_HTTP_VERSION_2_0 || version == CURL_HTTP_VERSION_3);
+        slot_release(rd->limiter, rd->slot, version == CURL_HTTP_VERSION_2_0 || version == CURL_HTTP_VERSION_3);
         rd->slot = NULL;
-        dispatch_waiting(loop, rd->share);
+        dispatch_waiting(loop, rd->limiter);
     }
     share_decref(rd->share);
     rd->share = NULL;
@@ -774,7 +789,12 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERDATA, rd);
     if (rd->share->max_host_connections || rd->share->max_connections) {
-        rd->slot = host_slot(rd->share, rd->url);
+        rd->limiter = rd->share;
+    } else if (loop->limiter != NULL && !rd->session->own_pool) {
+        rd->limiter = loop->limiter;
+    }
+    if (rd->limiter != NULL) {
+        rd->slot = host_slot(rd->limiter, rd->url);
     }
     free(rd->method);
     rd->method = NULL;
@@ -791,17 +811,17 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     free(rd->ca_file);
     rd->ca_file = NULL;
     free(rd->cookies_str);
-    if (rd->slot != NULL && !slot_free(rd->share, rd->slot)) {
+    if (rd->slot != NULL && !slot_free(rd->limiter, rd->slot)) {
         rd->queued_at = monotonic_time();
-        if (rd->share->waiting_tail != NULL) {
-            rd->share->waiting_tail->next_waiting = rd;
+        if (rd->limiter->waiting_tail != NULL) {
+            rd->limiter->waiting_tail->next_waiting = rd;
         } else {
-            rd->share->waiting_head = rd;
+            rd->limiter->waiting_head = rd;
         }
-        rd->share->waiting_tail = rd;
+        rd->limiter->waiting_tail = rd;
     } else {
         if (rd->slot != NULL) {
-            slot_acquire(rd->share, rd->slot);
+            slot_acquire(rd->limiter, rd->slot);
         }
         add_transfer(loop, rd);
     }
@@ -964,8 +984,13 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
         goto error;
     }
     curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, max_idle_connections);
-    curl_multi_setopt(self->multi, CURLMOPT_MAX_HOST_CONNECTIONS, max_host_connections);
-    curl_multi_setopt(self->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, max_total_connections);
+    if (max_host_connections || max_total_connections) {
+        self->limiter = share_new(false, false, max_host_connections, max_total_connections);
+        if (self->limiter == NULL) {
+            PyErr_NoMemory();
+            goto error;
+        }
+    }
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETFUNCTION, socket_callback);
     curl_multi_setopt(self->multi, CURLMOPT_SOCKETDATA, self);
     curl_multi_setopt(self->multi, CURLMOPT_TIMERFUNCTION, timer_callback);
@@ -1010,6 +1035,9 @@ static void EventLoop_dealloc(EventLoop *self) {
     }
     if (self->multi != NULL) {
         curl_multi_cleanup(self->multi);
+    }
+    if (self->limiter != NULL) {
+        share_decref(self->limiter);
     }
     if (self->event_loop != NULL) {
         aeDeleteEventLoop(self->event_loop);
@@ -1231,6 +1259,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     Py_INCREF(loop);
     self->loop = loop;
     self->fresh_connect = fresh_connect;
+    self->own_pool = share_connections;
     self->http_version = curl_http_version;
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;

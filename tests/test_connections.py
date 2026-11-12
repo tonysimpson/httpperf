@@ -11,6 +11,7 @@ import acurl
 
 class CountingHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
     open_connections = 0
 
     def setup(self):
@@ -77,17 +78,20 @@ def test_connection_reuse(url, connections, new):
     loop.close()
 
 
+@pytest.mark.parametrize("connections", ["shared", "none"])
 @pytest.mark.parametrize("limits, connects", [({"max_host_connections": 2}, 2), ({"max_total_connections": 3}, 3)])
-def test_event_loop_connection_limits(url, limits, connects):
+def test_event_loop_connection_limits(url, limits, connects, connections):
     loop = asyncio.new_event_loop()
     el = acurl.EventLoop(loop=loop, **limits)
-    s = el.session(http_version="HTTP/1.1")
+    s = el.session(connections=connections, http_version="HTTP/1.1")
 
     async def main():
         return await asyncio.gather(*(s.get(url + "slow") for _ in range(6)))
 
     responses = loop.run_until_complete(main())
-    assert sum(r.connect_time > 0 for r in responses) == connects
+    if connections == "shared":
+        assert sum(r.connect_time > 0 for r in responses) == connects
+    assert sum(r.queue_time > 0 for r in responses) == 6 - connects
     el.stop()
     loop.close()
 
@@ -225,5 +229,18 @@ def test_error_messages_are_specific():
     assert type(e.value) is acurl.RequestError
     assert e.value.code == 7
     assert "port %d" % port in str(e.value)
+    el.stop()
+    loop.close()
+
+
+def test_server_time(url):
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    r = loop.run_until_complete(el.session().get(url + "slow"))
+    if r.posttransfer_time is None:
+        pytest.skip("libcurl older than 8.10")
+    assert r.pretransfer_time <= r.posttransfer_time < r.starttransfer_time <= r.total_time
+    assert 0.05 <= r.starttransfer_time - r.posttransfer_time < 0.06
+    assert 0 <= r.client_lag < 0.01
     el.stop()
     loop.close()

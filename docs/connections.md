@@ -35,11 +35,11 @@ Where a limit is set depends on where the connections live.
 
 | Setting | Set on | Applies to | Done by |
 |---|---|---|---|
-| `max_host_connections`, `max_total_connections` | `EventLoop` | `"shared"` and `"none"` sessions together | curl, which queues requests above the limit |
+| `max_host_connections`, `max_total_connections` | `EventLoop` | `"shared"` and `"none"` sessions together, unless the session has its own limits | acurl, in a queue on the curl thread |
 | `max_host_connections`, `max_connections` | session | that session only (`"session"` or `"none"`) | acurl, in a queue on the curl thread |
 | `max_idle_connections` | `EventLoop` | each pool separately | curl, which closes the oldest idle connection when a pool is over the limit |
 
-The per-session limits exist because curl's own limits only see the shared pool. They count connections in use, which for HTTP/1.1 means requests in flight. Once a host has answered over HTTP/2 or HTTP/3, its requests share one connection and are not held back by `max_host_connections`. Until the first response shows that, a burst to a new host is capped like HTTP/1.1. Time spent in the queue is reported as `Response.queue_time` and kept out of `client_lag`.
+acurl does the queueing, not curl, because curl starts its timers before a request waits in its queue, so the wait would be counted as response time. All the limits count connections in use, which for HTTP/1.1 means requests in flight. Once a host has answered over HTTP/2 or HTTP/3, its requests share one connection and are not held back by `max_host_connections`. Until the first response shows that, a burst to a new host is capped like HTTP/1.1. Time spent in the queue is reported as `Response.queue_time` and kept out of `client_lag`.
 
 Idle connections do not count towards `max_connections`, so a session can hold more open connections than the cap if it talks to several hosts. `max_idle_connections` bounds those.
 
@@ -88,7 +88,7 @@ session = el.session(connections="none")
 
 - `connect_time` is 0 when a request reused a connection, and above 0 when it opened one. `appconnect_time` is the same for the TLS handshake.
 - `http_version` shows whether HTTP/2 was negotiated.
-- `queue_time` shows requests waiting for a per-session connection slot.
+- `queue_time` shows requests waiting for a connection slot.
 
 Counting new connections at the server (or from `/proc/net/snmp` `ActiveOpens` on the client) is the most direct check.
 
