@@ -1,11 +1,12 @@
 import asyncio
+import json as _json
 import threading
 import time
 from urllib.parse import urlparse
 
-import ujson
-
 from acurl import _acurl
+
+_json_encoder = _json.JSONEncoder(separators=(",", ":"), check_circular=False)
 
 
 class RequestError(Exception):
@@ -343,7 +344,7 @@ class Response:
 
     def json(self):
         if not hasattr(self, "_json"):
-            self._json = ujson.loads(self.body)
+            self._json = _json.loads(self.body.decode("utf-8"))
         return self._json
 
     @property
@@ -454,7 +455,7 @@ class Session:
         if json is not None:
             if data is not None:
                 raise ValueError("use only one or none of data or json")
-            data = ujson.dumps(json)
+            data = _json_encoder.encode(json)
             content_type_set = False
             if headers and "Content-Type" in headers:
                 content_type_set = True

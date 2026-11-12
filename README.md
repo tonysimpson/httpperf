@@ -97,7 +97,7 @@ Cookies always belong to the session, whatever the connection settings. See [doc
 | `cookie_list` | List of `Cookie` objects. |
 | `auth` | `(username, password)` for basic auth. |
 | `data` | Request body, `str` or `bytes`. |
-| `json` | Object to send as JSON. Sets `Content-Type: application/json` unless you set it. |
+| `json` | Object to send as JSON, encoded compactly with the standard library. Sets `Content-Type: application/json` unless you set it. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
 | `verify` | `True`, `False` or a CA bundle path, overriding the session's `verify`. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
@@ -118,11 +118,19 @@ Failed transfers raise `acurl.RequestError` with curl's error message.
 | `body` | Bytes. |
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |
-| `json()` | Body parsed as JSON (always UTF-8, as RFC 8259 requires). |
+| `json()` | Body parsed as JSON with the standard library (always UTF-8, as RFC 8259 requires). |
 | `cookies`, `cookielist` | The session's cookie jar at the time you read it (not only the cookies this response set). Empty once the session is closed. |
 | `primary_ip` | Address connected to. |
 | `upload_size`, `download_size` | Bytes, as integers. |
 | `request` | The `Request`: `method`, `url`, `headers`, `cookies`, `auth`, `data`. |
+
+### JSON
+
+acurl uses the standard library's `json`, which has no extra dependency and the most scrutinised parser. That matters because load tests often fetch responses from third parties. If JSON costs too much CPU:
+
+- Encode request bodies once and reuse the bytes, where the payload allows.
+- Encode with a faster library and send the bytes yourself: `session.post(url, data=orjson.dumps(obj), headers={"Content-Type": "application/json"})`. orjson is about 8 times faster on larger payloads, but turns `NaN` into `null` and refuses integers over 64 bits.
+- To read a few fields from a large response, parse lazily with [pysimdjson](https://github.com/TkTech/pysimdjson): `doc = simdjson.Parser().parse(r.body)`, then `doc["items"][3]["name"]`. Only the values you touch become Python objects, which was about 8 times faster than `json.loads` for one field of a 500 KB document. The result is read-only and not a real `dict`; `doc.as_dict()` converts it.
 
 ## Timings
 

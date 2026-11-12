@@ -34,15 +34,11 @@ cpy_extension = Extension(
 )
 
 
-install_requires = ["ujson"]
-
-
 setup(
     name="acurl",
     version=__version__,
     packages=["acurl"],
     ext_modules=[cpy_extension],
-    install_requires=install_requires,
     description="An async Curl library.",
     classifiers=[
         "Development Status :: 3 - Alpha",
