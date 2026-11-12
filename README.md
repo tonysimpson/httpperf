@@ -225,4 +225,4 @@ Set `HTTPPERF_PROFILE=1` when building to instrument the extension. See [docs/pr
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). [NOTICE](NOTICE) covers the bundled Redis event library and the libraries included in the binary wheels.

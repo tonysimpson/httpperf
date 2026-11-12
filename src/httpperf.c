@@ -1,7 +1,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "ae/ae.h"
-#include <curl/multi.h>
+#include <curl/curl.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <strings.h>
