@@ -61,14 +61,14 @@ def h2_url():
 
 def libcurl_has_http3():
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
+    el = acurl.Engine()
     try:
-        el.session(http_version="HTTP/3")
+        acurl.Session(engine=el, http_version="HTTP/3")
         return True
     except ValueError:
         return False
     finally:
-        el.stop()
+        el.close()
         loop.close()
 
 
@@ -81,7 +81,7 @@ needs_http3 = pytest.mark.skipif(
 def run(coro):
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(coro(acurl.EventLoop(loop=loop)))
+        return loop.run_until_complete(coro(acurl.Engine()))
     finally:
         loop.close()
 
@@ -91,8 +91,8 @@ def run(coro):
 )
 def test_http_version(h2_url, version, body):
     async def main(el):
-        r = await el.session(http_version=version).get(h2_url)
-        el.stop()
+        r = await acurl.Session(engine=el, http_version=version).get(h2_url)
+        el.close()
         return r
 
     r = run(main)
@@ -105,9 +105,9 @@ def test_http_version(h2_url, version, body):
 )
 def test_concurrent_requests_share_a_connection(h2_url, version, connects):
     async def main(el):
-        s = el.session(connections="session", http_version=version)
+        s = acurl.Session(engine=el, connections="session", http_version=version)
         responses = await asyncio.gather(*(s.get(h2_url) for _ in range(5)))
-        el.stop()
+        el.close()
         return responses
 
     assert sum(r.connect_time > 0 for r in run(main)) == connects
@@ -115,10 +115,10 @@ def test_concurrent_requests_share_a_connection(h2_url, version, connects):
 
 def test_session_host_limit_with_multiplexing(h2_url):
     async def main(el):
-        s = el.session(connections="session", max_host_connections=2)
+        s = acurl.Session(engine=el, connections="session", max_host_connections=2)
         first = await asyncio.gather(*(s.get(h2_url) for _ in range(6)))
         second = await asyncio.gather(*(s.get(h2_url) for _ in range(6)))
-        el.stop()
+        el.close()
         return first, second
 
     first, second = run(main)

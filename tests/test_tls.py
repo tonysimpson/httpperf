@@ -41,12 +41,12 @@ def tls_url():
 @pytest.mark.parametrize("tls, resumed", [("shared", "True"), ("session", "False")])
 def test_tls_resumption_across_sessions(tls_url, tls, resumed):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    first = el.session(connections="session", tls=tls)
+    el = acurl.Engine()
+    first = acurl.Session(engine=el, connections="session", tls=tls)
     assert loop.run_until_complete(first.get(tls_url)).text == "False"
-    second = el.session(connections="session", tls=tls)
+    second = acurl.Session(engine=el, connections="session", tls=tls)
     assert loop.run_until_complete(second.get(tls_url)).text == resumed
-    el.stop()
+    el.close()
     loop.close()
 
 
@@ -98,9 +98,9 @@ def mtls_url(client_certs):
 
 def test_client_certs(mtls_url, client_certs):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    user1 = el.session(cert=client_certs["user1"])
-    user2 = el.session(cert=client_certs["user2"])
+    el = acurl.Engine()
+    user1 = acurl.Session(engine=el, cert=client_certs["user1"])
+    user2 = acurl.Session(engine=el, cert=client_certs["user2"])
 
     def who(session, **kwargs):
         return loop.run_until_complete(session.get(mtls_url, **kwargs)).text
@@ -108,32 +108,32 @@ def test_client_certs(mtls_url, client_certs):
     assert [who(user1), who(user2), who(user1), who(user2)] == ["user1", "user2", "user1", "user2"]
     assert who(user1, cert=client_certs["user2"]) == "user2"
     with pytest.raises(acurl.RequestError):
-        who(el.session())
+        who(acurl.Session(engine=el))
     with pytest.raises(ValueError):
         who(user1, cert="user1.pem")
-    el.stop()
+    el.close()
     loop.close()
 
 
 def test_verify(tls_url):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
+    el = acurl.Engine()
     ca = pytest_httpbin.certs.where()
 
     def get(session, **kwargs):
         return loop.run_until_complete(session.get(tls_url, **kwargs)).status_code
 
-    unverified = el.session()
+    unverified = acurl.Session(engine=el)
     assert get(unverified) == 200
     with pytest.raises(acurl.RequestError):
         get(unverified, verify=True)
     assert get(unverified, verify=ca) == 200
     with pytest.raises(acurl.RequestError):
-        get(el.session(verify=True))
-    verified = el.session(verify=ca)
+        get(acurl.Session(engine=el, verify=True))
+    verified = acurl.Session(engine=el, verify=ca)
     assert get(verified) == 200
     assert get(verified, verify=False) == 200
     with pytest.raises(ValueError):
         get(verified, verify=1)
-    el.stop()
+    el.close()
     loop.close()

@@ -53,8 +53,8 @@ def wait_for_connections(n):
 
 def test_close_closes_connections(url):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    s = el.session(connections="session")
+    el = acurl.Engine()
+    s = acurl.Session(engine=el, connections="session")
     r = loop.run_until_complete(s.get(url))
     assert r.cookies == {"name": "value"}
     assert wait_for_connections(1) == 1
@@ -63,18 +63,18 @@ def test_close_closes_connections(url):
     assert r.status_code == 200
     with pytest.raises(RuntimeError):
         loop.run_until_complete(s.get(url))
-    el.stop()
+    el.close()
     loop.close()
 
 
 @pytest.mark.parametrize("connections, new", [("session", [True, False]), ("none", [True, True])])
 def test_connection_reuse(url, connections, new):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    s = el.session(connections=connections)
+    el = acurl.Engine()
+    s = acurl.Session(engine=el, connections=connections)
     assert [loop.run_until_complete(s.get(url)).connect_time > 0 for _ in new] == new
     s.close()
-    el.stop()
+    el.close()
     loop.close()
 
 
@@ -82,8 +82,8 @@ def test_connection_reuse(url, connections, new):
 @pytest.mark.parametrize("limits, connects", [({"max_host_connections": 2}, 2), ({"max_total_connections": 3}, 3)])
 def test_event_loop_connection_limits(url, limits, connects, connections):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop, **limits)
-    s = el.session(connections=connections, http_version="HTTP/1.1")
+    el = acurl.Engine(**limits)
+    s = acurl.Session(engine=el, connections=connections, http_version="HTTP/1.1")
 
     async def main():
         return await asyncio.gather(*(s.get(url + "slow") for _ in range(6)))
@@ -92,36 +92,36 @@ def test_event_loop_connection_limits(url, limits, connects, connections):
     if connections == "shared":
         assert sum(r.connect_time > 0 for r in responses) == connects
     assert sum(r.queue_time > 0 for r in responses) == 6 - connects
-    el.stop()
+    el.close()
     loop.close()
 
 
 def test_max_idle_connections(url):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop, max_idle_connections=1)
-    s = el.session(http_version="HTTP/1.1")
+    el = acurl.Engine(max_idle_connections=1)
+    s = acurl.Session(engine=el, http_version="HTTP/1.1")
 
     async def batch():
         return await asyncio.gather(*(s.get(url + "slow") for _ in range(3)))
 
     assert sum(r.connect_time > 0 for r in loop.run_until_complete(batch())) == 3
     assert sum(r.connect_time > 0 for r in loop.run_until_complete(batch())) == 2
-    el.stop()
+    el.close()
     loop.close()
 
 
 @pytest.mark.parametrize("options, wait", [({"idle_timeout": 0}, 1.1), ({"max_connection_age": 1}, 2.1)])
 def test_connection_expiry(url, options, wait):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    s = el.session(connections="session", **options)
+    el = acurl.Engine()
+    s = acurl.Session(engine=el, connections="session", **options)
     first = loop.run_until_complete(s.get(url))
     time.sleep(wait)
     second = loop.run_until_complete(s.get(url))
     assert first.connect_time > 0
     assert second.connect_time > 0
     s.close()
-    el.stop()
+    el.close()
     loop.close()
 
 
@@ -131,8 +131,8 @@ def test_connection_expiry(url, options, wait):
 )
 def test_session_connection_limits(url, limits, hosts, queued):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    s = el.session(connections="session", http_version="HTTP/1.1", **limits)
+    el = acurl.Engine()
+    s = acurl.Session(engine=el, connections="session", http_version="HTTP/1.1", **limits)
     urls = [url.replace("127.0.0.1", host) + "slow" for host in hosts for _ in range(6 // len(hosts))]
 
     async def main():
@@ -142,7 +142,7 @@ def test_session_connection_limits(url, limits, hosts, queued):
     assert sum(r.queue_time > 0 for r in responses) == queued
     assert all(r.client_lag < r.queue_time + 0.05 for r in responses)
     s.close()
-    el.stop()
+    el.close()
     loop.close()
 
 
@@ -150,13 +150,13 @@ def test_context_managers(url):
     loop = asyncio.new_event_loop()
 
     async def main():
-        async with acurl.EventLoop(loop=loop) as el:
-            async with el.session(connections="session") as s:
+        async with acurl.Engine() as el:
+            async with acurl.Session(engine=el, connections="session") as s:
                 assert (await s.get(url)).status_code == 200
             with pytest.raises(RuntimeError):
                 await s.get(url)
             assert wait_for_connections(0) == 0
-            with el.session() as s2:
+            with acurl.Session(engine=el) as s2:
                 assert (await s2.get(url)).status_code == 200
         return el
 
@@ -164,7 +164,7 @@ def test_context_managers(url):
     el._thread.join(2)
     assert not el._thread.is_alive()
     assert wait_for_connections(0) == 0
-    with acurl.EventLoop(loop=loop) as el:
+    with acurl.Engine() as el:
         pass
     el._thread.join(2)
     assert not el._thread.is_alive()
@@ -173,7 +173,7 @@ def test_context_managers(url):
 
 def test_timeouts(url):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
+    el = acurl.Engine()
     silent = socket.socket()
     silent.bind(("127.0.0.1", 0))
     silent.listen(8)
@@ -189,14 +189,14 @@ def test_timeouts(url):
         except acurl.RequestError as e:
             return type(e), e.code, round(time.monotonic() - start, 1)
 
-    unlimited = el.session()
+    unlimited = acurl.Session(engine=el)
     assert get(unlimited, "http://127.0.0.1:%d/" % silent.getsockname()[1], timeout=0.2) == (acurl.Timeout, 28, 0.2)
     assert get(unlimited, "http://127.0.0.1:%d/" % full.getsockname()[1], connect_timeout=0.2) == (
         acurl.Timeout,
         28,
         0.2,
     )
-    impatient = el.session(timeout=0.01)
+    impatient = acurl.Session(engine=el, timeout=0.01)
     assert get(impatient, url + "slow")[0] is acurl.Timeout
     assert get(impatient, url + "slow", timeout=0) == 200
     assert get(impatient, url + "slow", timeout=1) == 200
@@ -205,7 +205,7 @@ def test_timeouts(url):
             get(unlimited, url, timeout=bad)
     with pytest.raises(TypeError):
         get(unlimited, url, connect_timeout="1")
-    el.stop()
+    el.close()
     loop.close()
     for s in (silent, full, filler):
         s.close()
@@ -213,30 +213,30 @@ def test_timeouts(url):
 
 def test_error_messages_are_specific():
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
+    el = acurl.Engine()
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
     with pytest.raises(acurl.RequestError) as e:
-        loop.run_until_complete(el.session().get("http://127.0.0.1:%d/" % port))
+        loop.run_until_complete(acurl.Session(engine=el).get("http://127.0.0.1:%d/" % port))
     assert type(e.value) is acurl.RequestError
     assert e.value.code == 7
     assert "port %d" % port in str(e.value)
-    el.stop()
+    el.close()
     loop.close()
 
 
 def test_server_time(url):
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
-    r = loop.run_until_complete(el.session().get(url + "slow"))
+    el = acurl.Engine()
+    r = loop.run_until_complete(acurl.Session(engine=el).get(url + "slow"))
     if r.posttransfer_time is None:
         pytest.skip("libcurl older than 8.10")
     assert r.pretransfer_time <= r.posttransfer_time < r.starttransfer_time <= r.total_time
     assert 0.05 <= r.starttransfer_time - r.posttransfer_time < 0.06
     assert 0 <= r.client_lag < 0.01
-    el.stop()
+    el.close()
     loop.close()
 
 
@@ -248,7 +248,7 @@ def test_proxy_environment_is_read_per_session(url, monkeypatch):
     proxy_port = sock.getsockname()[1]
     sock.close()
     loop = asyncio.new_event_loop()
-    el = acurl.EventLoop(loop=loop)
+    el = acurl.Engine()
 
     def get(session):
         try:
@@ -256,23 +256,23 @@ def test_proxy_environment_is_read_per_session(url, monkeypatch):
         except acurl.RequestError as e:
             return str(e)
 
-    direct = el.session()
+    direct = acurl.Session(engine=el)
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:%d" % proxy_port)
-    proxied = el.session()
+    proxied = acurl.Session(engine=el)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    bypassed = el.session()
+    bypassed = acurl.Session(engine=el)
     monkeypatch.delenv("http_proxy")
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:%d" % proxy_port)
     monkeypatch.delenv("NO_PROXY")
-    fallback = el.session()
+    fallback = acurl.Session(engine=el)
     monkeypatch.delenv("ALL_PROXY")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:%d" % proxy_port)
-    uppercase = el.session()
+    uppercase = acurl.Session(engine=el)
 
     assert get(direct) == 200
     assert "port %d" % proxy_port in get(proxied)
     assert get(bypassed) == 200
     assert "port %d" % proxy_port in get(fallback)
     assert get(uppercase) == 200
-    el.stop()
+    el.close()
     loop.close()

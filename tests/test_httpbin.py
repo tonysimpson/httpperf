@@ -19,8 +19,8 @@ def event_loop():
 
 
 def session():
-    el = acurl.EventLoop()
-    return el.session()
+    el = acurl.Engine()
+    return acurl.Session(engine=el)
 
 
 def _await(awaitable):
@@ -147,46 +147,46 @@ def test_post_binary(httpbin):
 
 @pytest.mark.parametrize("connections", ["shared", "session", "none"])
 def test_connections(httpbin, connections):
-    s = acurl.EventLoop().session(connections=connections)
+    s = acurl.Session(connections=connections)
     for _ in range(2):
         assert _await(s.get(httpbin.url + "/get")).status_code == 200
 
 
 def test_connections_invalid():
     with pytest.raises(ValueError):
-        acurl.EventLoop().session(connections="pooled")
+        acurl.Session(connections="pooled")
 
 
 def test_tls_invalid():
     with pytest.raises(ValueError):
-        acurl.EventLoop().session(tls="pooled")
+        acurl.Session(tls="pooled")
 
 
 def test_connection_limits_invalid():
     with pytest.raises(ValueError):
-        acurl.EventLoop(max_host_connections=-1)
+        acurl.Engine(max_host_connections=-1)
 
 
 @pytest.mark.parametrize("options", [{"idle_timeout": -1}, {"max_connection_age": -1}])
 def test_expiry_invalid(options):
     with pytest.raises(ValueError):
-        acurl.EventLoop().session(**options)
+        acurl.Session(**options)
 
 
 def test_max_idle_connections_invalid():
     with pytest.raises(ValueError):
-        acurl.EventLoop(max_idle_connections=0)
+        acurl.Engine(max_idle_connections=0)
 
 
 @pytest.mark.parametrize("options", [{"max_host_connections": 2}, {"connections": "session", "max_connections": -1}])
 def test_session_connection_limits_invalid(options):
     with pytest.raises(ValueError):
-        acurl.EventLoop().session(**options)
+        acurl.Session(**options)
 
 
 def test_http_version_invalid():
     with pytest.raises(ValueError):
-        acurl.EventLoop().session(http_version="HTTP/0.9")
+        acurl.Session(http_version="HTTP/0.9")
 
 
 def test_client_lag(httpbin):
@@ -253,14 +253,14 @@ def test_status_helpers(httpbin):
 
 
 def test_reused_handles_do_not_leak_between_sessions(httpbin):
-    el = acurl.EventLoop()
-    first = el.session()
+    el = acurl.Engine()
+    first = acurl.Session(engine=el)
     for _ in range(3):
         _await(first.get(httpbin.url + "/cookies/set?secret=1"))
         _await(first.get(httpbin.url + "/headers", auth=("user", "pass"), headers={"X-Private": "1"}))
     gc.collect()
     _await(asyncio.sleep(0.05))
-    second = el.session()
+    second = acurl.Session(engine=el)
     for _ in range(3):
         assert _await(second.get(httpbin.url + "/cookies")).json()["cookies"] == {}
         headers = _await(second.get(httpbin.url + "/headers")).json()["headers"]

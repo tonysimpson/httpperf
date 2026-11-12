@@ -491,8 +491,8 @@ class Response:
 class Session:
     def __init__(
         self,
-        ae_loop,
-        loop,
+        *,
+        engine=None,
         connections="shared",
         tls="shared",
         http_version="HTTP/2",
@@ -505,10 +505,10 @@ class Session:
         timeout=None,
         connect_timeout=None,
     ):
-        self._loop = loop
+        self._engine = engine if engine is not None else _default_engine()
         self._options = {"cert": cert, "verify": verify, "timeout": timeout, "connect_timeout": connect_timeout}
         self._session = _acurl.Session(
-            ae_loop,
+            self._engine._ae_loop,
             connections,
             tls,
             http_version,
@@ -653,7 +653,10 @@ class Session:
         start = time.monotonic()
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
 
-        future = self._loop.create_future()
+        loop = asyncio.get_running_loop()
+        if loop is not self._engine._loop:
+            self._engine._bind(loop)
+        future = loop.create_future()
         self._session.request(
             future,
             method,
@@ -716,37 +719,23 @@ class Session:
         self._session.apply_cookielist(tuple(c.format() for c in cookie_list))
 
 
-class EventLoop:
+class Engine:
+    _closed = True
+
     def __init__(
         self,
-        loop=None,
-        same_thread=False,
+        *,
         max_host_connections=0,
         max_total_connections=0,
         max_idle_connections=1000,
+        same_thread=False,
     ):
+        self._loop = None
         self._running = False
-        if loop is None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
-        self._loop = loop
+        self._same_thread = same_thread
         self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
-        # Completed requests end up on the fd pipe, complete callback called
-        self._loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
-        if same_thread:
-            self._loop.call_later(0, self._same_thread_runner)
-        else:
-            self._run_in_thread()
-
-    def _same_thread_runner(self):
-        """Start event loop in normal python thread, allows use of python debugger and profiler"""
-        self._ae_loop.once()
-        self._loop.call_later(0.001, self._same_thread_runner)
-
-    def _run_in_thread(self):
-        if not self._running:
+        self._closed = False
+        if not same_thread:
             self._running = True
             self._thread = threading.Thread(target=self._runner, daemon=True)
             self._thread.start()
@@ -755,26 +744,21 @@ class EventLoop:
         self._ae_loop.main()
         self._running = False
 
-    def stop(self):
-        if self._running:
-            if not self._loop.is_closed():
-                self._loop.remove_reader(self._ae_loop.get_out_fd())
-            self._ae_loop.stop()
+    def _bind(self, loop):
+        if self._closed:
+            raise RuntimeError("engine is closed")
+        if self._loop is not None and not self._loop.is_closed():
+            raise RuntimeError("engine is in use by another event loop")
+        self._loop = loop
+        loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
+        if self._same_thread:
+            loop.call_soon(self._same_thread_runner, loop)
 
-    def __del__(self):
-        self.stop()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        self.stop()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc_info):
-        self.stop()
+    def _same_thread_runner(self, loop):
+        if self._closed or loop is not self._loop:
+            return
+        self._ae_loop.once()
+        loop.call_later(0.001, self._same_thread_runner, loop)
 
     def _complete(self):
         for error, response, future in self._ae_loop.get_completed():
@@ -784,32 +768,37 @@ class EventLoop:
                 code, message = error
                 future.set_exception((Timeout if code == CURLE_OPERATION_TIMEDOUT else RequestError)(message, code))
 
-    def session(
-        self,
-        connections="shared",
-        tls="shared",
-        http_version="HTTP/2",
-        idle_timeout=118,
-        max_connection_age=0,
-        max_host_connections=0,
-        max_connections=0,
-        cert=None,
-        verify=False,
-        timeout=None,
-        connect_timeout=None,
-    ):
-        return Session(
-            self._ae_loop,
-            self._loop,
-            connections,
-            tls,
-            http_version,
-            idle_timeout,
-            max_connection_age,
-            max_host_connections,
-            max_connections,
-            cert,
-            verify,
-            timeout,
-            connect_timeout,
-        )
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.remove_reader(self._ae_loop.get_out_fd())
+        self._loop = None
+        if self._running:
+            self._ae_loop.stop()
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        self.close()
+
+
+_default = None
+
+
+def _default_engine():
+    global _default
+    if _default is None:
+        _default = Engine()
+    return _default

@@ -15,13 +15,13 @@ def rss():
                 return int(line.split()[1]) * 1024
 
 async def main(url, n, connections):
-    el = acurl.EventLoop(loop=asyncio.get_running_loop())
+    el = acurl.Engine()
     for _ in range(n // 4):
-        await el.session(connections=connections).get(url)
+        await acurl.Session(engine=el, connections=connections).get(url)
     gc.collect()
     before = rss()
     for _ in range(n):
-        await el.session(connections=connections).get(url)
+        await acurl.Session(engine=el, connections=connections).get(url)
     gc.collect()
     print(json.dumps((rss() - before) / n))
 

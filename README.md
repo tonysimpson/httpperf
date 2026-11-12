@@ -36,38 +36,27 @@ import acurl
 
 
 async def main():
-    async with acurl.EventLoop() as el:
-        async with el.session() as session:
-            r = await session.get("https://example.com/")
-            print(r.status_code, r.http_version, r.total_time, r.client_lag)
+    async with acurl.Session() as session:
+        r = await session.get("https://example.com/")
+        print(r.status_code, r.http_version, r.total_time, r.client_lag)
 
 
 asyncio.run(main())
 ```
 
-One `EventLoop` per process (or per asyncio loop) is normal. Sessions are cheap: create one per virtual user or journey.
+Sessions are cheap: create one per virtual user or journey. They share a default `Engine` (the curl thread, the shared connection pool and the TLS cache) unless you pass your own.
 
 ## API
 
-### `EventLoop(loop=None, same_thread=False, max_host_connections=0, max_total_connections=0, max_idle_connections=1000)`
+### `Session(*, engine=None, ...)`
 
-Starts the curl thread and connects it to an asyncio loop (the running loop if `loop` is not given).
-
-| Argument | Meaning |
-|---|---|
-| `same_thread` | Run the curl loop on the asyncio thread instead, polling every millisecond. Only for debugging and profiling with Python tools. |
-| `max_host_connections` | Process-wide cap on connections per host for sessions using the shared pool or no pool. 0 means no limit. acurl queues requests above it and reports the wait as `queue_time`. |
-| `max_total_connections` | Process-wide cap on all connections for the same sessions. 0 means no limit. |
-| `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
-
-`el.stop()` stops the curl thread and closes the shared pool's connections. Requests still in flight are abandoned. `with` and `async with` call `stop()` on exit.
-
-### `el.session(...)`
+All arguments are keyword-only. A session can be created anywhere, even outside a running asyncio loop.
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `connections` | `"shared"` | `"shared"`: the process-wide pool. `"session"`: the session's own pool. `"none"`: a new connection for every request. |
-| `tls` | `"shared"` | Where TLS session tickets are kept. `"shared"`: process-wide, so new connections resume their handshake. `"session"`: per session, so each session starts with a full handshake. |
+| `engine` | `None` | The `Engine` to use. `None` means the default engine, created when first needed and shared by every session without one. |
+| `connections` | `"shared"` | `"shared"`: the engine's pool. `"session"`: the session's own pool. `"none"`: a new connection for every request. |
+| `tls` | `"shared"` | Where TLS session tickets are kept. `"shared"`: in the engine, so new connections resume their handshake. `"session"`: per session, so each session starts with a full handshake. |
 | `http_version` | `"HTTP/2"` | `"HTTP/2"`: HTTP/2 over TLS when the server offers it, with requests waiting to share one multiplexed connection. Plain http uses HTTP/1.1. `"HTTP/1.1"`: HTTP/1.1 only. `"HTTP/3"`: HTTP/3 over QUIC only, with no fallback, so requests fail if the server does not offer it. |
 | `idle_timeout` | `118` | Seconds a connection may sit idle and still be reused. |
 | `max_connection_age` | `0` | Seconds after which a connection is no longer reused, however busy it is. 0 means no limit. |
@@ -80,7 +69,22 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 
 Proxies come from the environment, as curl reads them: `http_proxy` (not `HTTP_PROXY`, which curl ignores for security), `https_proxy` or `HTTPS_PROXY`, then `all_proxy` or `ALL_PROXY`, with `no_proxy` or `NO_PROXY` for exceptions. A session reads them once, when it is created, so later changes apply to new sessions only.
 
-Cookies always belong to the session, whatever the connection settings. See [docs/connections.md](docs/connections.md) for how these fit together.
+Cookies always belong to the session, whatever the connection settings.
+
+### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, same_thread=False)`
+
+What sessions share: the curl thread, the shared connection pool, the TLS session cache and the limits. Most programs never create one. Create one to set limits, or to keep groups of sessions in separate pools, and pass it to `Session(engine=...)`.
+
+| Argument | Meaning |
+|---|---|
+| `max_host_connections` | Cap on connections per host for the engine's sessions that use the shared pool or no pool. 0 means no limit. acurl queues requests above it and reports the wait as `queue_time`. |
+| `max_total_connections` | Cap on all connections for the same sessions. 0 means no limit. |
+| `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
+| `same_thread` | Run the curl loop on the asyncio thread instead, polling every millisecond. Only for debugging and profiling with Python tools. |
+
+An engine binds to the asyncio loop running when it is first used. Once that loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool. Using it from two live loops at once raises `RuntimeError`.
+
+`engine.close()` stops the curl thread and closes the shared pool's connections. Requests still in flight are abandoned, and later requests raise `RuntimeError`. `with` and `async with` call `close()` on exit. See [docs/connections.md](docs/connections.md) for how these fit together.
 
 ### Session methods
 
@@ -157,7 +161,7 @@ All in seconds.
 | `posttransfer_time` | Request fully sent. `starttransfer_time − posttransfer_time` is the server's time to first byte, without connection setup or upload. `None` with libcurl older than 8.10. |
 | `starttransfer_time` | First byte received. |
 | `total_time` | Transfer complete. |
-| `queue_time` | Time waiting in acurl's queue for a connection, under the EventLoop or session limits. 0 if the request did not wait. curl's timings start after it. |
+| `queue_time` | Time waiting in acurl's queue for a connection, under the engine or session limits. 0 if the request did not wait. curl's timings start after it. |
 | `client_lag` | `end_time − start_time − total_time − queue_time`: time the request spent waiting on Python, before it was sent and after it finished. Measured with the monotonic clock, so clock changes don't affect it. |
 
 curl measures its timings on the curl thread, so a busy Python process does not inflate them. `client_lag` is how you see that Python is the bottleneck: if it grows, the client cannot keep up, and achieved request rates describe the client rather than the server. Report it alongside response times (p50, p99, max).
@@ -167,7 +171,7 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 ## Known limitations
 
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
-- Requests in flight when `EventLoop.stop()` is called never complete.
+- Requests in flight when `Engine.close()` is called never complete.
 
 ## Development
 

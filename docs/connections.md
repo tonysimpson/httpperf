@@ -8,7 +8,7 @@ How a virtual user holds connections changes what the server sees: how many TCP 
 
 | Value | Pool | What the server sees |
 |---|---|---|
-| `"shared"` (default) | One pool for the whole process, held by the curl multi handle. | A handful of long-lived connections, however many sessions there are. Like a single HTTP client object (requests, httpx) shared across a program. |
+| `"shared"` (default) | One pool per engine (by default, one for the whole process), held by the curl multi handle. | A handful of long-lived connections, however many sessions there are. Like a single HTTP client object (requests, httpx) shared across a program. |
 | `"session"` | The session's own pool, held in its curl share. | Keep-alive within a session, a fresh connection for each new session. Like a browser profile per user. |
 | `"none"` | No reuse: `CURLOPT_FRESH_CONNECT` and `CURLOPT_FORBID_REUSE`. | A new connection, and TLS handshake, for every request. |
 
@@ -18,7 +18,7 @@ Cookies are always per session, so sharing connections never shares cookies.
 
 | Value | Ticket cache | Effect on new connections |
 |---|---|---|
-| `"shared"` (default) | Process-wide (the multi handle's cache). | Resumed handshake: cheaper for both ends. |
+| `"shared"` (default) | The engine's (its curl multi handle's cache). | Resumed handshake: cheaper for both ends. |
 | `"session"` | The session's share. | Full handshake for each session's first connection, as a new visitor would see. |
 
 curl matches cached tickets on the client certificate as well as the host, so sessions with different certificates never resume each other's TLS sessions.
@@ -35,9 +35,9 @@ Where a limit is set depends on where the connections live.
 
 | Setting | Set on | Applies to | Done by |
 |---|---|---|---|
-| `max_host_connections`, `max_total_connections` | `EventLoop` | `"shared"` and `"none"` sessions together, unless the session has its own limits | acurl, in a queue on the curl thread |
+| `max_host_connections`, `max_total_connections` | `Engine` | `"shared"` and `"none"` sessions together, unless the session has its own limits | acurl, in a queue on the curl thread |
 | `max_host_connections`, `max_connections` | session | that session only (`"session"` or `"none"`) | acurl, in a queue on the curl thread |
-| `max_idle_connections` | `EventLoop` | each pool separately | curl, which closes the oldest idle connection when a pool is over the limit |
+| `max_idle_connections` | `Engine` | each pool separately | curl, which closes the oldest idle connection when a pool is over the limit |
 
 acurl does the queueing, not curl, because curl starts its timers before a request waits in its queue, so the wait would be counted as response time. All the limits count connections in use, which for HTTP/1.1 means requests in flight. Once a host has answered over HTTP/2 or HTTP/3, its requests share one connection and are not held back by `max_host_connections`. Until the first response shows that, a burst to a new host is capped like HTTP/1.1. Time spent in the queue is reported as `Response.queue_time` and kept out of `client_lag`.
 
@@ -50,7 +50,7 @@ Idle connections do not count towards `max_connections`, so a session can hold m
 | `idle_timeout` (session, default 118 s) | A connection idle for longer is not reused. |
 | `max_connection_age` (session, default none) | A connection older than this is not reused, however busy. Useful for spreading load across new load-balancer back ends. |
 | `session.close()` | Closes the session's own connections once its requests finish. |
-| `EventLoop.stop()` | Closes the shared pool's connections. |
+| `Engine.close()` | Closes the shared pool's connections. |
 
 Both times are whole seconds. curl does not close expired connections on a timer: it notices them the next time that pool needs a connection, or when the session is closed. So the client stops reusing a connection at the right time, but the server only sees it close later.
 
@@ -63,14 +63,14 @@ These are starting points, not exact models of any product. Check the behaviour 
 One HTTP client object shared by a service, capped at 100 connections:
 
 ```python
-el = acurl.EventLoop(max_total_connections=100)
-session = el.session()
+engine = acurl.Engine(max_total_connections=100)
+session = acurl.Session(engine=engine)
 ```
 
 A browser, new visitor, one session per journey:
 
 ```python
-async with el.session(connections="session", tls="session", max_host_connections=6) as session:
+async with acurl.Session(connections="session", tls="session", max_host_connections=6) as session:
     ...
 ```
 
@@ -81,7 +81,7 @@ A returning visitor: the same, with `tls="shared"`, so handshakes resume.
 A client that never reuses connections:
 
 ```python
-session = el.session(connections="none")
+session = acurl.Session(connections="none")
 ```
 
 ## Checking the model

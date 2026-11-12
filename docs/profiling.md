@@ -10,10 +10,8 @@ import sys
 
 import acurl
 
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-el = acurl.EventLoop(loop=loop)
-session = el.session()
+engine = acurl.Engine()
+session = acurl.Session(engine=engine)
 
 
 async def main():
@@ -21,9 +19,9 @@ async def main():
         await session.get(sys.argv[1])
 
 
-loop.run_until_complete(main())
-el.stop()
-el._thread.join()
+asyncio.run(main())
+engine.close()
+engine._thread.join()
 ```
 
 ## Call tracing and timing: uftrace
