@@ -8,7 +8,7 @@ How a virtual user holds connections changes what the server sees: how many TCP 
 
 | Value | Pool | What the server sees |
 |---|---|---|
-| `"shared"` (default) | One pool per engine (by default, one for the whole process), held by the curl multi handle. | A handful of long-lived connections, however many sessions there are. Like a single HTTP client object (requests, httpx) shared across a program. |
+| `"shared"` (default) | One pool per engine (by default, one per asyncio loop), held by the curl multi handle. | A handful of long-lived connections, however many sessions there are. Like a single HTTP client object (requests, httpx) shared across a program. |
 | `"session"` | The session's own pool, held in its curl share. | Keep-alive within a session, a fresh connection for each new session. Like a browser profile per user. |
 | `"none"` | No reuse: `CURLOPT_FRESH_CONNECT` and `CURLOPT_FORBID_REUSE`. | A new connection, and TLS handshake, for every request. |
 

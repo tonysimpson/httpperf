@@ -4,8 +4,11 @@ import datetime
 import http
 import json as _json
 import os
+import sys
 import threading
 import time
+import warnings
+import weakref
 from urllib.parse import urlencode, urlparse
 
 from acurl import _acurl
@@ -513,12 +516,12 @@ class Session:
         json_dumps=None,
         json_loads=None,
     ):
-        self._engine = engine if engine is not None else _default_engine()
-        self._json_dumps = json_dumps if json_dumps is not None else self._engine._json_dumps
-        self._json_loads = json_loads if json_loads is not None else self._engine._json_loads
+        self._engine = engine
+        self._json_dumps = json_dumps or (engine._json_dumps if engine is not None else _json_dumps)
+        self._json_loads = json_loads or (engine._json_loads if engine is not None else _json_loads)
         self._options = {"cert": cert, "verify": verify, "timeout": timeout, "connect_timeout": connect_timeout}
         self._session = _acurl.Session(
-            self._engine._ae_loop,
+            engine._ae_loop if engine is not None else None,
             connections,
             tls,
             http_version,
@@ -664,8 +667,12 @@ class Session:
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
 
         loop = asyncio.get_running_loop()
-        if loop is not self._engine._loop:
-            self._engine._bind(loop)
+        engine = self._engine
+        if engine is None:
+            engine = self._engine = _default_engine(loop)
+            self._session.attach(engine._ae_loop)
+        if loop is not engine._loop():
+            engine._bind(loop)
         future = loop.create_future()
         self._session.request(
             future,
@@ -738,36 +745,25 @@ class Engine:
         max_host_connections=0,
         max_total_connections=0,
         max_idle_connections=1000,
-        same_thread=False,
         json_dumps=_json_dumps,
         json_loads=_json_loads,
     ):
         self._json_dumps = json_dumps
         self._json_loads = json_loads
-        self._loop = None
-        self._thread = None
-        self._same_thread = same_thread
+        self._loop = _no_loop
         self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
         self._closed = False
-        if not same_thread:
-            self._thread = threading.Thread(target=self._ae_loop.main, daemon=True)
-            self._thread.start()
+        self._thread = threading.Thread(target=self._ae_loop.main, name="acurl-engine", daemon=True)
+        self._thread.start()
 
     def _bind(self, loop):
         if self._closed:
             raise RuntimeError("engine is closed")
-        if self._loop is not None and not self._loop.is_closed():
+        current = self._loop()
+        if current is not None and not current.is_closed():
             raise RuntimeError("engine is in use by another event loop")
-        self._loop = loop
+        self._loop = weakref.ref(loop)
         loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
-        if self._same_thread:
-            loop.call_soon(self._same_thread_runner, loop)
-
-    def _same_thread_runner(self, loop):
-        if self._closed or loop is not self._loop:
-            return
-        self._ae_loop.once()
-        loop.call_later(0.001, self._same_thread_runner, loop)
 
     def _complete(self):
         for error, response, future in self._ae_loop.get_completed():
@@ -781,11 +777,23 @@ class Engine:
         if self._closed:
             return
         self._closed = True
-        if self._loop is not None and not self._loop.is_closed():
-            self._loop.remove_reader(self._ae_loop.get_out_fd())
-        self._loop = None
-        if self._thread is not None and self._thread.is_alive():
-            self._ae_loop.stop()
+        loop = self._loop()
+        if loop is not None and not loop.is_closed():
+            loop.remove_reader(self._ae_loop.get_out_fd())
+        self._loop = _no_loop
+        if self._thread is None or not self._thread.is_alive():
+            return
+        self._ae_loop.stop()
+        if sys.is_finalizing():
+            return
+        self._thread.join()
+        futures = self._ae_loop.abandon()
+        if futures:
+            warnings.warn(f"engine closed with {len(futures)} requests in flight", ResourceWarning, stacklevel=2)
+        for future in futures:
+            loop = future.get_loop()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(_abandon, future)
 
     def __del__(self):
         self.close()
@@ -803,11 +811,24 @@ class Engine:
         self.close()
 
 
-_default = None
+def _no_loop():
+    return None
 
 
-def _default_engine():
-    global _default
-    if _default is None:
-        _default = Engine()
-    return _default
+def _abandon(future):
+    if not future.done():
+        future.set_exception(RequestError("engine closed before the request finished"))
+
+
+_engines = weakref.WeakKeyDictionary()
+_engines_lock = threading.Lock()
+
+
+def _default_engine(loop):
+    with _engines_lock:
+        ref = _engines.get(loop)
+        engine = ref() if ref is not None else None
+        if engine is None or engine._closed:
+            engine = Engine()
+            _engines[loop] = weakref.ref(engine)
+        return engine

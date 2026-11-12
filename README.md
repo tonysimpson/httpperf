@@ -54,7 +54,7 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `engine` | `None` | The `Engine` to use. `None` means the default engine, created when first needed and shared by every session without one. |
+| `engine` | `None` | The `Engine` to use. `None` means the default engine of the asyncio loop the session is first used in, created when first needed and shared by every session in that loop without one. |
 | `connections` | `"shared"` | `"shared"`: the engine's pool. `"session"`: the session's own pool. `"none"`: a new connection for every request. |
 | `tls` | `"shared"` | Where TLS session tickets are kept. `"shared"`: in the engine, so new connections resume their handshake. `"session"`: per session, so each session starts with a full handshake. |
 | `http_version` | `"HTTP/2"` | `"HTTP/2"`: HTTP/2 over TLS when the server offers it, with requests waiting to share one multiplexed connection. Plain http uses HTTP/1.1. `"HTTP/1.1"`: HTTP/1.1 only. `"HTTP/3"`: HTTP/3 over QUIC only, with no fallback, so requests fail if the server does not offer it. |
@@ -73,7 +73,7 @@ Proxies come from the environment, as curl reads them: `http_proxy` (not `HTTP_P
 
 Cookies always belong to the session, whatever the connection settings.
 
-### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, same_thread=False, json_dumps=..., json_loads=...)`
+### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, json_dumps=..., json_loads=...)`
 
 What sessions share: the curl thread, the shared connection pool, the TLS session cache and the limits. Most programs never create one. Create one to set limits, or to keep groups of sessions in separate pools, and pass it to `Session(engine=...)`.
 
@@ -82,14 +82,13 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 | `max_host_connections` | Cap on connections per host for the engine's sessions that use the shared pool or no pool. 0 means no limit. acurl queues requests above it and reports the wait as `queue_time`. |
 | `max_total_connections` | Cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
-| `same_thread` | Run the curl loop on the asyncio thread instead, polling every millisecond. Only for debugging and profiling with Python tools. |
 | `json_dumps`, `json_loads` | The JSON functions for the engine's sessions, unless a session sets its own. The defaults use the standard library: compact output, and bodies decoded as UTF-8. See [JSON](#json). |
 
-An engine binds to the asyncio loop running when it is first used. Once that loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool.
+Each asyncio loop has its own default engine, so sessions without an engine work in any thread, and in each `asyncio.run()`, without setup. A loop's default engine lasts as long as the loop, and is closed once the loop has been closed and no session uses it.
 
-An engine serves one asyncio loop at a time, and using it from a second live loop raises `RuntimeError`. To run loops in several threads at once, give each thread its own `Engine` and pass it to that thread's sessions. The default engine is shared by the whole process, so it only works for one thread's loop at a time.
+An engine binds to the asyncio loop running when it is first used, and so does a session. An engine serves one loop at a time, and using it from a second live loop raises `RuntimeError`. Once its loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool. So a session kept between `asyncio.run()` calls keeps its connections. To run loops in several threads at once with your own engines, give each thread its own `Engine`.
 
-`engine.close()` stops the curl thread and closes the shared pool's connections. Requests still in flight are abandoned, and later requests raise `RuntimeError`. `with` and `async with` call `close()` on exit. An engine that is no longer referenced is closed automatically. The default engine lasts as long as the process. See [docs/connections.md](docs/connections.md) for how these fit together.
+`engine.close()` stops the curl thread and closes the shared pool's connections, and later requests raise `RuntimeError`. Requests still in flight fail with `RequestError`, and a `ResourceWarning` says how many there were. `with` and `async with` call `close()` on exit. An engine that is no longer referenced is closed automatically. See [docs/connections.md](docs/connections.md) for how these fit together.
 
 ### Session methods
 

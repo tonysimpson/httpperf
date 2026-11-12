@@ -74,6 +74,8 @@ typedef struct {
     int curl_easy_cleanup_write;
     struct AcRequestData *unsent_head;
     struct AcRequestData *unsent_tail;
+    struct AcRequestData *live_head;
+    bool running;
     struct Share *limiter;
     CURL *free_handles[HANDLE_POOL_SIZE];
     int free_handle_count;
@@ -189,7 +191,7 @@ static int pipe_read(int fd, void *buf, size_t len) {
 
 static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
     CleanupItem item = {curl, share};
-    if (!pipe_write(loop->curl_easy_cleanup_write, &item, sizeof(item))) {
+    if (loop == NULL || !pipe_write(loop->curl_easy_cleanup_write, &item, sizeof(item))) {
         if (curl != NULL) {
             curl_easy_cleanup(curl);
         }
@@ -280,6 +282,8 @@ typedef struct AcRequestData {
     HostSlot *slot;
     struct AcRequestData *next_waiting;
     struct AcRequestData *next_unsent;
+    struct AcRequestData *live_prev;
+    struct AcRequestData *live_next;
     double queued_at;
     double queue_time;
 } AcRequestData;
@@ -815,6 +819,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     free(rd->ca_file);
     rd->ca_file = NULL;
     free(rd->cookies_str);
+    rd->cookies_str = NULL;
     if (rd->slot != NULL && !slot_free(rd->limiter, rd->slot)) {
         rd->queued_at = monotonic_time();
         if (rd->limiter->waiting_tail != NULL) {
@@ -1066,13 +1071,9 @@ static void EventLoop_dealloc(EventLoop *self) {
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
-static PyObject *EventLoop_once(EventLoop *self, PyObject *args) {
-    aeProcessEvents(self->event_loop, AE_ALL_EVENTS | AE_DONT_WAIT);
-    Py_RETURN_NONE;
-}
-
 static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
     DEBUG_PRINT("Started");
+    self->running = true;
     self->thread_state = PyEval_SaveThread();
     do {
         DEBUG_PRINT("Start of aeProcessEvents");
@@ -1082,8 +1083,53 @@ static PyObject *EventLoop_main(EventLoop *self, PyObject *args) {
     curl_multi_cleanup(self->multi);
     self->multi = NULL;
     PyEval_RestoreThread(self->thread_state);
+    self->running = false;
     DEBUG_PRINT("Ended");
     Py_RETURN_NONE;
+}
+
+static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
+    if (self->running) {
+        PyErr_SetString(PyExc_RuntimeError, "the event loop is still running");
+        return NULL;
+    }
+    PyObject *futures = PyList_New(0);
+    if (futures == NULL) {
+        return NULL;
+    }
+    while (self->live_head != NULL) {
+        AcRequestData *rd = self->live_head;
+        self->live_head = rd->live_next;
+        PyList_Append(futures, rd->future);
+        Py_DECREF(rd->future);
+        if (rd->slot != NULL) {
+            rd->limiter->waiting_head = rd->limiter->waiting_tail = NULL;
+        }
+        if (rd->curl != NULL) {
+            curl_easy_cleanup(rd->curl);
+        }
+        if (rd->share != NULL) {
+            share_decref(rd->share);
+        }
+        if (rd->headers != NULL) {
+            curl_slist_free_all(rd->headers);
+        }
+        free(rd->method);
+        free(rd->url);
+        free(rd->auth);
+        free(rd->cert_file);
+        free(rd->key_file);
+        free(rd->ca_file);
+        free(rd->cookies_str);
+        Py_XDECREF(rd->cookies);
+        free(rd->req_data_buf);
+        free(rd->header.data);
+        free(rd->body.data);
+        Py_DECREF(rd->session);
+        free(rd);
+    }
+    self->unsent_head = self->unsent_tail = NULL;
+    return futures;
 }
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
@@ -1107,6 +1153,14 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
     int status;
     while ((status = pipe_read(((EventLoop *)self)->req_out_read, &rd, sizeof(rd))) == 1) {
         REQUEST_TRACE_PRINT("Eventloop_get_completed", rd);
+        if (rd->live_prev != NULL) {
+            rd->live_prev->live_next = rd->live_next;
+        } else {
+            ((EventLoop *)self)->live_head = rd->live_next;
+        }
+        if (rd->live_next != NULL) {
+            rd->live_next->live_prev = rd->live_prev;
+        }
         DEBUG_PRINT("read AcRequestData; address=%p", rd);
         PyObject *tuple = PyTuple_New(3);
         if (rd->result == CURLE_OK) {
@@ -1153,7 +1207,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
 
 static PyMethodDef EventLoop_methods[] = {
     {"main", (PyCFunction)EventLoop_main, METH_NOARGS, "Run the event loop"},
-    {"once", (PyCFunction)EventLoop_once, METH_NOARGS, "Run the event loop once"},
+    {"abandon", (PyCFunction)EventLoop_abandon, METH_NOARGS, "Free requests in flight once stopped"},
     {"stop", EventLoop_stop, METH_NOARGS, "Stop the event loop"},
     {"get_out_fd", Eventloop_get_out_fd, METH_NOARGS, "Get the outbound file dscriptor"},
     {"get_completed", Eventloop_get_completed, METH_NOARGS, "Get the user_object, response and error"},
@@ -1234,6 +1288,12 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
                                      &idle_timeout, &max_connection_age, &max_host_connections, &max_connections)) {
         return NULL;
     }
+    if ((PyObject *)loop == Py_None) {
+        loop = NULL;
+    } else if (!PyObject_TypeCheck(loop, &EventLoopType)) {
+        PyErr_SetString(PyExc_TypeError, "loop must be an EventLoop or None");
+        return NULL;
+    }
     if (max_host_connections < 0 || max_connections < 0) {
         PyErr_SetString(PyExc_ValueError, "connection limits must not be negative");
         return NULL;
@@ -1250,7 +1310,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     }
     if (!share_connections && !fresh_connect && (max_host_connections || max_connections)) {
         PyErr_SetString(PyExc_ValueError, "session connection limits need connections='session' or 'none'; "
-                                          "set limits for the shared pool on the EventLoop");
+                                          "set limits for the shared pool on the Engine");
         return NULL;
     }
     bool share_tls = strcmp(tls, "session") == 0;
@@ -1279,7 +1339,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    Py_INCREF(loop);
+    Py_XINCREF(loop);
     self->loop = loop;
     self->fresh_connect = fresh_connect;
     self->own_pool = share_connections;
@@ -1373,6 +1433,10 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
 
     if (self->shared == NULL) {
         PyErr_SetString(PyExc_RuntimeError, "session is closed");
+        return NULL;
+    }
+    if (self->loop == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "session has no engine");
         return NULL;
     }
 
@@ -1497,6 +1561,11 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         share_decref(rd->share);
         goto error_cleanup;
     }
+    rd->live_next = self->loop->live_head;
+    if (rd->live_next != NULL) {
+        rd->live_next->live_prev = rd;
+    }
+    self->loop->live_head = rd;
     DEBUG_PRINT("scheduling request");
     Py_RETURN_NONE;
 
@@ -1525,6 +1594,22 @@ static PyObject *Session_close(Session *self, PyObject *args) {
     if (self->shared != NULL) {
         queue_cleanup(self->loop, NULL, self->shared);
         self->shared = NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *Session_attach(Session *self, PyObject *args) {
+    EventLoop *loop;
+    if (!PyArg_ParseTuple(args, "O!", &EventLoopType, &loop)) {
+        return NULL;
+    }
+    if (self->loop != NULL && self->loop != loop) {
+        PyErr_SetString(PyExc_RuntimeError, "session already has an engine");
+        return NULL;
+    }
+    if (self->loop == NULL) {
+        Py_INCREF(loop);
+        self->loop = loop;
     }
     Py_RETURN_NONE;
 }
@@ -1567,6 +1652,7 @@ static PyMethodDef Session_methods[] = {
     {"get_cookielist", (PyCFunction)Session_get_cookielist, METH_NOARGS, "Get the session's cookies"},
     {"apply_cookielist", (PyCFunction)Session_apply_cookielist, METH_VARARGS, "Apply CURLOPT_COOKIELIST lines"},
     {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
+    {"attach", (PyCFunction)Session_attach, METH_VARARGS, "Attach the session to an EventLoop"},
     {NULL, NULL, 0, NULL}};
 
 static PyTypeObject SessionType = {
