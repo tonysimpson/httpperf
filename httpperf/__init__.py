@@ -11,7 +11,7 @@ import warnings
 import weakref
 from urllib.parse import urlencode, urlparse
 
-from acurl import _acurl
+from httpperf import _httpperf
 
 _json_dumps = _json.JSONEncoder(separators=(",", ":"), check_circular=False).encode
 
@@ -520,7 +520,7 @@ class Session:
         self._json_dumps = json_dumps or (engine._json_dumps if engine is not None else _json_dumps)
         self._json_loads = json_loads or (engine._json_loads if engine is not None else _json_loads)
         self._options = {"cert": cert, "verify": verify, "timeout": timeout, "connect_timeout": connect_timeout}
-        self._session = _acurl.Session(
+        self._session = _httpperf.Session(
             engine._ae_loop if engine is not None else None,
             connections,
             tls,
@@ -751,9 +751,9 @@ class Engine:
         self._json_dumps = json_dumps
         self._json_loads = json_loads
         self._loop = _no_loop
-        self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
+        self._ae_loop = _httpperf.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
         self._closed = False
-        self._thread = threading.Thread(target=self._ae_loop.main, name="acurl-engine", daemon=True)
+        self._thread = threading.Thread(target=self._ae_loop.main, name="httpperf-engine", daemon=True)
         self._thread.start()
 
     def _bind(self, loop):

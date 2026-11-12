@@ -1,6 +1,6 @@
 # Connections
 
-How a virtual user holds connections changes what the server sees: how many TCP connections and TLS handshakes it handles, how load spreads across a load balancer, and where `TIME_WAIT` lands. In acurl that is an explicit choice made per session, not a side effect of the implementation.
+How a virtual user holds connections changes what the server sees: how many TCP connections and TLS handshakes it handles, how load spreads across a load balancer, and where `TIME_WAIT` lands. In httpperf that is an explicit choice made per session, not a side effect of the implementation.
 
 ## The settings
 
@@ -27,7 +27,7 @@ curl matches cached tickets on the client certificate as well as the host, so se
 
 ### Protocol: `http_version`
 
-`"HTTP/2"` (default) asks for HTTP/2 over TLS and, for `https://` URLs, sets `CURLOPT_PIPEWAIT`, so requests started together wait to share one multiplexed connection rather than each opening their own. Plain `http://` stays on HTTP/1.1, without `PIPEWAIT`, since there is nothing to wait for. `"HTTP/1.1"` never uses HTTP/2. `"HTTP/3"` uses QUIC and nothing else, also with `CURLOPT_PIPEWAIT`. curl can instead race QUIC against TCP and fall back, but that opens two connections for one, so acurl does not offer it. `Response.http_version` reports what was negotiated.
+`"HTTP/2"` (default) asks for HTTP/2 over TLS and, for `https://` URLs, sets `CURLOPT_PIPEWAIT`, so requests started together wait to share one multiplexed connection rather than each opening their own. Plain `http://` stays on HTTP/1.1, without `PIPEWAIT`, since there is nothing to wait for. `"HTTP/1.1"` never uses HTTP/2. `"HTTP/3"` uses QUIC and nothing else, also with `CURLOPT_PIPEWAIT`. curl can instead race QUIC against TCP and fall back, but that opens two connections for one, so httpperf does not offer it. `Response.http_version` reports what was negotiated.
 
 ### Limits
 
@@ -35,11 +35,11 @@ Where a limit is set depends on where the connections live.
 
 | Setting | Set on | Applies to | Done by |
 |---|---|---|---|
-| `max_host_connections`, `max_total_connections` | `Engine` | `"shared"` and `"none"` sessions together, unless the session has its own limits | acurl, in a queue on the curl thread |
-| `max_host_connections`, `max_connections` | session | that session only (`"session"` or `"none"`) | acurl, in a queue on the curl thread |
+| `max_host_connections`, `max_total_connections` | `Engine` | `"shared"` and `"none"` sessions together, unless the session has its own limits | httpperf, in a queue on the curl thread |
+| `max_host_connections`, `max_connections` | session | that session only (`"session"` or `"none"`) | httpperf, in a queue on the curl thread |
 | `max_idle_connections` | `Engine` | each pool separately | curl, which closes the oldest idle connection when a pool is over the limit |
 
-acurl does the queueing, not curl, because curl starts its timers before a request waits in its queue, so the wait would be counted as response time. All the limits count connections in use, which for HTTP/1.1 means requests in flight. Once a host has answered over HTTP/2 or HTTP/3, its requests share one connection and are not held back by `max_host_connections`. Until the first response shows that, a burst to a new host is capped like HTTP/1.1. Time spent in the queue is reported as `Response.queue_time` and kept out of `client_lag`.
+httpperf does the queueing, not curl, because curl starts its timers before a request waits in its queue, so the wait would be counted as response time. All the limits count connections in use, which for HTTP/1.1 means requests in flight. Once a host has answered over HTTP/2 or HTTP/3, its requests share one connection and are not held back by `max_host_connections`. Until the first response shows that, a burst to a new host is capped like HTTP/1.1. Time spent in the queue is reported as `Response.queue_time` and kept out of `client_lag`.
 
 Idle connections do not count towards `max_connections`, so a session can hold more open connections than the cap if it talks to several hosts. `max_idle_connections` bounds those.
 
@@ -63,14 +63,14 @@ These are starting points, not exact models of any product. Check the behaviour 
 One HTTP client object shared by a service, capped at 100 connections:
 
 ```python
-engine = acurl.Engine(max_total_connections=100)
-session = acurl.Session(engine=engine)
+engine = httpperf.Engine(max_total_connections=100)
+session = httpperf.Session(engine=engine)
 ```
 
 A browser, new visitor, one session per journey:
 
 ```python
-async with acurl.Session(connections="session", tls="session", max_host_connections=6) as session:
+async with httpperf.Session(connections="session", tls="session", max_host_connections=6) as session:
     ...
 ```
 
@@ -81,7 +81,7 @@ A returning visitor: the same, with `tls="shared"`, so handshakes resume.
 A client that never reuses connections:
 
 ```python
-session = acurl.Session(connections="none")
+session = httpperf.Session(connections="none")
 ```
 
 ## Checking the model

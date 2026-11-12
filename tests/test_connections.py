@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-import acurl
+import httpperf
 
 
 class CountingHandler(http.server.BaseHTTPRequestHandler):
@@ -53,8 +53,8 @@ def wait_for_connections(n):
 
 def test_close_closes_connections(url):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
-    s = acurl.Session(engine=el, connections="session")
+    el = httpperf.Engine()
+    s = httpperf.Session(engine=el, connections="session")
     r = loop.run_until_complete(s.get(url))
     assert r.cookies == {"name": "value"}
     assert wait_for_connections(1) == 1
@@ -70,8 +70,8 @@ def test_close_closes_connections(url):
 @pytest.mark.parametrize("connections, new", [("session", [True, False]), ("none", [True, True])])
 def test_connection_reuse(url, connections, new):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
-    s = acurl.Session(engine=el, connections=connections)
+    el = httpperf.Engine()
+    s = httpperf.Session(engine=el, connections=connections)
     assert [loop.run_until_complete(s.get(url)).connect_time > 0 for _ in new] == new
     s.close()
     el.close()
@@ -82,8 +82,8 @@ def test_connection_reuse(url, connections, new):
 @pytest.mark.parametrize("limits, connects", [({"max_host_connections": 2}, 2), ({"max_total_connections": 3}, 3)])
 def test_event_loop_connection_limits(url, limits, connects, connections):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine(**limits)
-    s = acurl.Session(engine=el, connections=connections, http_version="HTTP/1.1")
+    el = httpperf.Engine(**limits)
+    s = httpperf.Session(engine=el, connections=connections, http_version="HTTP/1.1")
 
     async def main():
         return await asyncio.gather(*(s.get(url + "slow") for _ in range(6)))
@@ -98,8 +98,8 @@ def test_event_loop_connection_limits(url, limits, connects, connections):
 
 def test_max_idle_connections(url):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine(max_idle_connections=1)
-    s = acurl.Session(engine=el, http_version="HTTP/1.1")
+    el = httpperf.Engine(max_idle_connections=1)
+    s = httpperf.Session(engine=el, http_version="HTTP/1.1")
 
     async def batch():
         return await asyncio.gather(*(s.get(url + "slow") for _ in range(3)))
@@ -113,8 +113,8 @@ def test_max_idle_connections(url):
 @pytest.mark.parametrize("options, wait", [({"idle_timeout": 0}, 1.1), ({"max_connection_age": 1}, 2.1)])
 def test_connection_expiry(url, options, wait):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
-    s = acurl.Session(engine=el, connections="session", **options)
+    el = httpperf.Engine()
+    s = httpperf.Session(engine=el, connections="session", **options)
     first = loop.run_until_complete(s.get(url))
     time.sleep(wait)
     second = loop.run_until_complete(s.get(url))
@@ -131,8 +131,8 @@ def test_connection_expiry(url, options, wait):
 )
 def test_session_connection_limits(url, limits, hosts, queued):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
-    s = acurl.Session(engine=el, connections="session", http_version="HTTP/1.1", **limits)
+    el = httpperf.Engine()
+    s = httpperf.Session(engine=el, connections="session", http_version="HTTP/1.1", **limits)
     urls = [url.replace("127.0.0.1", host) + "slow" for host in hosts for _ in range(6 // len(hosts))]
 
     async def main():
@@ -150,13 +150,13 @@ def test_context_managers(url):
     loop = asyncio.new_event_loop()
 
     async def main():
-        async with acurl.Engine() as el:
-            async with acurl.Session(engine=el, connections="session") as s:
+        async with httpperf.Engine() as el:
+            async with httpperf.Session(engine=el, connections="session") as s:
                 assert (await s.get(url)).status_code == 200
             with pytest.raises(RuntimeError):
                 await s.get(url)
             assert wait_for_connections(0) == 0
-            with acurl.Session(engine=el) as s2:
+            with httpperf.Session(engine=el) as s2:
                 assert (await s2.get(url)).status_code == 200
         return el
 
@@ -164,7 +164,7 @@ def test_context_managers(url):
     el._thread.join(2)
     assert not el._thread.is_alive()
     assert wait_for_connections(0) == 0
-    with acurl.Engine() as el:
+    with httpperf.Engine() as el:
         pass
     el._thread.join(2)
     assert not el._thread.is_alive()
@@ -173,7 +173,7 @@ def test_context_managers(url):
 
 def test_timeouts(url):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
+    el = httpperf.Engine()
     silent = socket.socket()
     silent.bind(("127.0.0.1", 0))
     silent.listen(8)
@@ -186,18 +186,18 @@ def test_timeouts(url):
         start = time.monotonic()
         try:
             return loop.run_until_complete(session.get(target, **kwargs)).status_code
-        except acurl.RequestError as e:
+        except httpperf.RequestError as e:
             return type(e), e.code, round(time.monotonic() - start, 1)
 
-    unlimited = acurl.Session(engine=el)
-    assert get(unlimited, "http://127.0.0.1:%d/" % silent.getsockname()[1], timeout=0.2) == (acurl.Timeout, 28, 0.2)
+    unlimited = httpperf.Session(engine=el)
+    assert get(unlimited, "http://127.0.0.1:%d/" % silent.getsockname()[1], timeout=0.2) == (httpperf.Timeout, 28, 0.2)
     assert get(unlimited, "http://127.0.0.1:%d/" % full.getsockname()[1], connect_timeout=0.2) == (
-        acurl.Timeout,
+        httpperf.Timeout,
         28,
         0.2,
     )
-    impatient = acurl.Session(engine=el, timeout=0.01)
-    assert get(impatient, url + "slow")[0] is acurl.Timeout
+    impatient = httpperf.Session(engine=el, timeout=0.01)
+    assert get(impatient, url + "slow")[0] is httpperf.Timeout
     assert get(impatient, url + "slow", timeout=0) == 200
     assert get(impatient, url + "slow", timeout=1) == 200
     for bad in (-1, float("nan")):
@@ -213,14 +213,14 @@ def test_timeouts(url):
 
 def test_error_messages_are_specific():
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
+    el = httpperf.Engine()
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
-    with pytest.raises(acurl.RequestError) as e:
-        loop.run_until_complete(acurl.Session(engine=el).get("http://127.0.0.1:%d/" % port))
-    assert type(e.value) is acurl.RequestError
+    with pytest.raises(httpperf.RequestError) as e:
+        loop.run_until_complete(httpperf.Session(engine=el).get("http://127.0.0.1:%d/" % port))
+    assert type(e.value) is httpperf.RequestError
     assert e.value.code == 7
     assert "port %d" % port in str(e.value)
     el.close()
@@ -229,8 +229,8 @@ def test_error_messages_are_specific():
 
 def test_server_time(url):
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
-    r = loop.run_until_complete(acurl.Session(engine=el).get(url + "slow"))
+    el = httpperf.Engine()
+    r = loop.run_until_complete(httpperf.Session(engine=el).get(url + "slow"))
     if r.posttransfer_time is None:
         pytest.skip("libcurl older than 8.10")
     assert r.pretransfer_time <= r.posttransfer_time < r.starttransfer_time <= r.total_time
@@ -248,26 +248,26 @@ def test_proxy_environment_is_read_per_session(url, monkeypatch):
     proxy_port = sock.getsockname()[1]
     sock.close()
     loop = asyncio.new_event_loop()
-    el = acurl.Engine()
+    el = httpperf.Engine()
 
     def get(session):
         try:
             return loop.run_until_complete(session.get(url)).status_code
-        except acurl.RequestError as e:
+        except httpperf.RequestError as e:
             return str(e)
 
-    direct = acurl.Session(engine=el)
+    direct = httpperf.Session(engine=el)
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:%d" % proxy_port)
-    proxied = acurl.Session(engine=el)
+    proxied = httpperf.Session(engine=el)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    bypassed = acurl.Session(engine=el)
+    bypassed = httpperf.Session(engine=el)
     monkeypatch.delenv("http_proxy")
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:%d" % proxy_port)
     monkeypatch.delenv("NO_PROXY")
-    fallback = acurl.Session(engine=el)
+    fallback = httpperf.Session(engine=el)
     monkeypatch.delenv("ALL_PROXY")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:%d" % proxy_port)
-    uppercase = acurl.Session(engine=el)
+    uppercase = httpperf.Session(engine=el)
 
     assert get(direct) == 200
     assert "port %d" % proxy_port in get(proxied)

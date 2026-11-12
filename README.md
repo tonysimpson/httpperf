@@ -1,10 +1,12 @@
-# acurl
+# httpperf
 
 An asyncio HTTP client for load testing, built on libcurl.
 
+httpperf was called acurl until version 1.0.
+
 ## Design
 
-A load-testing client has three jobs: drive as much load as possible from each machine, report the server's response times rather than time spent waiting on the client, and read responses promptly so the server never sees a slow reader. acurl is built around these.
+A load-testing client has three jobs: drive as much load as possible from each machine, report the server's response times rather than time spent waiting on the client, and read responses promptly so the server never sees a slow reader. httpperf is built around these.
 
 All network I/O runs in a small C event loop (the vendored `ae` reactor from Redis) on its own thread, which never takes the GIL. Python hands requests to that thread and collects finished responses through pipes:
 
@@ -20,7 +22,7 @@ Bytes are read off the wire as they arrive, whatever Python is doing. If Python 
 
 ## Install
 
-acurl needs the libcurl development headers and a C compiler. It supports Python 3.8 to 3.14.
+httpperf needs the libcurl development headers and a C compiler. It supports Python 3.8 to 3.14.
 
 ```sh
 sudo apt install libcurl4-openssl-dev   # Debian/Ubuntu
@@ -32,11 +34,11 @@ pip install .
 ```python
 import asyncio
 
-import acurl
+import httpperf
 
 
 async def main():
-    async with acurl.Session() as session:
+    async with httpperf.Session() as session:
         r = await session.get("https://example.com/")
         print(r.status_code, r.http_version, r.total_time, r.client_lag)
 
@@ -79,7 +81,7 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 
 | Argument | Meaning |
 |---|---|
-| `max_host_connections` | Cap on connections per host for the engine's sessions that use the shared pool or no pool. 0 means no limit. acurl queues requests above it and reports the wait as `queue_time`. |
+| `max_host_connections` | Cap on connections per host for the engine's sessions that use the shared pool or no pool. 0 means no limit. httpperf queues requests above it and reports the wait as `queue_time`. |
 | `max_total_connections` | Cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 | `json_dumps`, `json_loads` | The JSON functions for the engine's sessions, unless a session sets its own. The defaults use the standard library: compact output, and bodies decoded as UTF-8. See [JSON](#json). |
@@ -118,7 +120,7 @@ An engine binds to the asyncio loop running when it is first used, and so does a
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
 
-Failed transfers raise `acurl.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `acurl.Timeout`, a subclass, so they can be counted separately.
+Failed transfers raise `httpperf.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `httpperf.Timeout`, a subclass, so they can be counted separately.
 
 ### Response
 
@@ -127,7 +129,7 @@ Failed transfers raise `acurl.RequestError` with curl's detailed error message, 
 | `status_code` | HTTP status. |
 | `ok` | `True` if the status is below 400. |
 | `reason` | Reason phrase from the status line, or the standard phrase for HTTP/2 and HTTP/3, which send none. |
-| `raise_for_status()` | Raises `acurl.HTTPError` (a `RequestError`, with the `response`) for 4xx and 5xx statuses. |
+| `raise_for_status()` | Raises `httpperf.HTTPError` (a `RequestError`, with the `response`) for 4xx and 5xx statuses. |
 | `elapsed` | `total_time` as a `timedelta`. |
 | `url` | Effective URL. |
 | `redirect_url` | Location of a redirect, or `None`. |
@@ -145,22 +147,22 @@ Failed transfers raise `acurl.RequestError` with curl's detailed error message, 
 
 ### JSON
 
-By default acurl uses the standard library's `json`: compact output for `json=`, and response bodies decoded as UTF-8 for `json()`. It needs no extra dependency and has the most scrutinised parser, which matters because load tests often fetch responses from third parties.
+By default httpperf uses the standard library's `json`: compact output for `json=`, and response bodies decoded as UTF-8 for `json()`. It needs no extra dependency and has the most scrutinised parser, which matters because load tests often fetch responses from third parties.
 
 If JSON costs too much CPU, pass faster functions as `json_dumps` and `json_loads`, on the `Engine` for all its sessions or on one `Session`. [orjson](https://github.com/ijl/orjson) is a good choice for encoding, and [pysimdjson](https://github.com/TkTech/pysimdjson) for decoding. Create the parser once, at module scope, since it keeps its buffers between documents:
 
 ```python
-import acurl
+import httpperf
 import orjson
 import simdjson
 
 parser = simdjson.Parser()
-engine = acurl.Engine(json_dumps=orjson.dumps, json_loads=parser.parse)
+engine = httpperf.Engine(json_dumps=orjson.dumps, json_loads=parser.parse)
 
 
 async def journey():
-    async with acurl.Session(engine=engine) as session:
-        r = await session.post("https://example.com/search", json={"q": "acurl"})
+    async with httpperf.Session(engine=engine) as session:
+        r = await session.post("https://example.com/search", json={"q": "httpperf"})
         return r.json()["items"][3]["name"]
 ```
 
@@ -185,7 +187,7 @@ All in seconds.
 | `posttransfer_time` | Request fully sent. `starttransfer_time − posttransfer_time` is the server's time to first byte, without connection setup or upload. `None` with libcurl older than 8.10. |
 | `starttransfer_time` | First byte received. |
 | `total_time` | Transfer complete. |
-| `queue_time` | Time waiting in acurl's queue for a connection, under the engine or session limits. 0 if the request did not wait. curl's timings start after it. |
+| `queue_time` | Time waiting in httpperf's queue for a connection, under the engine or session limits. 0 if the request did not wait. curl's timings start after it. |
 | `client_lag` | `end_time − start_time − total_time − queue_time`: time the request spent waiting on Python, before it was sent and after it finished. Measured with the monotonic clock, so clock changes don't affect it. |
 
 curl measures its timings on the curl thread, so a busy Python process does not inflate them. `client_lag` is how you see that Python is the bottleneck: if it grows, the client cannot keep up, and achieved request rates describe the client rather than the server. Report it alongside response times (p50, p99, max).
@@ -207,13 +209,13 @@ make clean              # remove build output, caches and profiler output (keeps
 make distclean          # also remove .venv
 ```
 
-Each target first creates `.venv` with uv, if needed, and installs acurl in editable mode with the dev tools. It reinstalls when `setup.py`, `pyproject.toml` or the C sources change, so C edits are rebuilt automatically. `make venv` does only that step.
+Each target first creates `.venv` with uv, if needed, and installs httpperf in editable mode with the dev tools. It reinstalls when `setup.py`, `pyproject.toml` or the C sources change, so C edits are rebuilt automatically. `make venv` does only that step.
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 
 The tests run local servers: pytest-httpbin, small threaded `http.server` servers for connection counting and TLS, and hypercorn for HTTP/2 and HTTP/3 (skipped on Python 3.8, where hypercorn's HTTP/3 server hangs on shutdown). Client certificates are generated with `openssl`. The httpbin server is single-threaded, so keep concurrency in tests low.
 
-Set `ACURL_PROFILE=1` when building to instrument the extension. See [docs/profiling.md](docs/profiling.md).
+Set `HTTPPERF_PROFILE=1` when building to instrument the extension. See [docs/profiling.md](docs/profiling.md).
 
 ## Licence
 

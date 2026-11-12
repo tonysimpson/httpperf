@@ -6,7 +6,7 @@ import pytest
 
 PROBE = """
 import asyncio, gc, json, sys
-import acurl
+import httpperf
 
 def rss():
     with open("/proc/self/status") as f:
@@ -15,13 +15,13 @@ def rss():
                 return int(line.split()[1]) * 1024
 
 async def main(url, n, connections):
-    el = acurl.Engine()
+    el = httpperf.Engine()
     for _ in range(n // 4):
-        await acurl.Session(engine=el, connections=connections).get(url)
+        await httpperf.Session(engine=el, connections=connections).get(url)
     gc.collect()
     before = rss()
     for _ in range(n):
-        await acurl.Session(engine=el, connections=connections).get(url)
+        await httpperf.Session(engine=el, connections=connections).get(url)
     gc.collect()
     print(json.dumps((rss() - before) / n))
 

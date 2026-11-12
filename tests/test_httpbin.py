@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 import pytest
 
-import acurl
+import httpperf
 
 
 @pytest.fixture(autouse=True)
@@ -20,8 +20,8 @@ def event_loop():
 
 
 def session():
-    el = acurl.Engine()
-    return acurl.Session(engine=el)
+    el = httpperf.Engine()
+    return httpperf.Session(engine=el)
 
 
 def _await(awaitable):
@@ -64,9 +64,9 @@ def test_set_cookies(httpbin):
 
 def test_add_and_erase_session_cookies(httpbin):
     s = session()
-    lasting = acurl.session_cookie_for_url(httpbin.url, "lasting", "1")
-    lasting = acurl.Cookie(False, lasting.domain, True, "/", False, int(time.time()) + 3600, "lasting", "1")
-    s.add_cookie_list([acurl.session_cookie_for_url(httpbin.url, "brief", "1"), lasting])
+    lasting = httpperf.session_cookie_for_url(httpbin.url, "lasting", "1")
+    lasting = httpperf.Cookie(False, lasting.domain, True, "/", False, int(time.time()) + 3600, "lasting", "1")
+    s.add_cookie_list([httpperf.session_cookie_for_url(httpbin.url, "brief", "1"), lasting])
     assert _await(s.get(httpbin.url + "/cookies")).json()["cookies"] == {"brief": "1", "lasting": "1"}
     s.erase_session_cookies()
     assert s.cookies() == {"lasting": "1"}
@@ -148,8 +148,8 @@ def test_custom_json_functions(httpbin):
         calls.append("session loads")
         return json.loads(body)
 
-    engine = acurl.Engine(json_dumps=dumps, json_loads=lambda body: calls.append("engine loads"))
-    s = acurl.Session(engine=engine, json_loads=loads)
+    engine = httpperf.Engine(json_dumps=dumps, json_loads=lambda body: calls.append("engine loads"))
+    s = httpperf.Session(engine=engine, json_loads=loads)
     r = _await(s.post(httpbin.url + "/post", json={"a": 1}))
     assert r.json()["json"] == {"a": 1}
     assert calls == ["engine dumps", "session loads"]
@@ -167,46 +167,46 @@ def test_post_binary(httpbin):
 
 @pytest.mark.parametrize("connections", ["shared", "session", "none"])
 def test_connections(httpbin, connections):
-    s = acurl.Session(connections=connections)
+    s = httpperf.Session(connections=connections)
     for _ in range(2):
         assert _await(s.get(httpbin.url + "/get")).status_code == 200
 
 
 def test_connections_invalid():
     with pytest.raises(ValueError):
-        acurl.Session(connections="pooled")
+        httpperf.Session(connections="pooled")
 
 
 def test_tls_invalid():
     with pytest.raises(ValueError):
-        acurl.Session(tls="pooled")
+        httpperf.Session(tls="pooled")
 
 
 def test_connection_limits_invalid():
     with pytest.raises(ValueError):
-        acurl.Engine(max_host_connections=-1)
+        httpperf.Engine(max_host_connections=-1)
 
 
 @pytest.mark.parametrize("options", [{"idle_timeout": -1}, {"max_connection_age": -1}])
 def test_expiry_invalid(options):
     with pytest.raises(ValueError):
-        acurl.Session(**options)
+        httpperf.Session(**options)
 
 
 def test_max_idle_connections_invalid():
     with pytest.raises(ValueError):
-        acurl.Engine(max_idle_connections=0)
+        httpperf.Engine(max_idle_connections=0)
 
 
 @pytest.mark.parametrize("options", [{"max_host_connections": 2}, {"connections": "session", "max_connections": -1}])
 def test_session_connection_limits_invalid(options):
     with pytest.raises(ValueError):
-        acurl.Session(**options)
+        httpperf.Session(**options)
 
 
 def test_http_version_invalid():
     with pytest.raises(ValueError):
-        acurl.Session(http_version="HTTP/0.9")
+        httpperf.Session(http_version="HTTP/0.9")
 
 
 def test_client_lag(httpbin):
@@ -266,21 +266,21 @@ def test_status_helpers(httpbin):
     r.raise_for_status()
     r = _await(s.get(httpbin.url + "/status/404"))
     assert (r.ok, r.reason) == (False, "NOT FOUND")
-    with pytest.raises(acurl.HTTPError) as e:
+    with pytest.raises(httpperf.HTTPError) as e:
         r.raise_for_status()
     assert e.value.response is r
     assert str(e.value).startswith("404 Client Error: NOT FOUND for url: ")
 
 
 def test_reused_handles_do_not_leak_between_sessions(httpbin):
-    el = acurl.Engine()
-    first = acurl.Session(engine=el)
+    el = httpperf.Engine()
+    first = httpperf.Session(engine=el)
     for _ in range(3):
         _await(first.get(httpbin.url + "/cookies/set?secret=1"))
         _await(first.get(httpbin.url + "/headers", auth=("user", "pass"), headers={"X-Private": "1"}))
     gc.collect()
     _await(asyncio.sleep(0.05))
-    second = acurl.Session(engine=el)
+    second = httpperf.Session(engine=el)
     for _ in range(3):
         assert _await(second.get(httpbin.url + "/cookies")).json()["cookies"] == {}
         headers = _await(second.get(httpbin.url + "/headers")).json()["headers"]

@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "acurl"
+name = "httpperf"
 dynamic = ["version"]
 description = "An asyncio HTTP client for load testing, built on libcurl."
 readme = "README.md"
@@ -26,13 +26,13 @@ classifiers = [
 ]
 
 [project.urls]
-Source = "https://github.com/tonysimpson/acurl"
+Source = "https://github.com/tonysimpson/httpperf"
 
 [tool.setuptools]
-packages = ["acurl"]
+packages = ["httpperf"]
 
 [tool.setuptools.dynamic]
-version = { attr = "acurl.version.__version__" }
+version = { attr = "httpperf.version.__version__" }
 
 [dependency-groups]
 dev = [

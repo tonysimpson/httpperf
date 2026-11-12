@@ -1,10 +1,10 @@
 import time
 
-import acurl
+import httpperf
 
 
 def cookie(expiration):
-    return acurl.Cookie(False, "example.com", False, "/", False, expiration, "name", "value")
+    return httpperf.Cookie(False, "example.com", False, "/", False, expiration, "name", "value")
 
 
 def test_has_expired():

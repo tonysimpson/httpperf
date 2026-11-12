@@ -1,6 +1,6 @@
 import pytest
 
-import acurl
+import httpperf
 
 
 class FakeResponse:
@@ -16,7 +16,7 @@ class FakeResponse:
 
 
 def response(content_type, body=b""):
-    return acurl.Response(None, FakeResponse(content_type, body), 0, 0)
+    return httpperf.Response(None, FakeResponse(content_type, body), 0, 0)
 
 
 @pytest.mark.parametrize(
@@ -50,7 +50,7 @@ class RawResponse:
 
 
 def test_headers():
-    r = acurl.Response(
+    r = httpperf.Response(
         None,
         RawResponse(
             b"HTTP/1.1 100 Continue\r\n\r\n"

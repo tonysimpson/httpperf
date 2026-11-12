@@ -152,7 +152,7 @@ static void share_decref(Share *share) {
     }
     CURLSHcode rc = curl_share_cleanup(share->share);
     if (rc != CURLSHE_OK) {
-        fprintf(stderr, "acurl: curl_share_cleanup failed: %s\n", curl_share_strerror(rc));
+        fprintf(stderr, "httpperf: curl_share_cleanup failed: %s\n", curl_share_strerror(rc));
         return;
     }
     while (share->hosts != NULL) {
@@ -457,43 +457,43 @@ static PyMethodDef Response_methods[] = {
 static PyMemberDef Response_members[] = {{NULL}};
 
 static PyTypeObject ResponseType = {
-    PyVarObject_HEAD_INIT(NULL, 0) "acurl._acurl.Response", /* tp_name */
-    sizeof(Response),                                       /* tp_basicsize */
-    0,                                                      /* tp_itemsize */
-    (destructor)Response_dealloc,                           /* tp_dealloc */
-    0,                                                      /* tp_print */
-    0,                                                      /* tp_getattr */
-    0,                                                      /* tp_setattr */
-    0,                                                      /* tp_reserved */
-    0,                                                      /* tp_repr */
-    0,                                                      /* tp_as_number */
-    0,                                                      /* tp_as_sequence */
-    0,                                                      /* tp_as_mapping */
-    0,                                                      /* tp_hash  */
-    0,                                                      /* tp_call */
-    0,                                                      /* tp_str */
-    0,                                                      /* tp_getattro */
-    0,                                                      /* tp_setattro */
-    0,                                                      /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT,                                     /* tp_flags */
-    "Response Type",                                        /* tp_doc */
-    0,                                                      /* tp_traverse */
-    0,                                                      /* tp_clear */
-    0,                                                      /* tp_richcompare */
-    0,                                                      /* tp_weaklistoffset */
-    0,                                                      /* tp_iter */
-    0,                                                      /* tp_iternext */
-    Response_methods,                                       /* tp_methods */
-    Response_members,                                       /* tp_members */
-    0,                                                      /* tp_getset */
-    0,                                                      /* tp_base */
-    0,                                                      /* tp_dict */
-    0,                                                      /* tp_descr_get */
-    0,                                                      /* tp_descr_set */
-    0,                                                      /* tp_dictoffset */
-    0,                                                      /* tp_init */
-    0,                                                      /* tp_alloc */
-    0,                                                      /* tp_new */
+    PyVarObject_HEAD_INIT(NULL, 0) "httpperf._httpperf.Response", /* tp_name */
+    sizeof(Response),                                             /* tp_basicsize */
+    0,                                                            /* tp_itemsize */
+    (destructor)Response_dealloc,                                 /* tp_dealloc */
+    0,                                                            /* tp_print */
+    0,                                                            /* tp_getattr */
+    0,                                                            /* tp_setattr */
+    0,                                                            /* tp_reserved */
+    0,                                                            /* tp_repr */
+    0,                                                            /* tp_as_number */
+    0,                                                            /* tp_as_sequence */
+    0,                                                            /* tp_as_mapping */
+    0,                                                            /* tp_hash  */
+    0,                                                            /* tp_call */
+    0,                                                            /* tp_str */
+    0,                                                            /* tp_getattro */
+    0,                                                            /* tp_setattro */
+    0,                                                            /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                                           /* tp_flags */
+    "Response Type",                                              /* tp_doc */
+    0,                                                            /* tp_traverse */
+    0,                                                            /* tp_clear */
+    0,                                                            /* tp_richcompare */
+    0,                                                            /* tp_weaklistoffset */
+    0,                                                            /* tp_iter */
+    0,                                                            /* tp_iternext */
+    Response_methods,                                             /* tp_methods */
+    Response_members,                                             /* tp_members */
+    0,                                                            /* tp_getset */
+    0,                                                            /* tp_base */
+    0,                                                            /* tp_dict */
+    0,                                                            /* tp_descr_get */
+    0,                                                            /* tp_descr_set */
+    0,                                                            /* tp_dictoffset */
+    0,                                                            /* tp_init */
+    0,                                                            /* tp_alloc */
+    0,                                                            /* tp_new */
 };
 
 /* When at least one request has completed, write completed responses onto completion queue*/
@@ -501,7 +501,7 @@ static PyTypeObject ResponseType = {
 static void check_multi(EventLoop *loop, CURLMcode rc) {
     if (rc == CURLM_ABORTED_BY_CALLBACK) {
         int running_handles;
-        fprintf(stderr, "acurl: event loop error, aborting all requests\n");
+        fprintf(stderr, "httpperf: event loop error, aborting all requests\n");
         curl_multi_perform(loop->multi, &running_handles);
     }
 }
@@ -635,11 +635,11 @@ static void complete_request(EventLoop *loop, AcRequestData *rd) {
             return;
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("acurl: failed to return completed request");
+            perror("httpperf: failed to return completed request");
             return;
         }
         if (aeCreateFileEvent(loop->event_loop, loop->req_out_write, AE_WRITABLE, send_completed, loop) == AE_ERR) {
-            fprintf(stderr, "acurl: failed to watch the completed request pipe\n");
+            fprintf(stderr, "httpperf: failed to watch the completed request pipe\n");
         }
         loop->unsent_head = rd;
     } else {
@@ -656,7 +656,7 @@ static void send_completed(struct aeEventLoop *eventLoop, int fd, void *clientDa
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             }
-            perror("acurl: failed to return completed request");
+            perror("httpperf: failed to return completed request");
         }
         loop->unsent_head = rd->next_unsent;
         rd->next_unsent = NULL;
@@ -1216,43 +1216,43 @@ static PyMethodDef EventLoop_methods[] = {
 static PyMemberDef EventLoop_members[] = {{NULL}};
 
 static PyTypeObject EventLoopType = {
-    PyVarObject_HEAD_INIT(NULL, 0) "acurl._acurl.EventLoop", /* tp_name */
-    sizeof(EventLoop),                                       /* tp_basicsize */
-    0,                                                       /* tp_itemsize */
-    (destructor)EventLoop_dealloc,                           /* tp_dealloc */
-    0,                                                       /* tp_print */
-    0,                                                       /* tp_getattr */
-    0,                                                       /* tp_setattr */
-    0,                                                       /* tp_reserved */
-    0,                                                       /* tp_repr */
-    0,                                                       /* tp_as_number */
-    0,                                                       /* tp_as_sequence */
-    0,                                                       /* tp_as_mapping */
-    0,                                                       /* tp_hash  */
-    0,                                                       /* tp_call */
-    0,                                                       /* tp_str */
-    0,                                                       /* tp_getattro */
-    0,                                                       /* tp_setattro */
-    0,                                                       /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT,                                      /* tp_flags */
-    "Event Loop Type",                                       /* tp_doc */
-    0,                                                       /* tp_traverse */
-    0,                                                       /* tp_clear */
-    0,                                                       /* tp_richcompare */
-    0,                                                       /* tp_weaklistoffset */
-    0,                                                       /* tp_iter */
-    0,                                                       /* tp_iternext */
-    EventLoop_methods,                                       /* tp_methods */
-    EventLoop_members,                                       /* tp_members */
-    0,                                                       /* tp_getset */
-    0,                                                       /* tp_base */
-    0,                                                       /* tp_dict */
-    0,                                                       /* tp_descr_get */
-    0,                                                       /* tp_descr_set */
-    0,                                                       /* tp_dictoffset */
-    0,                                                       /* tp_init */
-    0,                                                       /* tp_alloc */
-    EventLoop_new,                                           /* tp_new */
+    PyVarObject_HEAD_INIT(NULL, 0) "httpperf._httpperf.EventLoop", /* tp_name */
+    sizeof(EventLoop),                                             /* tp_basicsize */
+    0,                                                             /* tp_itemsize */
+    (destructor)EventLoop_dealloc,                                 /* tp_dealloc */
+    0,                                                             /* tp_print */
+    0,                                                             /* tp_getattr */
+    0,                                                             /* tp_setattr */
+    0,                                                             /* tp_reserved */
+    0,                                                             /* tp_repr */
+    0,                                                             /* tp_as_number */
+    0,                                                             /* tp_as_sequence */
+    0,                                                             /* tp_as_mapping */
+    0,                                                             /* tp_hash  */
+    0,                                                             /* tp_call */
+    0,                                                             /* tp_str */
+    0,                                                             /* tp_getattro */
+    0,                                                             /* tp_setattro */
+    0,                                                             /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                                            /* tp_flags */
+    "Event Loop Type",                                             /* tp_doc */
+    0,                                                             /* tp_traverse */
+    0,                                                             /* tp_clear */
+    0,                                                             /* tp_richcompare */
+    0,                                                             /* tp_weaklistoffset */
+    0,                                                             /* tp_iter */
+    0,                                                             /* tp_iternext */
+    EventLoop_methods,                                             /* tp_methods */
+    EventLoop_members,                                             /* tp_members */
+    0,                                                             /* tp_getset */
+    0,                                                             /* tp_base */
+    0,                                                             /* tp_dict */
+    0,                                                             /* tp_descr_get */
+    0,                                                             /* tp_descr_set */
+    0,                                                             /* tp_dictoffset */
+    0,                                                             /* tp_init */
+    0,                                                             /* tp_alloc */
+    EventLoop_new,                                                 /* tp_new */
 };
 
 static char *getenv_dup(const char *name, const char *fallback) {
@@ -1656,52 +1656,52 @@ static PyMethodDef Session_methods[] = {
     {NULL, NULL, 0, NULL}};
 
 static PyTypeObject SessionType = {
-    PyVarObject_HEAD_INIT(NULL, 0) "acurl._acurl.Session", /* tp_name */
-    sizeof(Session),                                       /* tp_basicsize */
-    0,                                                     /* tp_itemsize */
-    (destructor)Session_dealloc,                           /* tp_dealloc */
-    0,                                                     /* tp_print */
-    0,                                                     /* tp_getattr */
-    0,                                                     /* tp_setattr */
-    0,                                                     /* tp_reserved */
-    0,                                                     /* tp_repr */
-    0,                                                     /* tp_as_number */
-    0,                                                     /* tp_as_sequence */
-    0,                                                     /* tp_as_mapping */
-    0,                                                     /* tp_hash  */
-    0,                                                     /* tp_call */
-    0,                                                     /* tp_str */
-    0,                                                     /* tp_getattro */
-    0,                                                     /* tp_setattro */
-    0,                                                     /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT,                                    /* tp_flags */
-    "Session Type",                                        /* tp_doc */
-    0,                                                     /* tp_traverse */
-    0,                                                     /* tp_clear */
-    0,                                                     /* tp_richcompare */
-    0,                                                     /* tp_weaklistoffset */
-    0,                                                     /* tp_iter */
-    0,                                                     /* tp_iternext */
-    Session_methods,                                       /* tp_methods */
-    0,                                                     /* tp_members */
-    0,                                                     /* tp_getset */
-    0,                                                     /* tp_base */
-    0,                                                     /* tp_dict */
-    0,                                                     /* tp_descr_get */
-    0,                                                     /* tp_descr_set */
-    0,                                                     /* tp_dictoffset */
-    0,                                                     /* tp_init */
-    0,                                                     /* tp_alloc */
-    Session_new,                                           /* tp_new */
+    PyVarObject_HEAD_INIT(NULL, 0) "httpperf._httpperf.Session", /* tp_name */
+    sizeof(Session),                                             /* tp_basicsize */
+    0,                                                           /* tp_itemsize */
+    (destructor)Session_dealloc,                                 /* tp_dealloc */
+    0,                                                           /* tp_print */
+    0,                                                           /* tp_getattr */
+    0,                                                           /* tp_setattr */
+    0,                                                           /* tp_reserved */
+    0,                                                           /* tp_repr */
+    0,                                                           /* tp_as_number */
+    0,                                                           /* tp_as_sequence */
+    0,                                                           /* tp_as_mapping */
+    0,                                                           /* tp_hash  */
+    0,                                                           /* tp_call */
+    0,                                                           /* tp_str */
+    0,                                                           /* tp_getattro */
+    0,                                                           /* tp_setattro */
+    0,                                                           /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                                          /* tp_flags */
+    "Session Type",                                              /* tp_doc */
+    0,                                                           /* tp_traverse */
+    0,                                                           /* tp_clear */
+    0,                                                           /* tp_richcompare */
+    0,                                                           /* tp_weaklistoffset */
+    0,                                                           /* tp_iter */
+    0,                                                           /* tp_iternext */
+    Session_methods,                                             /* tp_methods */
+    0,                                                           /* tp_members */
+    0,                                                           /* tp_getset */
+    0,                                                           /* tp_base */
+    0,                                                           /* tp_dict */
+    0,                                                           /* tp_descr_get */
+    0,                                                           /* tp_descr_set */
+    0,                                                           /* tp_dictoffset */
+    0,                                                           /* tp_init */
+    0,                                                           /* tp_alloc */
+    Session_new,                                                 /* tp_new */
 };
 
-const static char MODULE_NAME[] = "_acurl";
+const static char MODULE_NAME[] = "_httpperf";
 
 static PyMethodDef module_methods[] = {{NULL, NULL, 0, NULL}};
 
-static struct PyModuleDef _acurl_module = {PyModuleDef_HEAD_INIT, MODULE_NAME, NULL, -1, module_methods};
+static struct PyModuleDef _httpperf_module = {PyModuleDef_HEAD_INIT, MODULE_NAME, NULL, -1, module_methods};
 
-PyMODINIT_FUNC PyInit__acurl(void) {
+PyMODINIT_FUNC PyInit__httpperf(void) {
     PyObject *m;
 
     if (PyType_Ready(&SessionType) < 0)
@@ -1713,7 +1713,7 @@ PyMODINIT_FUNC PyInit__acurl(void) {
     if (PyType_Ready(&ResponseType) < 0)
         return NULL;
 
-    m = PyModule_Create(&_acurl_module);
+    m = PyModule_Create(&_httpperf_module);
 
     if (m != NULL) {
         curl_global_init(CURL_GLOBAL_ALL); // init curl library

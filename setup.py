@@ -9,7 +9,7 @@ compile_args = [
     "-Wno-missing-field-initializers",
     "-Wno-cast-function-type",
 ]
-if os.environ.get("ACURL_PROFILE"):
+if os.environ.get("HTTPPERF_PROFILE"):
     compile_args += [
         "-g",
         "-fno-omit-frame-pointer",
@@ -20,8 +20,8 @@ if os.environ.get("ACURL_PROFILE"):
 setup(
     ext_modules=[
         Extension(
-            "acurl._acurl",
-            sources=["src/acurl.c", "src/ae/ae.c", "src/ae/zmalloc.c"],
+            "httpperf._httpperf",
+            sources=["src/httpperf.c", "src/ae/ae.c", "src/ae/zmalloc.c"],
             libraries=["curl"],
             extra_compile_args=compile_args,
         )
