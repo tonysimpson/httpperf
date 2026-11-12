@@ -993,24 +993,6 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     self->stop_read = self->stop_write = -1;
     self->curl_easy_cleanup_read = self->curl_easy_cleanup_write = -1;
 
-    self->multi = curl_multi_init();
-    if (self->multi == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "curl_multi_init failed");
-        goto error;
-    }
-    curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, max_idle_connections);
-    if (max_host_connections || max_total_connections) {
-        self->limiter = share_new(false, false, max_host_connections, max_total_connections);
-        if (self->limiter == NULL) {
-            PyErr_NoMemory();
-            goto error;
-        }
-    }
-    curl_multi_setopt(self->multi, CURLMOPT_SOCKETFUNCTION, socket_callback);
-    curl_multi_setopt(self->multi, CURLMOPT_SOCKETDATA, self);
-    curl_multi_setopt(self->multi, CURLMOPT_TIMERFUNCTION, timer_callback);
-    curl_multi_setopt(self->multi, CURLMOPT_TIMERDATA, self);
-
     self->event_loop = aeCreateEventLoop(200);
     if (self->event_loop == NULL) {
         PyErr_SetFromErrno(PyExc_OSError);
@@ -1030,6 +1012,28 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
         PyErr_SetFromErrno(PyExc_OSError);
         goto error;
     }
+    errno = 0;
+    self->multi = curl_multi_init();
+    if (self->multi == NULL) {
+        if (errno == EMFILE || errno == ENFILE) {
+            PyErr_SetFromErrno(PyExc_OSError);
+        } else {
+            PyErr_SetString(PyExc_RuntimeError, "curl_multi_init failed");
+        }
+        goto error;
+    }
+    curl_multi_setopt(self->multi, CURLMOPT_MAXCONNECTS, max_idle_connections);
+    if (max_host_connections || max_total_connections) {
+        self->limiter = share_new(false, false, max_host_connections, max_total_connections);
+        if (self->limiter == NULL) {
+            PyErr_NoMemory();
+            goto error;
+        }
+    }
+    curl_multi_setopt(self->multi, CURLMOPT_SOCKETFUNCTION, socket_callback);
+    curl_multi_setopt(self->multi, CURLMOPT_SOCKETDATA, self);
+    curl_multi_setopt(self->multi, CURLMOPT_TIMERFUNCTION, timer_callback);
+    curl_multi_setopt(self->multi, CURLMOPT_TIMERDATA, self);
     return (PyObject *)self;
 
 error:
