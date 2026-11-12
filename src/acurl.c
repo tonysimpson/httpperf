@@ -56,6 +56,8 @@ static inline double monotonic_time(void) {
 
 struct AcRequestData;
 
+#define HANDLE_POOL_SIZE 256
+
 typedef struct {
     PyObject_HEAD aeEventLoop *event_loop;
     PyThreadState *thread_state;
@@ -73,6 +75,8 @@ typedef struct {
     struct AcRequestData *unsent_head;
     struct AcRequestData *unsent_tail;
     struct Share *limiter;
+    CURL *free_handles[HANDLE_POOL_SIZE];
+    int free_handle_count;
 } EventLoop;
 
 typedef struct HostSlot {
@@ -720,7 +724,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     }
     REQUEST_TRACE_PRINT("start_request", rd);
     DEBUG_PRINT("read AcRequestData");
-    rd->curl = curl_easy_init();
+    rd->curl = loop->free_handle_count ? loop->free_handles[--loop->free_handle_count] : curl_easy_init();
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->share->share);
     if (rd->session->fresh_connect) {
         curl_easy_setopt(rd->curl, CURLOPT_FRESH_CONNECT, 1L);
@@ -841,10 +845,16 @@ void stop_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int
 
 void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     CleanupItem item;
+    EventLoop *loop = (EventLoop *)clientData;
     while (pipe_read(fd, &item, sizeof(item)) == 1) {
         DEBUG_PRINT("curl=%p", item.curl);
         if (item.curl != NULL) {
-            curl_easy_cleanup(item.curl);
+            if (loop != NULL && loop->free_handle_count < HANDLE_POOL_SIZE) {
+                curl_easy_reset(item.curl);
+                loop->free_handles[loop->free_handle_count++] = item.curl;
+            } else {
+                curl_easy_cleanup(item.curl);
+            }
         }
         if (item.share != NULL) {
             share_decref(item.share);
@@ -1001,7 +1011,7 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     if (aeCreateFileEvent(self->event_loop, self->req_in_read, AE_READABLE, start_request, self) == AE_ERR ||
         aeCreateFileEvent(self->event_loop, self->stop_read, AE_READABLE, stop_eventloop, self) == AE_ERR ||
         aeCreateFileEvent(self->event_loop, self->curl_easy_cleanup_read, AE_READABLE, curl_easy_cleanup_in_eventloop,
-                          NULL) == AE_ERR) {
+                          self) == AE_ERR) {
         PyErr_SetFromErrno(PyExc_OSError);
         goto error;
     }
@@ -1021,7 +1031,10 @@ static void close_fd(int fd) {
 static void EventLoop_dealloc(EventLoop *self) {
     DEBUG_PRINT("response=%p", self);
     if (self->curl_easy_cleanup_read != -1) {
-        curl_easy_cleanup_in_eventloop(NULL, self->curl_easy_cleanup_read, self, 0);
+        curl_easy_cleanup_in_eventloop(NULL, self->curl_easy_cleanup_read, NULL, 0);
+    }
+    while (self->free_handle_count > 0) {
+        curl_easy_cleanup(self->free_handles[--self->free_handle_count]);
     }
     if (self->multi != NULL) {
         curl_multi_cleanup(self->multi);

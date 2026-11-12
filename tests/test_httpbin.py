@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import time
 from urllib.parse import urlencode
 
@@ -249,3 +250,19 @@ def test_status_helpers(httpbin):
         r.raise_for_status()
     assert e.value.response is r
     assert str(e.value).startswith("404 Client Error: NOT FOUND for url: ")
+
+
+def test_reused_handles_do_not_leak_between_sessions(httpbin):
+    el = acurl.EventLoop()
+    first = el.session()
+    for _ in range(3):
+        _await(first.get(httpbin.url + "/cookies/set?secret=1"))
+        _await(first.get(httpbin.url + "/headers", auth=("user", "pass"), headers={"X-Private": "1"}))
+    gc.collect()
+    _await(asyncio.sleep(0.05))
+    second = el.session()
+    for _ in range(3):
+        assert _await(second.get(httpbin.url + "/cookies")).json()["cookies"] == {}
+        headers = _await(second.get(httpbin.url + "/headers")).json()["headers"]
+        assert "Authorization" not in headers and "X-Private" not in headers
+    assert _await(first.get(httpbin.url + "/cookies")).json()["cookies"] == {"secret": "1"}
