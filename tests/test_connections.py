@@ -244,3 +244,41 @@ def test_server_time(url):
     assert 0 <= r.client_lag < 0.01
     el.stop()
     loop.close()
+
+
+def test_proxy_environment_is_read_per_session(url, monkeypatch):
+    for name in ("http_proxy", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    proxy_port = sock.getsockname()[1]
+    sock.close()
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+
+    def get(session):
+        try:
+            return loop.run_until_complete(session.get(url)).status_code
+        except acurl.RequestError as e:
+            return str(e)
+
+    direct = el.session()
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:%d" % proxy_port)
+    proxied = el.session()
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    bypassed = el.session()
+    monkeypatch.delenv("http_proxy")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:%d" % proxy_port)
+    monkeypatch.delenv("NO_PROXY")
+    fallback = el.session()
+    monkeypatch.delenv("ALL_PROXY")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:%d" % proxy_port)
+    uppercase = el.session()
+
+    assert get(direct) == 200
+    assert "port %d" % proxy_port in get(proxied)
+    assert get(bypassed) == 200
+    assert "port %d" % proxy_port in get(fallback)
+    assert get(uppercase) == 200
+    el.stop()
+    loop.close()

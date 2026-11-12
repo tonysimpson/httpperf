@@ -78,6 +78,8 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 | `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
 | `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA store. A path: check against that CA bundle. Requests can override it. |
 
+Proxies come from the environment, as curl reads them: `http_proxy` (not `HTTP_PROXY`, which curl ignores for security), `https_proxy` or `HTTPS_PROXY`, then `all_proxy` or `ALL_PROXY`, with `no_proxy` or `NO_PROXY` for exceptions. A session reads them once, when it is created, so later changes apply to new sessions only.
+
 Cookies always belong to the session, whatever the connection settings. See [docs/connections.md](docs/connections.md) for how these fit together.
 
 ### Session methods

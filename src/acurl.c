@@ -207,6 +207,9 @@ typedef struct {
     long http_version;
     long idle_timeout;
     long max_connection_age;
+    char *http_proxy;
+    char *https_proxy;
+    char *no_proxy;
 } Session;
 
 typedef struct {
@@ -736,6 +739,13 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->session->http_version != CURL_HTTP_VERSION_1_1 && strncasecmp(rd->url, "https:", 6) == 0) {
         curl_easy_setopt(rd->curl, CURLOPT_PIPEWAIT, 1L);
     }
+    if (strncasecmp(rd->url, "https:", 6) == 0) {
+        curl_easy_setopt(rd->curl, CURLOPT_PROXY, rd->session->https_proxy ? rd->session->https_proxy : "");
+        curl_easy_setopt(rd->curl, CURLOPT_NOPROXY, rd->session->no_proxy ? rd->session->no_proxy : "");
+    } else if (strncasecmp(rd->url, "http:", 5) == 0) {
+        curl_easy_setopt(rd->curl, CURLOPT_PROXY, rd->session->http_proxy ? rd->session->http_proxy : "");
+        curl_easy_setopt(rd->curl, CURLOPT_NOPROXY, rd->session->no_proxy ? rd->session->no_proxy : "");
+    }
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
@@ -1191,6 +1201,14 @@ static PyTypeObject EventLoopType = {
     EventLoop_new,                                           /* tp_new */
 };
 
+static char *getenv_dup(const char *name, const char *fallback) {
+    const char *value = getenv(name);
+    if (value == NULL && fallback != NULL) {
+        value = getenv(fallback);
+    }
+    return value ? strdup(value) : NULL;
+}
+
 static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     Session *self;
     EventLoop *loop;
@@ -1268,6 +1286,15 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->http_version = curl_http_version;
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;
+    self->http_proxy = getenv_dup("http_proxy", NULL);
+    if (self->http_proxy == NULL) {
+        self->http_proxy = getenv_dup("all_proxy", "ALL_PROXY");
+    }
+    self->https_proxy = getenv_dup("https_proxy", "HTTPS_PROXY");
+    if (self->https_proxy == NULL) {
+        self->https_proxy = getenv_dup("all_proxy", "ALL_PROXY");
+    }
+    self->no_proxy = getenv_dup("no_proxy", "NO_PROXY");
     self->shared = share_new(share_connections, share_tls, max_host_connections, max_connections);
     if (self->shared == NULL) {
         Py_DECREF(self);
@@ -1281,6 +1308,9 @@ static void Session_dealloc(Session *self) {
     if (self->shared != NULL) {
         queue_cleanup(self->loop, NULL, self->shared);
     }
+    free(self->http_proxy);
+    free(self->https_proxy);
+    free(self->no_proxy);
     Py_XDECREF(self->loop);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
