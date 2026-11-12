@@ -192,3 +192,7 @@ Each target first creates `.venv` with uv, if needed, and installs acurl in edit
 The tests run local servers: pytest-httpbin, small threaded `http.server` servers for connection counting and TLS, and hypercorn for HTTP/2 and HTTP/3 (skipped on Python 3.8, where hypercorn's HTTP/3 server hangs on shutdown). Client certificates are generated with `openssl`. The httpbin server is single-threaded, so keep concurrency in tests low.
 
 Set `ACURL_PROFILE=1` when building to instrument the extension. See [docs/profiling.md](docs/profiling.md).
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
