@@ -33,6 +33,8 @@ tar xf curl.tar.gz
         --disable-ldap --disable-docs &&
     make -j"$(nproc)" && make install)
 
-echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf
-ldconfig /usr/local/lib 2>/dev/null || ldconfig
+if [ -d /etc/ld.so.conf.d ]; then
+    echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf
+    ldconfig
+fi
 /usr/local/bin/curl --version
