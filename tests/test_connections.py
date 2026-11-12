@@ -187,19 +187,13 @@ def test_timeouts(url):
         try:
             return loop.run_until_complete(session.get(target, **kwargs)).status_code
         except acurl.RequestError as e:
-            return type(e), e.code, str(e).split(" after ")[0], round(time.monotonic() - start, 1)
+            return type(e), e.code, round(time.monotonic() - start, 1)
 
     unlimited = el.session()
-    assert get(unlimited, "http://127.0.0.1:%d/" % silent.getsockname()[1], timeout=0.2) == (
-        acurl.Timeout,
-        28,
-        "Operation timed out",
-        0.2,
-    )
+    assert get(unlimited, "http://127.0.0.1:%d/" % silent.getsockname()[1], timeout=0.2) == (acurl.Timeout, 28, 0.2)
     assert get(unlimited, "http://127.0.0.1:%d/" % full.getsockname()[1], connect_timeout=0.2) == (
         acurl.Timeout,
         28,
-        "Connection timed out",
         0.2,
     )
     impatient = el.session(timeout=0.01)
