@@ -45,6 +45,20 @@ dev = [
     "ruff",
 ]
 
+[tool.cibuildwheel]
+build = "cp3*"
+skip = "cp3??t-*"
+before-all = "sh {project}/tools/build-libcurl.sh"
+test-requires = ["pytest", "pytest-timeout", "pytest-httpbin"]
+test-command = [
+    "python {project}/tools/wheel_smoke.py",
+    "pytest -p no:cacheprovider {project}/tests/test_httpbin.py {project}/tests/test_engine.py {project}/tests/test_response.py {project}/tests/test_cookie.py",
+]
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
+
 [tool.ruff]
 line-length = 120
 target-version = "py38"

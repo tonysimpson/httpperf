@@ -1697,7 +1697,28 @@ static PyTypeObject SessionType = {
 
 const static char MODULE_NAME[] = "_httpperf";
 
-static PyMethodDef module_methods[] = {{NULL, NULL, 0, NULL}};
+static PyObject *module_default_ca_file(PyObject *self, PyObject *args) {
+#if LIBCURL_VERSION_NUM >= 0x075400
+    CURL *curl = curl_easy_init();
+    if (curl == NULL) {
+        return PyErr_NoMemory();
+    }
+    char *path = NULL;
+    curl_easy_getinfo(curl, CURLINFO_CAINFO, &path);
+    PyObject *result = path != NULL ? PyUnicode_DecodeFSDefault(path) : Py_None;
+    if (path == NULL) {
+        Py_INCREF(Py_None);
+    }
+    curl_easy_cleanup(curl);
+    return result;
+#else
+    Py_RETURN_NONE;
+#endif
+}
+
+static PyMethodDef module_methods[] = {
+    {"default_ca_file", module_default_ca_file, METH_NOARGS, "libcurl's built-in CA bundle path, or None"},
+    {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef _httpperf_module = {PyModuleDef_HEAD_INIT, MODULE_NAME, NULL, -1, module_methods};
 

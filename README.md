@@ -22,11 +22,17 @@ Bytes are read off the wire as they arrive, whatever Python is doing. If Python 
 
 ## Install
 
-httpperf needs the libcurl development headers and a C compiler. It supports Python 3.8 to 3.14.
+```sh
+pip install httpperf
+```
+
+Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.14, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 but not HTTP/3.
+
+Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs its development headers and a C compiler. That libcurl decides whether HTTP/3 is available.
 
 ```sh
 sudo apt install libcurl4-openssl-dev   # Debian/Ubuntu
-pip install .
+pip install httpperf
 ```
 
 ## Quick start
@@ -67,7 +73,7 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 | `cert` | `None` | `(certfile, keyfile)` paths for a client certificate, used by every request unless the request overrides it. |
 | `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. |
 | `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
-| `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA store. A path: check against that CA bundle. Requests can override it. |
+| `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA bundle: `SSL_CERT_FILE` if set, otherwise libcurl's own default, or the usual system locations if it has none. A path: check against that CA bundle. Requests can override it. |
 | `json_dumps` | `None` | Function that turns a `json=` argument into the request body (`str` or `bytes`). `None` means the engine's. |
 | `json_loads` | `None` | Function that turns the response body (`bytes`) into the result of `json()`. `None` means the engine's. |
 

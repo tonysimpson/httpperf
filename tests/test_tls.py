@@ -137,3 +137,16 @@ def test_verify(tls_url):
         get(verified, verify=1)
     el.close()
     loop.close()
+
+
+def test_ca_file_lookup(monkeypatch, tmp_path):
+    monkeypatch.setenv("SSL_CERT_FILE", "/custom/ca.pem")
+    assert httpperf._find_ca_file() == "/custom/ca.pem"
+    monkeypatch.delenv("SSL_CERT_FILE")
+    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: None)
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("")
+    monkeypatch.setattr(httpperf, "_CA_FILES", ("/missing/ca.pem", str(bundle)))
+    assert httpperf._find_ca_file() == str(bundle)
+    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: str(bundle))
+    assert httpperf._find_ca_file() is None

@@ -20,6 +20,32 @@ def _json_loads(body):
     return _json.loads(body.decode("utf-8"))
 
 
+_CA_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _find_ca_file():
+    env = os.environ.get("SSL_CERT_FILE")
+    if env:
+        return env
+    builtin = _httpperf.default_ca_file()
+    if builtin and os.path.exists(builtin):
+        return None
+    return next((path for path in _CA_FILES if os.path.exists(path)), None)
+
+
+_ca_file = _find_ca_file()
+
+
+def _verify(verify):
+    return _ca_file if verify is True and _ca_file is not None else verify
+
+
 class RequestError(Exception):
     def __init__(self, message, code=None):
         super().__init__(message)
@@ -519,7 +545,12 @@ class Session:
         self._engine = engine
         self._json_dumps = json_dumps or (engine._json_dumps if engine is not None else _json_dumps)
         self._json_loads = json_loads or (engine._json_loads if engine is not None else _json_loads)
-        self._options = {"cert": cert, "verify": verify, "timeout": timeout, "connect_timeout": connect_timeout}
+        self._options = {
+            "cert": cert,
+            "verify": _verify(verify),
+            "timeout": timeout,
+            "connect_timeout": connect_timeout,
+        }
         self._session = _httpperf.Session(
             engine._ae_loop if engine is not None else None,
             connections,
@@ -598,7 +629,7 @@ class Session:
             if cert is not None:
                 options["cert"] = cert
             if verify is not None:
-                options["verify"] = verify
+                options["verify"] = _verify(verify)
             if timeout is not None:
                 options["timeout"] = timeout
             if connect_timeout is not None:
