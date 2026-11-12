@@ -4,7 +4,7 @@ PYTHON ?= $(VENV)/bin/python
 C_SOURCES := src/httpperf.c
 INSTALLED := $(VENV)/.installed
 
-.PHONY: venv test lint lint-fix clean distclean
+.PHONY: venv test lint lint-fix clean distclean release
 
 venv: $(INSTALLED)
 
@@ -32,3 +32,9 @@ clean:
 
 distclean: clean
 	rm -rf $(VENV)
+
+release:
+	git diff --quiet HEAD || { echo "commit your changes first"; exit 1; }
+	git fetch -q origin main && test "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" || { echo "HEAD is not origin/main"; exit 1; }
+	v=$$(sed -n 's/^__version__ = "\(.*\)"/\1/p' httpperf/version.py); \
+	git tag -a v$$v -m "httpperf $$v" && git push origin v$$v
