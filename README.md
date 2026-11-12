@@ -26,7 +26,7 @@ Bytes are read off the wire as they arrive, whatever Python is doing. If Python 
 pip install httpperf
 ```
 
-Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.14, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 but not HTTP/3.
+Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 but not HTTP/3.
 
 Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs its development headers and a C compiler. That libcurl decides whether HTTP/3 is available.
 
