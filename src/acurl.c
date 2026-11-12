@@ -205,14 +205,45 @@ typedef struct {
     long max_connection_age;
 } Session;
 
-/* Node in a linked list structure. Used for piecing together sections of resposnes e.g. headers and body.
- * Possible optimisation to have a memory pool for buffer nodes so they aren't being malloc'ed all the time */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} Buffer;
 
-struct BufferNode {
-    int len;
-    char *buffer;
-    struct BufferNode *next;
-};
+#define MAX_BODY_PREALLOC (64 * 1024 * 1024)
+
+static bool buffer_append(Buffer *b, const char *src, size_t n, size_t initial) {
+    if (b->len + n > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : initial;
+        while (cap < b->len + n) {
+            cap *= 2;
+        }
+        char *data = realloc(b->data, cap);
+        if (data == NULL) {
+            return false;
+        }
+        b->data = data;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, src, n);
+    b->len += n;
+    return true;
+}
+
+static PyObject *buffer_to_bytes(Buffer *b, PyObject **cache) {
+    if (*cache == NULL) {
+        *cache = PyBytes_FromStringAndSize(b->data, (Py_ssize_t)b->len);
+        if (*cache == NULL) {
+            return NULL;
+        }
+        free(b->data);
+        b->data = NULL;
+        b->len = b->cap = 0;
+    }
+    Py_INCREF(*cache);
+    return *cache;
+}
 
 typedef struct AcRequestData {
     char *method;
@@ -237,10 +268,8 @@ typedef struct AcRequestData {
     Share *limiter;
     CURL *curl;
     CURLcode result;
-    struct BufferNode *header_buffer_head;
-    struct BufferNode *header_buffer_tail;
-    struct BufferNode *body_buffer_head;
-    struct BufferNode *body_buffer_tail;
+    Buffer header;
+    Buffer body;
     HostSlot *slot;
     struct AcRequestData *next_waiting;
     struct AcRequestData *next_unsent;
@@ -249,61 +278,36 @@ typedef struct AcRequestData {
 } AcRequestData;
 
 typedef struct {
-    PyObject_HEAD struct BufferNode *header_buffer;
-    struct BufferNode *body_buffer;
+    PyObject_HEAD Buffer header;
+    Buffer body;
+    PyObject *header_bytes;
+    PyObject *body_bytes;
     Session *session;
     CURL *curl;
     double queue_time;
 } Response;
 
-void free_buffer_nodes(struct BufferNode *start) {
-    struct BufferNode *node = start;
-    while (node != NULL) {
-        struct BufferNode *next = node->next;
-        free(node->buffer);
-        free(node);
-        node = next;
-    };
-}
-
 /* Python deallocator for Response Object. For GC */
 
 static void Response_dealloc(Response *self) {
     DEBUG_PRINT("response=%p", self);
-    free_buffer_nodes(self->header_buffer);
-    free_buffer_nodes(self->body_buffer);
+    free(self->header.data);
+    free(self->body.data);
+    Py_XDECREF(self->header_bytes);
+    Py_XDECREF(self->body_bytes);
     queue_cleanup(self->session->loop, self->curl, NULL);
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
-PyObject *get_buffer_as_pylist(struct BufferNode *start) {
-    int i = 0, len = 0;
-    PyObject *list;
-    struct BufferNode *node = start;
-    while (node != NULL) {
-        len++;
-        node = node->next;
-    };
-    list = PyList_New(len);
-    node = start;
-    ;
-    while (node != NULL) {
-        PyList_SET_ITEM(list, i++, PyBytes_FromStringAndSize(node->buffer, node->len));
-        node = node->next;
-    };
-    DEBUG_PRINT("list=%p", list);
-    return list;
-}
-
 static PyObject *Response_get_header(Response *self, PyObject *args) {
     DEBUG_PRINT("");
-    return get_buffer_as_pylist(self->header_buffer);
+    return buffer_to_bytes(&self->header, &self->header_bytes);
 }
 
 static PyObject *Response_get_body(Response *self, PyObject *args) {
     DEBUG_PRINT("");
-    return get_buffer_as_pylist(self->body_buffer);
+    return buffer_to_bytes(&self->body, &self->body_bytes);
 }
 
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
@@ -688,38 +692,24 @@ void socket_action_and_response_complete(EventLoop *loop, curl_socket_t socket, 
 
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     AcRequestData *rd = (AcRequestData *)userdata;
-    struct BufferNode *node = (struct BufferNode *)malloc(sizeof(struct BufferNode));
-    node->len = size * nmemb;
-    node->buffer = (char *)malloc(node->len);
-    memcpy(node->buffer, ptr, node->len);
-    node->next = NULL;
-    if (unlikely(rd->header_buffer_head == NULL)) {
-        rd->header_buffer_head = node;
-    }
-    if (likely(rd->header_buffer_tail != NULL)) {
-        rd->header_buffer_tail->next = node;
-    }
-    rd->header_buffer_tail = node;
-    return node->len;
+    size_t n = size * nmemb;
+    return buffer_append(&rd->header, ptr, n, n > 1024 ? n : 1024) ? n : 0;
 }
 
 /* See docs for CURLOPT_WTIE_FUNCTION */
 
 size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     AcRequestData *rd = (AcRequestData *)userdata;
-    struct BufferNode *node = (struct BufferNode *)malloc(sizeof(struct BufferNode));
-    node->len = size * nmemb;
-    node->buffer = (char *)malloc(node->len);
-    memcpy(node->buffer, ptr, node->len);
-    node->next = NULL;
-    if (unlikely(rd->body_buffer_head == NULL)) {
-        rd->body_buffer_head = node;
+    size_t n = size * nmemb;
+    size_t initial = n;
+    if (rd->body.cap == 0) {
+        curl_off_t length = -1;
+        curl_easy_getinfo(rd->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
+        if (length > (curl_off_t)n) {
+            initial = length < MAX_BODY_PREALLOC ? (size_t)length : MAX_BODY_PREALLOC;
+        }
     }
-    if (likely(rd->body_buffer_tail != NULL)) {
-        rd->body_buffer_tail->next = node;
-    }
-    rd->body_buffer_tail = node;
-    return node->len;
+    return buffer_append(&rd->body, ptr, n, initial) ? n : 0;
 }
 
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
@@ -1098,8 +1088,10 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         PyObject *tuple = PyTuple_New(3);
         if (rd->result == CURLE_OK) {
             Response *response = PyObject_New(Response, (PyTypeObject *)&ResponseType);
-            response->header_buffer = rd->header_buffer_head;
-            response->body_buffer = rd->body_buffer_head;
+            response->header = rd->header;
+            response->body = rd->body;
+            response->header_bytes = NULL;
+            response->body_bytes = NULL;
             response->curl = rd->curl;
             response->session = rd->session;
             response->queue_time = rd->queue_time;
@@ -1111,8 +1103,8 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         } else {
             PyObject *error =
                 Py_BuildValue("(is)", rd->result, rd->error[0] ? rd->error : curl_easy_strerror(rd->result));
-            free_buffer_nodes(rd->header_buffer_head);
-            free_buffer_nodes(rd->body_buffer_head);
+            free(rd->header.data);
+            free(rd->body.data);
             queue_cleanup(rd->session->loop, rd->curl, NULL);
             Py_DECREF(rd->session);
 

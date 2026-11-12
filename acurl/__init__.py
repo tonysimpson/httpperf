@@ -436,7 +436,7 @@ class Response:
     @property
     def body(self):
         if not hasattr(self, "_body"):
-            self._body = b"".join(self._resp.get_body())
+            self._body = self._resp.get_body()
         return self._body
 
     @property
@@ -484,7 +484,7 @@ class Response:
     @property
     def header(self):
         if not hasattr(self, "_header"):
-            self._header = b"".join(self._resp.get_header()).decode("latin-1")
+            self._header = self._resp.get_header().decode("latin-1")
         return self._header
 
 

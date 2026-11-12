@@ -9,10 +9,10 @@ class FakeResponse:
         self._body = body
 
     def get_header(self):
-        return [self._header.encode("ascii")]
+        return self._header.encode("ascii")
 
     def get_body(self):
-        return [self._body]
+        return self._body
 
 
 def response(content_type, body=b""):
@@ -46,7 +46,7 @@ class RawResponse:
         self._header = header
 
     def get_header(self):
-        return [self._header]
+        return self._header
 
 
 def test_headers():
