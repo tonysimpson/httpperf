@@ -66,12 +66,14 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 | `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. |
 | `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
 | `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA store. A path: check against that CA bundle. Requests can override it. |
+| `json_dumps` | `None` | Function that turns a `json=` argument into the request body (`str` or `bytes`). `None` means the engine's. |
+| `json_loads` | `None` | Function that turns the response body (`bytes`) into the result of `json()`. `None` means the engine's. |
 
 Proxies come from the environment, as curl reads them: `http_proxy` (not `HTTP_PROXY`, which curl ignores for security), `https_proxy` or `HTTPS_PROXY`, then `all_proxy` or `ALL_PROXY`, with `no_proxy` or `NO_PROXY` for exceptions. A session reads them once, when it is created, so later changes apply to new sessions only.
 
 Cookies always belong to the session, whatever the connection settings.
 
-### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, same_thread=False)`
+### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, same_thread=False, json_dumps=..., json_loads=...)`
 
 What sessions share: the curl thread, the shared connection pool, the TLS session cache and the limits. Most programs never create one. Create one to set limits, or to keep groups of sessions in separate pools, and pass it to `Session(engine=...)`.
 
@@ -81,6 +83,7 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 | `max_total_connections` | Cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 | `same_thread` | Run the curl loop on the asyncio thread instead, polling every millisecond. Only for debugging and profiling with Python tools. |
+| `json_dumps`, `json_loads` | The JSON functions for the engine's sessions, unless a session sets its own. The defaults use the standard library: compact output, and bodies decoded as UTF-8. See [JSON](#json). |
 
 An engine binds to the asyncio loop running when it is first used. Once that loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool.
 
@@ -108,7 +111,7 @@ An engine serves one asyncio loop at a time, and using it from a second live loo
 | `cookie_list` | List of `Cookie` objects. |
 | `auth` | `(username, password)` for basic auth. |
 | `data` | Request body: `str` or `bytes` as is, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. |
-| `json` | Object to send as JSON, encoded compactly with the standard library. Sets `Content-Type: application/json` unless you set it. |
+| `json` | Object to send as JSON, encoded with the session's `json_dumps`. Sets `Content-Type: application/json` unless you set it. |
 | `files` | Dict (or list of pairs) of files to send as `multipart/form-data`, with any `data` dict as extra fields. A value is an open file, or `(filename, content)` or `(filename, content, content_type)`, where content is `bytes`, `str` or a file. Files are read into memory. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
 | `verify` | `True`, `False` or a CA bundle path, overriding the session's `verify`. |
@@ -135,7 +138,7 @@ Failed transfers raise `acurl.RequestError` with curl's detailed error message, 
 | `body` | Bytes. |
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |
-| `json()` | Body parsed as JSON with the standard library (always UTF-8, as RFC 8259 requires). |
+| `json()` | Body parsed with the session's `json_loads`, once. By default the standard library, always as UTF-8, as RFC 8259 requires. |
 | `cookies`, `cookielist` | The session's cookie jar at the time you read it (not only the cookies this response set). Empty once the session is closed. |
 | `primary_ip` | Address connected to. |
 | `upload_size`, `download_size` | Bytes, as integers. |
@@ -143,11 +146,31 @@ Failed transfers raise `acurl.RequestError` with curl's detailed error message, 
 
 ### JSON
 
-acurl uses the standard library's `json`, which has no extra dependency and the most scrutinised parser. That matters because load tests often fetch responses from third parties. If JSON costs too much CPU:
+By default acurl uses the standard library's `json`: compact output for `json=`, and response bodies decoded as UTF-8 for `json()`. It needs no extra dependency and has the most scrutinised parser, which matters because load tests often fetch responses from third parties.
 
-- Encode request bodies once and reuse the bytes, where the payload allows.
-- Encode with a faster library and send the bytes yourself: `session.post(url, data=orjson.dumps(obj), headers={"Content-Type": "application/json"})`. orjson is about 8 times faster on larger payloads, but turns `NaN` into `null` and refuses integers over 64 bits.
-- To read a few fields from a large response, parse lazily with [pysimdjson](https://github.com/TkTech/pysimdjson). Create one `parser = simdjson.Parser()` and reuse it, since it keeps its buffers between documents. Then `doc = parser.parse(r.body)` and `doc["items"][3]["name"]`. Only the values you touch become Python objects, which was about 8 times faster than `json.loads` for one field of a 500 KB document. The result is read-only and not a real `dict`; `doc.as_dict()` converts it.
+If JSON costs too much CPU, pass faster functions as `json_dumps` and `json_loads`, on the `Engine` for all its sessions or on one `Session`. [orjson](https://github.com/ijl/orjson) is a good choice for encoding, and [pysimdjson](https://github.com/TkTech/pysimdjson) for decoding. Create the parser once, at module scope, since it keeps its buffers between documents:
+
+```python
+import acurl
+import orjson
+import simdjson
+
+parser = simdjson.Parser()
+engine = acurl.Engine(json_dumps=orjson.dumps, json_loads=parser.parse)
+
+
+async def journey():
+    async with acurl.Session(engine=engine) as session:
+        r = await session.post("https://example.com/search", json={"q": "acurl"})
+        return r.json()["items"][3]["name"]
+```
+
+Things to know:
+
+- orjson is about 8 times faster than `json` on larger payloads, but turns `NaN` into `null` and refuses integers over 64 bits.
+- `parser.parse` is lazy: only the values you touch become Python objects. That was about 8 times faster than `json.loads` for reading one field of a 500 KB document. The result is read-only and not a real `dict` or `list`; `.as_dict()` and `.as_list()` convert it. Documents stay valid after the parser moves on to the next one.
+- To get real `dict`s and `list`s from simdjson, use `json_loads=lambda body: parser.parse(body, True)`.
+- Request bodies that never change can be encoded once and sent as `data=`, with `headers={"Content-Type": "application/json"}`.
 
 ## Timings
 

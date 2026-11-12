@@ -10,7 +10,11 @@ from urllib.parse import urlencode, urlparse
 
 from acurl import _acurl
 
-_json_encoder = _json.JSONEncoder(separators=(",", ":"), check_circular=False)
+_json_dumps = _json.JSONEncoder(separators=(",", ":"), check_circular=False).encode
+
+
+def _json_loads(body):
+    return _json.loads(body.decode("utf-8"))
 
 
 class RequestError(Exception):
@@ -303,9 +307,11 @@ class Response:
         "_headers",
         "_encoding",
         "_json",
+        "_json_loads",
     )
 
-    def __init__(self, req, resp, start_time, end_time):
+    def __init__(self, req, resp, start_time, end_time, json_loads=_json_loads):
+        self._json_loads = json_loads
         self._req = req
         self._resp = resp
         self._start_time = start_time
@@ -459,7 +465,7 @@ class Response:
 
     def json(self):
         if not hasattr(self, "_json"):
-            self._json = _json.loads(self.body.decode("utf-8"))
+            self._json = self._json_loads(self.body)
         return self._json
 
     @property
@@ -504,8 +510,12 @@ class Session:
         verify=False,
         timeout=None,
         connect_timeout=None,
+        json_dumps=None,
+        json_loads=None,
     ):
         self._engine = engine if engine is not None else _default_engine()
+        self._json_dumps = json_dumps if json_dumps is not None else self._engine._json_dumps
+        self._json_loads = json_loads if json_loads is not None else self._engine._json_loads
         self._options = {"cert": cert, "verify": verify, "timeout": timeout, "connect_timeout": connect_timeout}
         self._session = _acurl.Session(
             self._engine._ae_loop,
@@ -599,7 +609,7 @@ class Session:
         if json is not None:
             if data is not None or files is not None:
                 raise ValueError("json cannot be combined with data or files")
-            data = _json_encoder.encode(json)
+            data = self._json_dumps(json)
             content_type = "application/json"
         elif files is not None:
             data, content_type = _multipart(data, files)
@@ -668,7 +678,7 @@ class Session:
             **options,
         )
         resp = await future
-        response = Response(request, resp, start_time, start_time + time.monotonic() - start)
+        response = Response(request, resp, start_time, start_time + time.monotonic() - start, self._json_loads)
         if prev is not None:
             response._prev = prev
 
@@ -729,7 +739,11 @@ class Engine:
         max_total_connections=0,
         max_idle_connections=1000,
         same_thread=False,
+        json_dumps=_json_dumps,
+        json_loads=_json_loads,
     ):
+        self._json_dumps = json_dumps
+        self._json_loads = json_loads
         self._loop = None
         self._thread = None
         self._same_thread = same_thread

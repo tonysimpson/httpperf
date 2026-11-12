@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import gc
+import json
 import time
 from urllib.parse import urlencode
 
@@ -134,6 +135,25 @@ def test_methods_with_body(httpbin, method):
     r = _await(getattr(s, method)(httpbin.url + "/" + method, json={"a": 1}))
     assert r.status_code == 200
     assert r.json()["json"] == {"a": 1}
+
+
+def test_custom_json_functions(httpbin):
+    calls = []
+
+    def dumps(obj):
+        calls.append("engine dumps")
+        return json.dumps(obj).encode()
+
+    def loads(body):
+        calls.append("session loads")
+        return json.loads(body)
+
+    engine = acurl.Engine(json_dumps=dumps, json_loads=lambda body: calls.append("engine loads"))
+    s = acurl.Session(engine=engine, json_loads=loads)
+    r = _await(s.post(httpbin.url + "/post", json={"a": 1}))
+    assert r.json()["json"] == {"a": 1}
+    assert calls == ["engine dumps", "session loads"]
+    engine.close()
 
 
 def test_post_binary(httpbin):
