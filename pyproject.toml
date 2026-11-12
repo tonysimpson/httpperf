@@ -1,5 +1,6 @@
 [dependency-groups]
 dev = [
+    "aioquic",
     "hypercorn",
     "pytest",
     "pytest-httpbin",

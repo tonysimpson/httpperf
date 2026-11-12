@@ -27,7 +27,7 @@ curl matches cached tickets on the client certificate as well as the host, so se
 
 ### Protocol: `http_version`
 
-`"HTTP/2"` (default) asks for HTTP/2 over TLS and sets `CURLOPT_PIPEWAIT`, so requests started together wait to share one multiplexed connection rather than each opening their own. Plain `http://` stays on HTTP/1.1. `"HTTP/1.1"` never uses HTTP/2. `Response.http_version` reports what was negotiated.
+`"HTTP/2"` (default) asks for HTTP/2 over TLS and sets `CURLOPT_PIPEWAIT`, so requests started together wait to share one multiplexed connection rather than each opening their own. Plain `http://` stays on HTTP/1.1. `"HTTP/1.1"` never uses HTTP/2. `"HTTP/3"` uses QUIC and nothing else, also with `CURLOPT_PIPEWAIT`. curl can instead race QUIC against TCP and fall back, but that opens two connections for one, so acurl does not offer it. `Response.http_version` reports what was negotiated.
 
 ### Limits
 

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import socket
+import sys
 import threading
 
 import pytest
@@ -28,6 +29,9 @@ def h2_url():
     sock.close()
     config = Config()
     config.bind = ["127.0.0.1:%d" % port]
+    if HTTP3:
+        config.quic_bind = ["127.0.0.1:%d" % port]
+    config.graceful_timeout = 0.1
     config.certfile = os.path.join(certs, "server.pem")
     config.keyfile = os.path.join(certs, "server.key")
     loop = asyncio.new_event_loop()
@@ -55,6 +59,10 @@ def h2_url():
     loop.close()
 
 
+HTTP3 = sys.version_info >= (3, 9)
+needs_http3 = pytest.mark.skipif(not HTTP3, reason="hypercorn's HTTP/3 server hangs on shutdown on Python 3.8")
+
+
 def run(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -63,7 +71,9 @@ def run(coro):
         loop.close()
 
 
-@pytest.mark.parametrize("version, body", [("HTTP/2", "2"), ("HTTP/1.1", "1.1")])
+@pytest.mark.parametrize(
+    "version, body", [pytest.param("HTTP/3", "3", marks=needs_http3), ("HTTP/2", "2"), ("HTTP/1.1", "1.1")]
+)
 def test_http_version(h2_url, version, body):
     async def main(el):
         r = await el.session(http_version=version).get(h2_url)
@@ -74,7 +84,9 @@ def test_http_version(h2_url, version, body):
     assert (r.http_version, r.text) == (version, body)
 
 
-@pytest.mark.parametrize("version, connects", [("HTTP/2", 1), ("HTTP/1.1", 5)])
+@pytest.mark.parametrize(
+    "version, connects", [pytest.param("HTTP/3", 1, marks=needs_http3), ("HTTP/2", 1), ("HTTP/1.1", 5)]
+)
 def test_concurrent_requests_share_a_connection(h2_url, version, connects):
     async def main(el):
         s = el.session(connections="session", http_version=version)

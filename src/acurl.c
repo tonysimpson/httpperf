@@ -719,7 +719,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_HTTP_VERSION, rd->session->http_version);
     curl_easy_setopt(rd->curl, CURLOPT_MAXAGE_CONN, rd->session->idle_timeout);
     curl_easy_setopt(rd->curl, CURLOPT_MAXLIFETIME_CONN, rd->session->max_connection_age);
-    if (rd->session->http_version == CURL_HTTP_VERSION_2TLS) {
+    if (rd->session->http_version != CURL_HTTP_VERSION_1_1) {
         curl_easy_setopt(rd->curl, CURLOPT_PIPEWAIT, 1L);
     }
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
@@ -1199,8 +1199,14 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         curl_http_version = CURL_HTTP_VERSION_2TLS;
     } else if (strcmp(http_version, "HTTP/1.1") == 0) {
         curl_http_version = CURL_HTTP_VERSION_1_1;
+    } else if (strcmp(http_version, "HTTP/3") == 0) {
+        if (!(curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP3)) {
+            PyErr_SetString(PyExc_ValueError, "this libcurl was built without HTTP/3");
+            return NULL;
+        }
+        curl_http_version = CURL_HTTP_VERSION_3ONLY;
     } else {
-        PyErr_Format(PyExc_ValueError, "http_version must be 'HTTP/2' or 'HTTP/1.1', not '%s'", http_version);
+        PyErr_Format(PyExc_ValueError, "http_version must be 'HTTP/3', 'HTTP/2' or 'HTTP/1.1', not '%s'", http_version);
         return NULL;
     }
 

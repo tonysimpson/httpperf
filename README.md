@@ -68,7 +68,7 @@ Starts the curl thread and connects it to an asyncio loop (the running loop if `
 |---|---|---|
 | `connections` | `"shared"` | `"shared"`: the process-wide pool. `"session"`: the session's own pool. `"none"`: a new connection for every request. |
 | `tls` | `"shared"` | Where TLS session tickets are kept. `"shared"`: process-wide, so new connections resume their handshake. `"session"`: per session, so each session starts with a full handshake. |
-| `http_version` | `"HTTP/2"` | `"HTTP/2"`: HTTP/2 over TLS when the server offers it, with requests waiting to share one multiplexed connection. Plain http uses HTTP/1.1. `"HTTP/1.1"`: HTTP/1.1 only. |
+| `http_version` | `"HTTP/2"` | `"HTTP/2"`: HTTP/2 over TLS when the server offers it, with requests waiting to share one multiplexed connection. Plain http uses HTTP/1.1. `"HTTP/1.1"`: HTTP/1.1 only. `"HTTP/3"`: HTTP/3 over QUIC only, with no fallback, so requests fail if the server does not offer it. |
 | `idle_timeout` | `118` | Seconds a connection may sit idle and still be reused. |
 | `max_connection_age` | `0` | Seconds after which a connection is no longer reused, however busy it is. 0 means no limit. |
 | `max_host_connections` | `0` | Per-session cap on connections per host. Needs `connections="session"` or `"none"`. |
@@ -148,7 +148,6 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `EventLoop.stop()` is called never complete.
-- HTTP/3 is not supported yet, though libcurl can do it.
 
 ## Development
 
@@ -164,6 +163,6 @@ Each target first creates `.venv` with uv, if needed, and installs acurl in edit
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 
-The tests run local servers: pytest-httpbin, small threaded `http.server` servers for connection counting and TLS, and hypercorn for HTTP/2. Client certificates are generated with `openssl`. The httpbin server is single-threaded, so keep concurrency in tests low.
+The tests run local servers: pytest-httpbin, small threaded `http.server` servers for connection counting and TLS, and hypercorn for HTTP/2 and HTTP/3 (skipped on Python 3.8, where hypercorn's HTTP/3 server hangs on shutdown). Client certificates are generated with `openssl`. The httpbin server is single-threaded, so keep concurrency in tests low.
 
 Set `ACURL_PROFILE=1` when building to instrument the extension. See [docs/profiling.md](docs/profiling.md).
