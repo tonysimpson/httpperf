@@ -37,6 +37,7 @@ version = { attr = "acurl.version.__version__" }
 [dependency-groups]
 dev = [
     "aioquic",
+    "clang-format==19.1.7",
     "hypercorn",
     "pytest",
     "pytest-httpbin",

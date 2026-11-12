@@ -19,11 +19,11 @@ test: $(INSTALLED)
 lint: $(INSTALLED)
 	$(PYTHON) -m ruff check .
 	$(PYTHON) -m ruff format --check .
-	clang-format --dry-run --Werror $(C_SOURCES)
+	$(VENV)/bin/clang-format --dry-run --Werror $(C_SOURCES)
 
 lint-fix: $(INSTALLED)
 	$(PYTHON) -m ruff format .
-	clang-format -i $(C_SOURCES)
+	$(VENV)/bin/clang-format -i $(C_SOURCES)
 	$(PYTHON) -m ruff check --fix .
 
 clean:

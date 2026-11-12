@@ -59,8 +59,23 @@ def h2_url():
     loop.close()
 
 
-HTTP3 = sys.version_info >= (3, 9)
-needs_http3 = pytest.mark.skipif(not HTTP3, reason="hypercorn's HTTP/3 server hangs on shutdown on Python 3.8")
+def libcurl_has_http3():
+    loop = asyncio.new_event_loop()
+    el = acurl.EventLoop(loop=loop)
+    try:
+        el.session(http_version="HTTP/3")
+        return True
+    except ValueError:
+        return False
+    finally:
+        el.stop()
+        loop.close()
+
+
+HTTP3 = sys.version_info >= (3, 9) and libcurl_has_http3()
+needs_http3 = pytest.mark.skipif(
+    not HTTP3, reason="needs libcurl with HTTP/3, and Python 3.9+ (hypercorn's HTTP/3 server hangs on 3.8)"
+)
 
 
 def run(coro):
