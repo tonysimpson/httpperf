@@ -147,3 +147,18 @@ def test_arguments_are_keyword_only():
         acurl.Session("shared")
     with pytest.raises(TypeError):
         acurl.Engine(10)
+
+
+def test_unclosed_engine_stops_when_dropped():
+    loop = asyncio.new_event_loop()
+    try:
+        engine = acurl.Engine()
+        thread = engine._thread
+        with pytest.raises(acurl.RequestError):
+            loop.run_until_complete(acurl.Session(engine=engine).get("http://127.0.0.1:1/"))
+    finally:
+        loop.close()
+    del engine
+    gc.collect()
+    thread.join(timeout=2)
+    assert not thread.is_alive()

@@ -82,9 +82,11 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 | `same_thread` | Run the curl loop on the asyncio thread instead, polling every millisecond. Only for debugging and profiling with Python tools. |
 
-An engine binds to the asyncio loop running when it is first used. Once that loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool. Using it from two live loops at once raises `RuntimeError`.
+An engine binds to the asyncio loop running when it is first used. Once that loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool.
 
-`engine.close()` stops the curl thread and closes the shared pool's connections. Requests still in flight are abandoned, and later requests raise `RuntimeError`. `with` and `async with` call `close()` on exit. See [docs/connections.md](docs/connections.md) for how these fit together.
+An engine serves one asyncio loop at a time, and using it from a second live loop raises `RuntimeError`. To run loops in several threads at once, give each thread its own `Engine` and pass it to that thread's sessions. The default engine is shared by the whole process, so it only works for one thread's loop at a time.
+
+`engine.close()` stops the curl thread and closes the shared pool's connections. Requests still in flight are abandoned, and later requests raise `RuntimeError`. `with` and `async with` call `close()` on exit. An engine that is no longer referenced is closed automatically. The default engine lasts as long as the process. See [docs/connections.md](docs/connections.md) for how these fit together.
 
 ### Session methods
 

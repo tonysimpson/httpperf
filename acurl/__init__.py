@@ -731,18 +731,13 @@ class Engine:
         same_thread=False,
     ):
         self._loop = None
-        self._running = False
+        self._thread = None
         self._same_thread = same_thread
         self._ae_loop = _acurl.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
         self._closed = False
         if not same_thread:
-            self._running = True
-            self._thread = threading.Thread(target=self._runner, daemon=True)
+            self._thread = threading.Thread(target=self._ae_loop.main, daemon=True)
             self._thread.start()
-
-    def _runner(self):
-        self._ae_loop.main()
-        self._running = False
 
     def _bind(self, loop):
         if self._closed:
@@ -775,7 +770,7 @@ class Engine:
         if self._loop is not None and not self._loop.is_closed():
             self._loop.remove_reader(self._ae_loop.get_out_fd())
         self._loop = None
-        if self._running:
+        if self._thread is not None and self._thread.is_alive():
             self._ae_loop.stop()
 
     def __del__(self):
