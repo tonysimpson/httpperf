@@ -1,4 +1,5 @@
 import asyncio
+import collections.abc
 import json as _json
 import threading
 import time
@@ -205,6 +206,37 @@ class Request:
         return self._data
 
 
+class Headers(collections.abc.Mapping):
+    __slots__ = ("_items",)
+
+    def __init__(self, pairs):
+        items = {name.lower(): (name, value) for name, value in pairs}
+        if len(items) != len(pairs):
+            items = {}
+            for name, value in pairs:
+                key = name.lower()
+                if key in items:
+                    items[key] = (items[key][0], items[key][1] + ", " + value)
+                else:
+                    items[key] = (name, value)
+        self._items = items
+
+    def __getitem__(self, name):
+        return self._items[name.lower()][1]
+
+    def __contains__(self, name):
+        return isinstance(name, str) and name.lower() in self._items
+
+    def __iter__(self):
+        return (name for name, _ in self._items.values())
+
+    def __len__(self):
+        return len(self._items)
+
+    def __repr__(self):
+        return repr(dict(self.items()))
+
+
 class Response:
     __slots__ = (
         "_req",
@@ -331,12 +363,7 @@ class Response:
     @property
     def encoding(self):
         if not hasattr(self, "_encoding"):
-            content_type = None
-            for header in self.headers_tuple:
-                if len(header) == 2 and header[0].lower() == "content-type":
-                    content_type = header[1]
-                    break
-            self._encoding = _encoding_from_content_type(content_type)
+            self._encoding = _encoding_from_content_type(self.headers.get("content-type"))
         return self._encoding
 
     @encoding.setter
@@ -359,19 +386,23 @@ class Response:
     @property
     def headers(self):
         if not hasattr(self, "_headers"):
-            self._headers = dict(self.headers_tuple)
+            self._headers = Headers(self.headers_tuple)
         return self._headers
 
     @property
     def headers_tuple(self):
         if not hasattr(self, "_headers_tuple"):
-            self._headers_tuple = tuple(tuple(line.split(": ", 1)) for line in self.header.split("\r\n")[1:-2])
+            blocks = [b for b in self.header.split("\r\n\r\n") if b]
+            block = blocks[-1] if blocks else ""
+            self._headers_tuple = tuple(
+                [(name, value.strip()) for name, _, value in [line.partition(":") for line in block.split("\r\n")[1:]]]
+            )
         return self._headers_tuple
 
     @property
     def header(self):
         if not hasattr(self, "_header"):
-            self._header = b"".join(self._resp.get_header()).decode("ascii")
+            self._header = b"".join(self._resp.get_header()).decode("latin-1")
         return self._header
 
 

@@ -117,7 +117,7 @@ Failed transfers raise `acurl.RequestError` with curl's detailed error message, 
 | `redirect_url` | Location of a redirect, or `None`. |
 | `history` | Earlier responses in a redirect chain. |
 | `http_version` | `"HTTP/1.0"`, `"HTTP/1.1"`, `"HTTP/2"` or `"HTTP/3"`. |
-| `headers` | Dict of response headers. `headers_tuple` keeps repeats and order; `header` is the raw header block. |
+| `headers` | Case-insensitive mapping of the response headers. Repeated headers are joined with `, `, as in requests. `headers_tuple` keeps repeats and order. Both skip interim responses such as `100 Continue`. `header` is the raw text of every header block, decoded as latin-1. |
 | `body` | Bytes. |
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |

@@ -82,6 +82,7 @@ def test_http_version(h2_url, version, body):
 
     r = run(main)
     assert (r.http_version, r.text) == (version, body)
+    assert r.headers["Content-Type"] == "text/plain"
 
 
 @pytest.mark.parametrize(
