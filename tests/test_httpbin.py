@@ -43,12 +43,12 @@ def test_cookies(httpbin):
 def test_session_cookies(httpbin):
     s = session()
     _await(s.get(httpbin.url + "/cookies/set?name=value"))
-    cookie_list = _await(s.get_cookie_list())
+    cookie_list = s.get_cookie_list()
     assert len(cookie_list) == 1
     assert cookie_list[0].name == "name"
     assert s.cookies() == {"name": "value"}
-    _await(s.erase_all_cookies())
-    cookie_list = _await(s.get_cookie_list())
+    s.erase_all_cookies()
+    cookie_list = s.get_cookie_list()
     assert len(cookie_list) == 0
     assert s.cookies() == {}
 
@@ -64,13 +64,13 @@ def test_add_and_erase_session_cookies(httpbin):
     s = session()
     lasting = acurl.session_cookie_for_url(httpbin.url, "lasting", "1")
     lasting = acurl.Cookie(False, lasting.domain, True, "/", False, int(time.time()) + 3600, "lasting", "1")
-    _await(s.add_cookie_list([acurl.session_cookie_for_url(httpbin.url, "brief", "1"), lasting]))
+    s.add_cookie_list([acurl.session_cookie_for_url(httpbin.url, "brief", "1"), lasting])
     assert _await(s.get(httpbin.url + "/cookies")).json()["cookies"] == {"brief": "1", "lasting": "1"}
-    _await(s.erase_session_cookies())
+    s.erase_session_cookies()
     assert s.cookies() == {"lasting": "1"}
     s.close()
     with pytest.raises(RuntimeError):
-        _await(s.erase_all_cookies())
+        s.erase_all_cookies()
 
 
 def test_basic_auth(httpbin):
@@ -204,3 +204,48 @@ def test_unencodable_strings_raise(httpbin, kwargs):
     with pytest.raises(UnicodeEncodeError):
         _await(s.get(httpbin.url + "/get", **kwargs))
     assert _await(s.get(httpbin.url + "/get")).status_code == 200
+
+
+def test_params(httpbin):
+    s = session()
+    r = _await(s.get(httpbin.url + "/get?a=1#frag", params={"b": "x y", "c": ["1", "2"]}))
+    assert r.json()["args"] == {"a": "1", "b": "x y", "c": ["1", "2"]}
+    assert _await(s.get(httpbin.url + "/get", params="raw=1")).json()["args"] == {"raw": "1"}
+
+
+def test_form_data(httpbin):
+    s = session()
+    r = _await(s.post(httpbin.url + "/post", data={"a": "1", "b": ["2", "3"]}))
+    assert r.json()["form"] == {"a": "1", "b": ["2", "3"]}
+    assert r.json()["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+    r = _await(s.post(httpbin.url + "/post", data=[("a", "1")], headers={"content-type": "text/plain"}))
+    assert r.json()["headers"]["Content-Type"] == "text/plain"
+
+
+def test_files(httpbin, tmp_path):
+    path = tmp_path / "upload.txt"
+    path.write_bytes(b"from disk")
+    s = session()
+    with open(path, "rb") as f:
+        files = {"disk": f, "inline": ("a.csv", "x,y", "text/csv"), "raw": ("b.bin", b"\x00\x01")}
+        r = _await(s.post(httpbin.url + "/post", data={"field": "value"}, files=files))
+    body = r.json()
+    assert body["form"] == {"field": "value"}
+    assert body["files"] == {"disk": "from disk", "inline": "x,y", "raw": "\x00\x01"}
+    assert body["headers"]["Content-Type"].startswith("multipart/form-data; boundary=")
+    with pytest.raises(ValueError):
+        _await(s.post(httpbin.url + "/post", json={}, files=files))
+
+
+def test_status_helpers(httpbin):
+    s = session()
+    r = _await(s.get(httpbin.url + "/get"))
+    assert (r.ok, r.reason) == (True, "OK")
+    assert r.elapsed.total_seconds() == r.total_time
+    r.raise_for_status()
+    r = _await(s.get(httpbin.url + "/status/404"))
+    assert (r.ok, r.reason) == (False, "NOT FOUND")
+    with pytest.raises(acurl.HTTPError) as e:
+        r.raise_for_status()
+    assert e.value.response is r
+    assert str(e.value).startswith("404 Client Error: NOT FOUND for url: ")

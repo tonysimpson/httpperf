@@ -86,20 +86,22 @@ Cookies always belong to the session, whatever the connection settings. See [doc
 - `await session.request(method, url, **kwargs)`.
 - `session.close()`: closes the session's connections once its requests finish. Later requests raise `RuntimeError`. `with` and `async with` call it on exit.
 - `session.cookies()`: the cookie jar as a dict.
-- `await session.get_cookie_list()`, `await session.add_cookie_list(cookies)`, `await session.erase_all_cookies()` and `await session.erase_session_cookies()`: work with `Cookie` objects.
+- `session.get_cookie_list()`, `session.add_cookie_list(cookies)`, `session.erase_all_cookies()` and `session.erase_session_cookies()`: work with `Cookie` objects. These are ordinary methods, not coroutines.
 - `session.set_response_callback(callback)`: called with each `Response`, including each hop of a redirect.
 
 ### Request arguments
 
 | Argument | Meaning |
 |---|---|
+| `params` | Query parameters: a dict or list of pairs (lists as values repeat the key), or a ready-made string. Added to any query already in the URL. |
 | `headers` | Dict of headers. |
 | `headers_list` | List of `"Name: value"` strings, for repeated headers. |
 | `cookies` | Dict of cookies to send with this request (added to the session jar). |
 | `cookie_list` | List of `Cookie` objects. |
 | `auth` | `(username, password)` for basic auth. |
-| `data` | Request body, `str` or `bytes`. |
+| `data` | Request body: `str` or `bytes` as is, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. |
 | `json` | Object to send as JSON, encoded compactly with the standard library. Sets `Content-Type: application/json` unless you set it. |
+| `files` | Dict (or list of pairs) of files to send as `multipart/form-data`, with any `data` dict as extra fields. A value is an open file, or `(filename, content)` or `(filename, content, content_type)`, where content is `bytes`, `str` or a file. Files are read into memory. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
 | `verify` | `True`, `False` or a CA bundle path, overriding the session's `verify`. |
 | `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
@@ -113,6 +115,10 @@ Failed transfers raise `acurl.RequestError` with curl's detailed error message, 
 | Attribute | Meaning |
 |---|---|
 | `status_code` | HTTP status. |
+| `ok` | `True` if the status is below 400. |
+| `reason` | Reason phrase from the status line, or the standard phrase for HTTP/2 and HTTP/3, which send none. |
+| `raise_for_status()` | Raises `acurl.HTTPError` (a `RequestError`, with the `response`) for 4xx and 5xx statuses. |
+| `elapsed` | `total_time` as a `timedelta`. |
 | `url` | Effective URL. |
 | `redirect_url` | Location of a redirect, or `None`. |
 | `history` | Earlier responses in a redirect chain. |

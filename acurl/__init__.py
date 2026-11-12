@@ -1,9 +1,12 @@
 import asyncio
 import collections.abc
+import datetime
+import http
 import json as _json
+import os
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from acurl import _acurl
 
@@ -18,6 +21,12 @@ class RequestError(Exception):
 
 class Timeout(RequestError):
     pass
+
+
+class HTTPError(RequestError):
+    def __init__(self, message, response):
+        super().__init__(message)
+        self.response = response
 
 
 CURLE_OPERATION_TIMEDOUT = 28
@@ -133,6 +142,48 @@ def parse_cookie_string(cookie_string):
 
 def parse_cookie_list_string(cookie_list_string):
     return [parse_cookie_string(line) for line in cookie_list_string.splitlines() if line.strip()]
+
+
+def _has_header(name, headers, headers_list):
+    name = name.lower()
+    if headers and any(key.lower() == name for key in headers):
+        return True
+    return bool(headers_list) and any(line.partition(":")[0].strip().lower() == name for line in headers_list)
+
+
+def _form_quote(value):
+    return value.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A").encode("utf-8")
+
+
+def _as_bytes(value):
+    if hasattr(value, "read"):
+        value = value.read()
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    return str(value).encode("utf-8")
+
+
+def _multipart(data, files):
+    boundary = os.urandom(16).hex().encode()
+    parts = []
+    for name, value in data.items() if isinstance(data, dict) else data or ():
+        parts += [b"--", boundary, b'\r\nContent-Disposition: form-data; name="', _form_quote(name), b'"\r\n\r\n']
+        parts += [_as_bytes(value), b"\r\n"]
+    for name, value in files.items() if isinstance(files, dict) else files:
+        content_type = "application/octet-stream"
+        if isinstance(value, tuple):
+            filename, content = value[0], value[1]
+            if len(value) > 2:
+                content_type = value[2]
+        else:
+            filename, content = os.path.basename(getattr(value, "name", None) or name), value
+        parts += [b"--", boundary, b'\r\nContent-Disposition: form-data; name="', _form_quote(name)]
+        parts += [b'"; filename="', _form_quote(filename), b'"\r\nContent-Type: ', content_type.encode("latin-1")]
+        parts += [b"\r\n\r\n", _as_bytes(content), b"\r\n"]
+    parts += [b"--", boundary, b"--\r\n"]
+    return b"".join(parts), "multipart/form-data; boundary=" + boundary.decode()
 
 
 def session_cookie_for_url(
@@ -271,6 +322,30 @@ class Response:
     response_code = status_code
 
     @property
+    def ok(self):
+        return self.status_code < 400
+
+    @property
+    def reason(self):
+        status_line = self._final_header_block().partition("\r\n")[0]
+        reason = status_line.split(" ", 2)[2].strip() if status_line.count(" ") >= 2 else ""
+        if not reason:
+            try:
+                reason = http.HTTPStatus(self.status_code).phrase
+            except ValueError:
+                pass
+        return reason
+
+    @property
+    def elapsed(self):
+        return datetime.timedelta(seconds=self.total_time)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            kind = "Client" if self.status_code < 500 else "Server"
+            raise HTTPError("%d %s Error: %s for url: %s" % (self.status_code, kind, self.reason, self.url), self)
+
+    @property
     def url(self):
         return self._resp.get_effective_url()
 
@@ -392,12 +467,15 @@ class Response:
     @property
     def headers_tuple(self):
         if not hasattr(self, "_headers_tuple"):
-            blocks = [b for b in self.header.split("\r\n\r\n") if b]
-            block = blocks[-1] if blocks else ""
+            block = self._final_header_block()
             self._headers_tuple = tuple(
                 [(name, value.strip()) for name, _, value in [line.partition(":") for line in block.split("\r\n")[1:]]]
             )
         return self._headers_tuple
+
+    def _final_header_block(self):
+        blocks = [b for b in self.header.split("\r\n\r\n") if b]
+        return blocks[-1] if blocks else ""
 
     @property
     def header(self):
@@ -481,6 +559,7 @@ class Session:
         self,
         method,
         url,
+        params=None,
         headers=None,
         headers_list=None,
         cookies=None,
@@ -488,6 +567,7 @@ class Session:
         auth=None,
         data=None,
         json=None,
+        files=None,
         allow_redirects=True,
         max_redirects=5,
         cert=None,
@@ -506,19 +586,25 @@ class Session:
                 options["timeout"] = timeout
             if connect_timeout is not None:
                 options["connect_timeout"] = connect_timeout
+        if params:
+            base, hash_, fragment = url.partition("#")
+            query = params if isinstance(params, str) else urlencode(params, doseq=True)
+            url = base + ("&" if "?" in base else "?") + query + hash_ + fragment
+
+        content_type = None
         if json is not None:
-            if data is not None:
-                raise ValueError("use only one or none of data or json")
+            if data is not None or files is not None:
+                raise ValueError("json cannot be combined with data or files")
             data = _json_encoder.encode(json)
-            content_type_set = False
-            if headers and "Content-Type" in headers:
-                content_type_set = True
-            elif headers_list:
-                content_type_set = any(1 for i in headers_list if i.startswith("Content-Type: "))
-            if not content_type_set:
-                if headers_list is None:
-                    headers_list = []
-                headers_list.append("Content-Type: application/json")
+            content_type = "application/json"
+        elif files is not None:
+            data, content_type = _multipart(data, files)
+        elif isinstance(data, (dict, list, tuple)):
+            data = urlencode(data, doseq=True)
+            content_type = "application/x-www-form-urlencoded"
+        if content_type is not None and not _has_header("content-type", headers, headers_list):
+            headers_list = list(headers_list) if headers_list else []
+            headers_list.append("Content-Type: " + content_type)
 
         if headers:
             if headers_list is None:
@@ -611,16 +697,16 @@ class Session:
             return redir_response
         return response
 
-    async def erase_all_cookies(self):
+    def erase_all_cookies(self):
         self._session.apply_cookielist(("ALL",))
 
-    async def erase_session_cookies(self):
+    def erase_session_cookies(self):
         self._session.apply_cookielist(("SESS",))
 
-    async def get_cookie_list(self):
+    def get_cookie_list(self):
         return [parse_cookie_string(cookie) for cookie in self._session.get_cookielist()]
 
-    async def add_cookie_list(self, cookie_list):
+    def add_cookie_list(self, cookie_list):
         self._session.apply_cookielist(tuple(c.format() for c in cookie_list))
 
 
