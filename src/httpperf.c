@@ -567,22 +567,13 @@ static bool slot_free(Share *share, HostSlot *h) {
     return !share->max_connections || share->connections < share->max_connections;
 }
 
-static void slot_acquire(Share *share, HostSlot *h) {
-    if (!h->multiplexed || h->active == 0) {
-        share->connections++;
-    }
-    h->active++;
-}
+static long host_usage(HostSlot *h) { return h->multiplexed ? h->active > 0 : h->active; }
 
-static void slot_release(Share *share, HostSlot *h, bool multiplexed) {
-    if (multiplexed && !h->multiplexed) {
-        h->multiplexed = true;
-        share->connections -= h->active - 1;
-    }
-    h->active--;
-    if (!h->multiplexed || h->active == 0) {
-        share->connections--;
-    }
+static void host_update(Share *share, HostSlot *h, long delta, bool multiplexed) {
+    share->connections -= host_usage(h);
+    h->active += delta;
+    h->multiplexed = multiplexed;
+    share->connections += host_usage(h);
 }
 
 static PyObject *limiter_state(Share *share) {
@@ -635,7 +626,7 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
             rd->next_waiting = NULL;
             rd->waiting = false;
             rd->queue_time = monotonic_time() - rd->queued_at;
-            slot_acquire(share, rd->slot);
+            host_update(share, rd->slot, 1, rd->slot->multiplexed);
             add_transfer(loop, rd);
             started = true;
             break;
@@ -649,11 +640,13 @@ static void release_request(EventLoop *loop, AcRequestData *rd) {
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
     curl_easy_setopt(rd->curl, CURLOPT_ERRORBUFFER, NULL);
     if (rd->slot != NULL) {
-        long version = 0;
+        bool multiplexed = rd->slot->multiplexed;
         if (rd->result == CURLE_OK) {
+            long version = 0;
             curl_easy_getinfo(rd->curl, CURLINFO_HTTP_VERSION, &version);
+            multiplexed = version == CURL_HTTP_VERSION_2_0 || version == CURL_HTTP_VERSION_3;
         }
-        slot_release(rd->limiter, rd->slot, version == CURL_HTTP_VERSION_2_0 || version == CURL_HTTP_VERSION_3);
+        host_update(rd->limiter, rd->slot, -1, multiplexed);
         rd->slot = NULL;
         dispatch_waiting(loop, rd->limiter);
     }
@@ -910,7 +903,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         rd->limiter->waiting_tail = rd;
     } else {
         if (rd->slot != NULL) {
-            slot_acquire(rd->limiter, rd->slot);
+            host_update(rd->limiter, rd->slot, 1, rd->slot->multiplexed);
         }
         add_transfer(loop, rd);
     }
