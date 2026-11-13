@@ -144,3 +144,42 @@ def test_cancel_one_stream_keeps_the_connection(h2_url, version):
     assert cancelled == [True] * 3
     assert [r.status_code for r in responses] == [200] * 4
     assert sum(r.connect_time > 0 for r in responses) == 0
+
+
+def limiter_host(state):
+    (host,) = state["hosts"].values()
+    usage = (1 if host["active"] else 0) if host["multiplexed"] else host["active"]
+    assert state["connections"] == usage
+    return host
+
+
+@pytest.mark.parametrize("version", [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2"])
+def test_limiter_counts_a_multiplexed_host_once(h2_url, version):
+    async def main(el):
+        s = httpperf.Session(engine=el, connections="session", http_version=version, max_host_connections=2)
+        await s.get(h2_url)
+        tasks = [asyncio.ensure_future(s.get(h2_url + "slow")) for _ in range(6)]
+        await asyncio.sleep(0.3)
+        busy = limiter_host(s._session._limiter_state())
+        await asyncio.gather(*tasks)
+        idle = limiter_host(s._session._limiter_state())
+        el.close()
+        return busy, idle
+
+    busy, idle = run(main)
+    assert busy == {"active": 6, "waiting": 0, "multiplexed": True}
+    assert idle == {"active": 0, "waiting": 0, "multiplexed": True}
+
+
+def test_limiter_keeps_multiplexing_after_a_failure(h2_url):
+    async def main(el):
+        s = httpperf.Session(engine=el, connections="session", max_host_connections=2)
+        await s.get(h2_url)
+        with pytest.raises(httpperf.Timeout):
+            await s.get(h2_url + "slow", timeout=0.1)
+        state = s._session._limiter_state()
+        s.close()
+        el.close()
+        return state
+
+    assert limiter_host(run(main))["multiplexed"] is True
