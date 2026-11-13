@@ -33,6 +33,21 @@ sudo apt install libcurl4-openssl-dev   # Debian/Ubuntu
 pip install httpperf
 ```
 
+For HTTP/3, skip the wheel and build against a libcurl that has it. `curl -V` lists `HTTP3` under Features when it does; Debian 13's libcurl has it.
+
+```sh
+sudo apt install libcurl4-openssl-dev
+pip install --no-binary httpperf httpperf
+```
+
+With a libcurl you built yourself, point the build at it and make sure it is found at run time:
+
+```sh
+CFLAGS=-I$PREFIX/include LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib" pip install --no-binary httpperf httpperf
+```
+
+A session with `http_version="HTTP/3"` raises `ValueError` if the libcurl in use lacks HTTP/3.
+
 ## Quick start
 
 ```python
