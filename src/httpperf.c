@@ -85,7 +85,13 @@ typedef struct {
 typedef struct HostSlot {
     char *key;
     long active;
+    long waiting;
     bool multiplexed;
+    bool ready;
+    struct AcRequestData *waiting_head;
+    struct AcRequestData *waiting_tail;
+    struct HostSlot *prev_ready;
+    struct HostSlot *next_ready;
     struct HostSlot *next;
 } HostSlot;
 
@@ -97,8 +103,8 @@ typedef struct Share {
     long max_connections;
     long connections;
     HostSlot *hosts;
-    struct AcRequestData *waiting_head;
-    struct AcRequestData *waiting_tail;
+    HostSlot *ready_head;
+    HostSlot *ready_tail;
     bool dispatching;
 } Share;
 
@@ -281,6 +287,7 @@ typedef struct AcRequestData {
     Buffer header;
     Buffer body;
     HostSlot *slot;
+    struct AcRequestData *prev_waiting;
     struct AcRequestData *next_waiting;
     struct AcRequestData *next_unsent;
     struct AcRequestData *live_prev;
@@ -585,11 +592,7 @@ static PyObject *limiter_state(Share *share) {
         return NULL;
     }
     for (HostSlot *h = share->hosts; h != NULL; h = h->next) {
-        long waiting = 0;
-        for (AcRequestData *rd = share->waiting_head; rd != NULL; rd = rd->next_waiting) {
-            waiting += rd->slot == h;
-        }
-        PyObject *state = Py_BuildValue("{s:l,s:l,s:O}", "active", h->active, "waiting", waiting, "multiplexed",
+        PyObject *state = Py_BuildValue("{s:l,s:l,s:O}", "active", h->active, "waiting", h->waiting, "multiplexed",
                                         h->multiplexed ? Py_True : Py_False);
         if (state == NULL || PyDict_SetItemString(hosts, h->key, state) == -1) {
             Py_XDECREF(state);
@@ -601,36 +604,90 @@ static PyObject *limiter_state(Share *share) {
     return Py_BuildValue("{s:l,s:N}", "connections", share->connections, "hosts", hosts);
 }
 
+static void ready_remove(Share *share, HostSlot *h) {
+    if (h->prev_ready != NULL) {
+        h->prev_ready->next_ready = h->next_ready;
+    } else {
+        share->ready_head = h->next_ready;
+    }
+    if (h->next_ready != NULL) {
+        h->next_ready->prev_ready = h->prev_ready;
+    } else {
+        share->ready_tail = h->prev_ready;
+    }
+    h->prev_ready = h->next_ready = NULL;
+    h->ready = false;
+}
+
+static void ready_append(Share *share, HostSlot *h) {
+    h->prev_ready = share->ready_tail;
+    if (share->ready_tail != NULL) {
+        share->ready_tail->next_ready = h;
+    } else {
+        share->ready_head = h;
+    }
+    share->ready_tail = h;
+    h->ready = true;
+}
+
+static void queue_push(Share *share, AcRequestData *rd) {
+    HostSlot *h = rd->slot;
+    rd->prev_waiting = h->waiting_tail;
+    if (h->waiting_tail != NULL) {
+        h->waiting_tail->next_waiting = rd;
+    } else {
+        h->waiting_head = rd;
+    }
+    h->waiting_tail = rd;
+    h->waiting++;
+    rd->waiting = true;
+    if (!h->ready) {
+        ready_append(share, h);
+    }
+}
+
+static void queue_remove(Share *share, AcRequestData *rd) {
+    HostSlot *h = rd->slot;
+    if (rd->prev_waiting != NULL) {
+        rd->prev_waiting->next_waiting = rd->next_waiting;
+    } else {
+        h->waiting_head = rd->next_waiting;
+    }
+    if (rd->next_waiting != NULL) {
+        rd->next_waiting->prev_waiting = rd->prev_waiting;
+    } else {
+        h->waiting_tail = rd->prev_waiting;
+    }
+    rd->prev_waiting = rd->next_waiting = NULL;
+    h->waiting--;
+    rd->waiting = false;
+    if (h->waiting_head == NULL) {
+        ready_remove(share, h);
+    }
+}
+
 static void dispatch_waiting(EventLoop *loop, Share *share) {
     if (share->dispatching) {
         return;
     }
     share_incref(share);
     share->dispatching = true;
-    bool started = true;
-    while (started) {
-        started = false;
-        AcRequestData *prev = NULL;
-        for (AcRequestData *rd = share->waiting_head; rd != NULL; prev = rd, rd = rd->next_waiting) {
-            if (!slot_free(share, rd->slot)) {
-                continue;
-            }
-            if (prev != NULL) {
-                prev->next_waiting = rd->next_waiting;
-            } else {
-                share->waiting_head = rd->next_waiting;
-            }
-            if (share->waiting_tail == rd) {
-                share->waiting_tail = prev;
-            }
-            rd->next_waiting = NULL;
-            rd->waiting = false;
-            rd->queue_time = monotonic_time() - rd->queued_at;
-            host_update(share, rd->slot, 1, rd->slot->multiplexed);
-            add_transfer(loop, rd);
-            started = true;
-            break;
+    HostSlot *h = share->ready_head;
+    while (h != NULL) {
+        if (!slot_free(share, h)) {
+            h = h->next_ready;
+            continue;
         }
+        AcRequestData *rd = h->waiting_head;
+        queue_remove(share, rd);
+        if (h->ready) {
+            ready_remove(share, h);
+            ready_append(share, h);
+        }
+        rd->queue_time = monotonic_time() - rd->queued_at;
+        host_update(share, h, 1, h->multiplexed);
+        add_transfer(loop, rd);
+        h = share->ready_head;
     }
     share->dispatching = false;
     share_decref(share);
@@ -689,19 +746,7 @@ static void cancel_request(EventLoop *loop, AcRequestData *rd) {
         return;
     }
     if (rd->waiting) {
-        AcRequestData *prev = NULL;
-        for (AcRequestData *w = rd->limiter->waiting_head; w != rd; prev = w, w = w->next_waiting) {
-        }
-        if (prev != NULL) {
-            prev->next_waiting = rd->next_waiting;
-        } else {
-            rd->limiter->waiting_head = rd->next_waiting;
-        }
-        if (rd->limiter->waiting_tail == rd) {
-            rd->limiter->waiting_tail = prev;
-        }
-        rd->next_waiting = NULL;
-        rd->waiting = false;
+        queue_remove(rd->limiter, rd);
         rd->slot = NULL;
     } else {
         check_multi(loop, curl_multi_remove_handle(loop->multi, rd->curl));
@@ -894,13 +939,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     rd->cookies_str = NULL;
     if (rd->slot != NULL && !slot_free(rd->limiter, rd->slot)) {
         rd->queued_at = monotonic_time();
-        rd->waiting = true;
-        if (rd->limiter->waiting_tail != NULL) {
-            rd->limiter->waiting_tail->next_waiting = rd;
-        } else {
-            rd->limiter->waiting_head = rd;
-        }
-        rd->limiter->waiting_tail = rd;
+        queue_push(rd->limiter, rd);
     } else {
         if (rd->slot != NULL) {
             host_update(rd->limiter, rd->slot, 1, rd->slot->multiplexed);
@@ -1179,8 +1218,8 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
         self->live_head = rd->live_next;
         PyList_Append(futures, rd->future);
         Py_DECREF(rd->future);
-        if (rd->slot != NULL) {
-            rd->limiter->waiting_head = rd->limiter->waiting_tail = NULL;
+        if (rd->waiting) {
+            queue_remove(rd->limiter, rd);
         }
         if (rd->curl != NULL) {
             curl_easy_cleanup(rd->curl);
