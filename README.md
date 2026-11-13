@@ -24,23 +24,16 @@ Bytes are read off the wire as they arrive, whatever Python is doing. If Python 
 pip install httpperf
 ```
 
-Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 but not HTTP/3.
+Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 and HTTP/3.
 
-Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs its development headers and a C compiler. That libcurl decides whether HTTP/3 is available.
+Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs its development headers and a C compiler. That libcurl decides whether HTTP/3 is available: `curl -V` lists `HTTP3` under Features when it does.
 
 ```sh
 sudo apt install libcurl4-openssl-dev   # Debian/Ubuntu
 pip install httpperf
 ```
 
-For HTTP/3, skip the wheel and build against a libcurl that has it. `curl -V` lists `HTTP3` under Features when it does; Debian 13's libcurl has it.
-
-```sh
-sudo apt install libcurl4-openssl-dev
-pip install --no-binary httpperf httpperf
-```
-
-With a libcurl you built yourself, point the build at it and make sure it is found at run time:
+To build against your own libcurl even where a wheel exists, skip the wheel, point the build at it and make sure it is found at run time:
 
 ```sh
 CFLAGS=-I$PREFIX/include LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib" pip install --no-binary httpperf httpperf
