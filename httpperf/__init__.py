@@ -375,6 +375,9 @@ class Headers(collections.abc.Mapping):
         return repr(dict(self.items()))
 
 
+_UNSET = object()
+
+
 class Response:
     __slots__ = (
         "_req",
@@ -399,6 +402,15 @@ class Response:
         self._resp = resp
         self._start_time = start_time
         self._end_time = end_time
+        self._redirect_url = _UNSET
+        self._prev = None
+        self._body = None
+        self._text = None
+        self._header = None
+        self._headers_tuple = None
+        self._headers = None
+        self._encoding = None
+        self._json = _UNSET
 
     @property
     def request(self):
@@ -440,7 +452,7 @@ class Response:
 
     @property
     def redirect_url(self):
-        if not hasattr(self, "_redirect_url"):
+        if self._redirect_url is _UNSET:
             self._redirect_url = self._resp.get_redirect_url()
         return self._redirect_url
 
@@ -517,51 +529,50 @@ class Response:
     @property
     def history(self):
         result = []
-        cur = getattr(self, "_prev", None)
+        cur = self._prev
         while cur is not None:
             result.append(cur)
-            cur = getattr(cur, "_prev", None)
+            cur = cur._prev
         result.reverse()
         return result
 
     @property
     def body(self):
-        if not hasattr(self, "_body"):
+        if self._body is None:
             self._body = self._resp.get_body()
         return self._body
 
     @property
     def encoding(self):
-        if not hasattr(self, "_encoding"):
+        if self._encoding is None:
             self._encoding = _encoding_from_content_type(self.headers.get("content-type"))
         return self._encoding
 
     @encoding.setter
     def encoding(self, encoding):
         self._encoding = encoding
-        if hasattr(self, "_text"):
-            del self._text
+        self._text = None
 
     @property
     def text(self):
-        if not hasattr(self, "_text"):
+        if self._text is None:
             self._text = self.body.decode(self.encoding)
         return self._text
 
     def json(self):
-        if not hasattr(self, "_json"):
+        if self._json is _UNSET:
             self._json = self._json_loads(self.body)
         return self._json
 
     @property
     def headers(self):
-        if not hasattr(self, "_headers"):
+        if self._headers is None:
             self._headers = Headers(self.headers_tuple)
         return self._headers
 
     @property
     def headers_tuple(self):
-        if not hasattr(self, "_headers_tuple"):
+        if self._headers_tuple is None:
             block = self._final_header_block()
             self._headers_tuple = tuple(
                 [(name, value.strip()) for name, _, value in [line.partition(":") for line in block.split("\r\n")[1:]]]
@@ -574,7 +585,7 @@ class Response:
 
     @property
     def header(self):
-        if not hasattr(self, "_header"):
+        if self._header is None:
             self._header = self._resp.get_header().decode("latin-1")
         return self._header
 
