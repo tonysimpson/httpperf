@@ -183,3 +183,19 @@ def test_limiter_keeps_multiplexing_after_a_failure(h2_url):
         return state
 
     assert limiter_host(run(main))["multiplexed"] is True
+
+
+def test_limiter_follows_a_host_back_to_http1(h2_url):
+    async def main(el):
+        engine = httpperf.Engine(max_host_connections=4)
+        h2 = httpperf.Session(engine=engine)
+        h1 = httpperf.Session(engine=engine, http_version="HTTP/1.1")
+        await h2.get(h2_url)
+        before = limiter_host(engine._ae_loop._limiter_state())
+        await h1.get(h2_url)
+        after = limiter_host(engine._ae_loop._limiter_state())
+        engine.close()
+        el.close()
+        return before["multiplexed"], after["multiplexed"]
+
+    assert run(main) == (True, False)
