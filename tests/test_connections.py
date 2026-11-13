@@ -276,3 +276,29 @@ def test_proxy_environment_is_read_per_session(url, monkeypatch):
     assert get(uppercase) == 200
     el.close()
     loop.close()
+
+
+def test_many_new_connections_while_responses_arrive(server):
+    async def run(engine):
+        busy = httpperf.Session(engine=engine)
+        done = False
+
+        async def traffic():
+            while not done:
+                assert (await busy.get(server.url + "/")).status_code == 200
+
+        workers = [asyncio.create_task(traffic()) for _ in range(20)]
+        sessions = [httpperf.Session(engine=engine, connections="session") for _ in range(350)]
+        responses = await asyncio.gather(*(s.get(server.url + "/") for s in sessions))
+        for s in sessions:
+            s.close()
+        assert [r.status_code for r in responses] == [200] * 350
+        done = True
+        await asyncio.gather(*workers)
+
+    async def main():
+        for _ in range(4):
+            async with httpperf.Engine() as engine:
+                await run(engine)
+
+    asyncio.run(main())

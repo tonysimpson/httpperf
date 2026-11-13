@@ -426,6 +426,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 				DEBUG_PRINT("fd=%d fe->mask=%d", fd, fe->mask);
                 rfired = 1;
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
+                fe = &eventLoop->events[fd];
             }
             if (fe->mask & mask & AE_WRITABLE) {
                 if (!rfired || fe->wfileProc != fe->rfileProc)

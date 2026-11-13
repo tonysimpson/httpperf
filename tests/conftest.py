@@ -36,7 +36,7 @@ class Server:
             def log_message(self, *args):
                 pass
 
-        http_server = type("HTTPServer", (http.server.ThreadingHTTPServer,), {"request_queue_size": 256})
+        http_server = type("HTTPServer", (http.server.ThreadingHTTPServer,), {"request_queue_size": 1024})
         self.httpd = http_server(("127.0.0.1", 0), Handler)
         self.httpd.daemon_threads = True
         self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
