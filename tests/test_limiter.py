@@ -103,3 +103,25 @@ def test_cancelled_requests_release_their_slots(server):
 def test_no_limiter_without_limits():
     assert httpperf.Session()._session._limiter_state() is None
     assert httpperf.Engine()._ae_loop._limiter_state() is None
+
+
+def test_hosts_take_turns_under_the_total_limit(server):
+    other = server.url.replace("127.0.0.1", "localhost")
+
+    async def main():
+        async with httpperf.Engine(max_total_connections=1) as engine:
+            state = engine._ae_loop._limiter_state
+            async with httpperf.Session(engine=engine, http_version="HTTP/1.1") as s:
+                first = asyncio.create_task(s.get(server.url + "/slow"))
+                await wait_until(state, lambda st: st["connections"] == 1)
+                tasks = [asyncio.create_task(s.get(server.url + "/a%d" % i)) for i in range(3)]
+                await wait_until(state, lambda st: st["hosts"][key(server.url)]["waiting"] == 3)
+                tasks += [asyncio.create_task(s.get(other + "/b%d" % i)) for i in range(3)]
+                await wait_until(
+                    state, lambda st: key(other) in st["hosts"] and st["hosts"][key(other)]["waiting"] == 3
+                )
+                server.release.set()
+                await asyncio.gather(first, *tasks)
+
+    asyncio.run(main())
+    assert server.started == ["/slow", "/a0", "/b0", "/a1", "/b1", "/a2", "/b2"]
