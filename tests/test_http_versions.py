@@ -15,7 +15,7 @@ import httpperf
 async def app(scope, receive, send):
     if scope["type"] != "http":
         return
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(1 if scope["path"] == "/slow" else 0.05)
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
     await send({"type": "http.response.body", "body": scope["http_version"].encode()})
 
@@ -125,3 +125,22 @@ def test_session_host_limit_with_multiplexing(h2_url):
     assert sum(r.connect_time > 0 for r in first + second) == 1
     assert sum(r.queue_time > 0 for r in first) == 4
     assert all(r.queue_time == 0 for r in second)
+
+
+@pytest.mark.parametrize("version", [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2"])
+def test_cancel_one_stream_keeps_the_connection(h2_url, version):
+    async def main(el):
+        s = httpperf.Session(engine=el, connections="session", http_version=version)
+        tasks = [asyncio.ensure_future(s.get(h2_url + "slow")) for _ in range(6)]
+        await asyncio.sleep(0.3)
+        for task in tasks[::2]:
+            task.cancel()
+        kept = await asyncio.gather(*tasks[1::2])
+        after = await s.get(h2_url)
+        el.close()
+        return kept + [after], [t.cancelled() for t in tasks[::2]]
+
+    responses, cancelled = run(main)
+    assert cancelled == [True] * 3
+    assert [r.status_code for r in responses] == [200] * 4
+    assert sum(r.connect_time > 0 for r in responses) == 0
