@@ -123,7 +123,7 @@ An engine binds to the asyncio loop running when it is first used, and so does a
 | `cookies` | Dict of cookies to send with this request (added to the session jar). |
 | `cookie_list` | List of `Cookie` objects. |
 | `auth` | `(username, password)` for basic auth. |
-| `data` | Request body: `str` or `bytes` as is, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. |
+| `data` | Request body: `str` or `bytes` as is, with no `Content-Type` unless you set one, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. |
 | `json` | Object to send as JSON, encoded with the session's `json_dumps`. Sets `Content-Type: application/json` unless you set it. |
 | `files` | Dict (or list of pairs) of files to send as `multipart/form-data`, with any `data` dict as extra fields. A value is an open file, or `(filename, content)` or `(filename, content, content_type)`, where content is `bytes`, `str` or a file. Files are read into memory. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
@@ -152,7 +152,7 @@ Failed transfers raise `httpperf.RequestError` with curl's detailed error messag
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |
 | `json()` | Body parsed with the session's `json_loads`, once. By default the standard library, always as UTF-8, as RFC 8259 requires. |
-| `cookies`, `cookielist` | The session's cookie jar at the time you read it (not only the cookies this response set). Empty once the session is closed. |
+| `cookies`, `cookielist` | The cookies this response set, from its `Set-Cookie` headers, as a dict or as `Cookie` objects. The session's whole jar is `session.cookies()`. |
 | `primary_ip` | Address connected to. |
 | `upload_size`, `download_size` | Bytes, as integers. |
 | `request` | The `Request`: `method`, `url`, `headers`, `cookies`, `auth`, `data`. |

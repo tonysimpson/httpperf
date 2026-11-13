@@ -1,6 +1,7 @@
 import asyncio
 import collections.abc
 import datetime
+import email.utils
 import http
 import json as _json
 import os
@@ -12,6 +13,7 @@ import weakref
 from urllib.parse import urlencode, urlparse
 
 from httpperf import _httpperf
+from httpperf.version import __version__ as __version__
 
 _json_dumps = _json.JSONEncoder(separators=(",", ":"), check_circular=False).encode
 
@@ -242,6 +244,47 @@ def _encoding_from_content_type(content_type):
     return "latin1"
 
 
+def _cookie_expiration(attrs):
+    if "max-age" in attrs:
+        try:
+            max_age = int(attrs["max-age"])
+        except ValueError:
+            return 0
+        return int(time.time()) + max_age if max_age > 0 else 1
+    if "expires" in attrs:
+        try:
+            return max(int(email.utils.parsedate_to_datetime(attrs["expires"]).timestamp()), 1)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return 0
+    return 0
+
+
+def _parse_set_cookie(value, url):
+    pair, *rest = value.split(";")
+    name, sep, cookie_value = pair.partition("=")
+    if not sep or not name.strip():
+        return None
+    attrs = {}
+    for attr in rest:
+        key, _, attr_value = attr.partition("=")
+        attrs[key.strip().lower()] = attr_value.strip()
+    parsed = urlparse(url)
+    domain = attrs.get("domain", "").lstrip(".")
+    path = attrs.get("path", "")
+    if not path.startswith("/"):
+        path = parsed.path.rpartition("/")[0] or "/"
+    return Cookie(
+        "httponly" in attrs,
+        "." + domain if domain else parsed.hostname,
+        bool(domain),
+        path,
+        "secure" in attrs,
+        _cookie_expiration(attrs),
+        name.strip(),
+        cookie_value.strip(),
+    )
+
+
 def _cookie_list_to_cookie_dict(cookie_list):
     return {cookie.name: cookie.value for cookie in cookie_list}
 
@@ -455,7 +498,9 @@ class Response:
 
     @property
     def cookielist(self):
-        return [parse_cookie_string(cookie) for cookie in self._resp.get_cookielist()]
+        url = self.url
+        cookies = (_parse_set_cookie(v, url) for name, v in self.headers_tuple if name.lower() == "set-cookie")
+        return [cookie for cookie in cookies if cookie is not None]
 
     @property
     def cookies(self):

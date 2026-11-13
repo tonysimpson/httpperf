@@ -39,7 +39,8 @@ def test_get(httpbin):
 def test_cookies(httpbin):
     s = session()
     r = _await(s.get(httpbin.url + "/cookies/set?name=value"))
-    assert r.cookies == {"name": "value"}
+    assert r.history[0].cookies == {"name": "value"}
+    assert r.cookies == {}
 
 
 def test_session_cookies(httpbin):
@@ -57,9 +58,9 @@ def test_session_cookies(httpbin):
 
 def test_set_cookies(httpbin):
     s = session()
-    r = _await(s.get(httpbin.url + "/cookies/set?name=value"))
-    r = _await(s.get(httpbin.url + "/cookies/set?name2=value", cookies={"name3": "value"}))
-    assert r.cookies == {"name": "value", "name2": "value", "name3": "value"}
+    _await(s.get(httpbin.url + "/cookies/set?name=value"))
+    _await(s.get(httpbin.url + "/cookies/set?name2=value", cookies={"name3": "value"}))
+    assert s.cookies() == {"name": "value", "name2": "value", "name3": "value"}
 
 
 def test_add_and_erase_session_cookies(httpbin):

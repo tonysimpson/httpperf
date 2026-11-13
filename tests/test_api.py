@@ -1,11 +1,12 @@
 import asyncio
 import datetime
 import json
+import time
 
 import pytest
 
 import httpperf
-from httpperf.version import __version__
+from httpperf import version
 
 
 def call(method, url, **kwargs):
@@ -25,7 +26,7 @@ def with_session(fn):
 
 
 def test_version():
-    assert isinstance(__version__, str)
+    assert httpperf.__version__ == version.__version__
 
 
 @pytest.mark.parametrize("method", ["get", "put", "patch", "post", "delete"])
@@ -182,6 +183,19 @@ def test_data(httpbin, data, form, raw):
     assert body["data"] == raw
 
 
+@pytest.mark.parametrize("data", ["text", b"bytes", ""])
+def test_raw_data_has_no_content_type(httpbin, data):
+    body = call("post", httpbin.url + "/anything", data=data).json()
+    assert "Content-Type" not in body["headers"]
+    assert body["data"] == (data.decode() if isinstance(data, bytes) else data)
+
+
+@pytest.mark.parametrize("header", ["content-type: text/plain", "Content-Type:text/plain", "CONTENT-TYPE:  text/plain"])
+def test_raw_data_keeps_a_set_content_type(httpbin, header):
+    body = call("post", httpbin.url + "/anything", data="x", headers_list=[header]).json()
+    assert body["headers"]["Content-Type"] == "text/plain"
+
+
 def test_json_kwarg(httpbin):
     body = call("post", httpbin.url + "/post", json={"a": [1, None]}).json()
     assert body["json"] == {"a": [1, None]}
@@ -318,11 +332,59 @@ def test_upload_size(httpbin):
 
 
 def test_response_cookies(httpbin):
-    async def main(s):
-        r = await s.get(httpbin.url + "/cookies/set", params={"a": "1"}, allow_redirects=False)
-        return r.status_code, r.cookies, [c.name for c in r.cookielist]
+    r = call("get", httpbin.url + "/cookies/set", params={"a": "1"})
+    assert r.history[0].cookies == {"a": "1"}
+    assert r.cookies == {}
+    assert r.history[0].cookielist[0].format() == "127.0.0.1\tFALSE\t/\tFALSE\t0\ta\t1"
 
-    assert with_session(main) == (302, {"a": "1"}, ["a"])
+
+def test_response_cookies_are_only_this_responses(httpbin):
+    async def main(s):
+        await s.get(httpbin.url + "/cookies/set", params={"a": "1"})
+        r = await s.get(httpbin.url + "/response-headers", params={"Set-Cookie": "b=2"})
+        return r.cookies, s.cookies()
+
+    assert with_session(main) == ({"b": "2"}, {"a": "1", "b": "2"})
+
+
+def test_response_cookie_attributes(httpbin):
+    now = time.time()
+    r = call(
+        "get",
+        httpbin.url + "/response-headers",
+        params=[
+            ("Set-Cookie", "plain=1"),
+            ("Set-Cookie", "full=2; Domain=.example.com; Path=/p; Secure; HttpOnly; Max-Age=60"),
+            ("Set-Cookie", "dated=3; Expires=Wed, 21 Oct 2037 07:28:00 GMT"),
+            ("Set-Cookie", "gone=4; Max-Age=0"),
+            ("Set-Cookie", "empty="),
+            ("Set-Cookie", "invalid"),
+        ],
+    )
+    cookies = {c.name: c for c in r.cookielist}
+    assert list(cookies) == ["plain", "full", "dated", "gone", "empty"]
+    plain = cookies["plain"]
+    assert (plain.domain, plain.include_subdomains, plain.path, plain.is_secure, plain.http_only) == (
+        "127.0.0.1",
+        False,
+        "/",
+        False,
+        False,
+    )
+    assert plain.expiration == 0 and not plain.has_expired
+    full = cookies["full"]
+    assert (full.domain, full.include_subdomains, full.path, full.is_secure, full.http_only) == (
+        ".example.com",
+        True,
+        "/p",
+        True,
+        True,
+    )
+    assert now + 59 <= full.expiration <= now + 62
+    assert cookies["dated"].expiration == 2139722880
+    assert cookies["gone"].has_expired
+    assert cookies["empty"].value == ""
+    assert r.cookies == {"plain": "1", "full": "2", "dated": "3", "gone": "4", "empty": ""}
 
 
 def test_response_callback(httpbin):
@@ -469,3 +531,12 @@ def test_exceptions():
     assert httpperf.RequestError("m").code is None
     assert httpperf.RequestError("m", 7).code == 7
     assert httpperf.HTTPError("m", "resp").response == "resp"
+
+
+@pytest.mark.parametrize(
+    "url, path",
+    [("http://h/a/b/c", "/a/b"), ("http://h/a", "/"), ("http://h", "/"), ("http://h/a/", "/a")],
+)
+def test_response_cookie_default_path(url, path):
+    assert httpperf._parse_set_cookie("n=v", url).path == path
+    assert httpperf._parse_set_cookie("n=v; Path=relative", url).path == path

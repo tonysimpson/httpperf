@@ -424,8 +424,6 @@ static PyObject *session_cookielist(Session *session) {
     return list;
 }
 
-static PyObject *Response_get_cookielist(Response *self, PyObject *args) { return session_cookielist(self->session); }
-
 static PyMethodDef Response_methods[] = {
     {"get_effective_url", (PyCFunction)Response_get_effective_url, METH_NOARGS, ""},
     {"get_response_code", (PyCFunction)Response_get_response_code, METH_NOARGS, ""},
@@ -448,7 +446,6 @@ static PyMethodDef Response_methods[] = {
     {"get_http_version", (PyCFunction)Response_get_http_version, METH_NOARGS, "Get the HTTP version used"},
     {"get_queue_time", (PyCFunction)Response_get_queue_time, METH_NOARGS,
      "Get the time spent waiting for a connection"},
-    {"get_cookielist", (PyCFunction)Response_get_cookielist, METH_NOARGS, ""},
     {"get_redirect_url", (PyCFunction)Response_get_redirect_url, METH_NOARGS, "Get the redirect URL or None"},
     {"get_header", (PyCFunction)Response_get_header, METH_NOARGS, "Get the header"},
     {"get_body", (PyCFunction)Response_get_body, METH_NOARGS, "Get the body"},
@@ -1452,6 +1449,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     REQUEST_TRACE_PRINT("Session_request", rd);
     rd->timeout_ms = timeout_ms;
     rd->connect_timeout_ms = connect_timeout_ms;
+    bool has_content_type = false;
     if (headers != Py_None) {
         if (!PyTuple_CheckExact(headers)) {
             PyErr_SetString(PyExc_ValueError, "headers should be a tuple of strings or None");
@@ -1466,10 +1464,18 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
             if (header == NULL) {
                 goto error_cleanup;
             }
+            if (strncasecmp(header, "content-type", 12) == 0 && strchr(":; \t", header[12]) != NULL) {
+                has_content_type = true;
+            }
             struct curl_slist *appended = curl_slist_append(rd->headers, header);
             CHECK_ALLOC(appended);
             rd->headers = appended;
         }
+    }
+    if (req_data_buf != NULL && !has_content_type) {
+        struct curl_slist *appended = curl_slist_append(rd->headers, "Content-Type:");
+        CHECK_ALLOC(appended);
+        rd->headers = appended;
     }
     if (auth != Py_None) {
         if (!PyTuple_CheckExact(auth) || PyTuple_GET_SIZE(auth) != 2 ||
