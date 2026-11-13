@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import gc
+import http.server
 import os
 import socket
 import subprocess
@@ -284,3 +285,42 @@ def test_default_engine_lasts_as_long_as_its_loop():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_cancelled_requests_do_not_strand_others():
+    release = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            release.wait(10)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/" % server.server_address[1]
+    errors = []
+
+    async def main():
+        asyncio.get_running_loop().set_exception_handler(lambda loop, context: errors.append(context))
+        async with httpperf.Session(http_version="HTTP/1.1") as session:
+            tasks = [asyncio.create_task(session.get(url)) for _ in range(10)]
+            await asyncio.sleep(0.2)
+            for task in tasks[::2]:
+                task.cancel()
+            release.set()
+            done, pending = await asyncio.wait(tasks[1::2], timeout=5)
+            await asyncio.sleep(0.1)
+            return [t.result().status_code for t in done], len(pending)
+
+    try:
+        assert asyncio.run(main()) == ([200] * 5, 0)
+        assert errors == []
+    finally:
+        server.shutdown()

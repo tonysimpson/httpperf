@@ -841,6 +841,8 @@ class Engine:
 
     def _complete(self):
         for error, response, future in self._ae_loop.get_completed():
+            if future.done():
+                continue
             if response is not None:
                 future.set_result(response)
             else:
