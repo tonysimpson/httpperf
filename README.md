@@ -77,7 +77,7 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 | `max_host_connections` | `0` | Per-session cap on connections per host. Needs `connections="session"` or `"none"`. |
 | `max_connections` | `0` | Per-session cap on connections in use. Needs `connections="session"` or `"none"`. |
 | `cert` | `None` | `(certfile, keyfile)` paths for a client certificate, used by every request unless the request overrides it. |
-| `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. |
+| `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. Prefer this to `asyncio.wait_for` or cancelling the task: a cancelled request still runs to the end in curl and holds its connection until then, while a timeout stops it. |
 | `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
 | `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA bundle: `SSL_CERT_FILE` if set, otherwise libcurl's own default, or the usual system locations if it has none. A path: check against that CA bundle. Requests can override it. |
 | `json_dumps` | `None` | Function that turns a `json=` argument into the request body (`str` or `bytes`). `None` means the engine's. |
