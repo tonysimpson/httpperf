@@ -573,10 +573,7 @@ class Response:
     @property
     def headers_tuple(self):
         if self._headers_tuple is None:
-            block = self._final_header_block()
-            self._headers_tuple = tuple(
-                [(name, value.strip()) for name, _, value in [line.partition(":") for line in block.split("\r\n")[1:]]]
-            )
+            self._headers_tuple = _httpperf.parse_headers(self._resp.get_header())
         return self._headers_tuple
 
     def _final_header_block(self):

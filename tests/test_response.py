@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 import httpperf
@@ -73,3 +75,37 @@ def test_headers():
     assert list(r.headers) == ["Content-Type", "X-Name", "X-Dup", "X-Tight"]
     assert r.headers.get("missing", "default") == "default"
     assert dict(r.headers) == {"Content-Type": "text/plain", "X-Name": "café", "X-Dup": "a, b", "X-Tight": "v"}
+
+
+def python_parse_headers(header):
+    blocks = [b for b in header.decode("latin-1").split("\r\n\r\n") if b]
+    block = blocks[-1] if blocks else ""
+    return tuple((name, value.strip()) for name, _, value in (line.partition(":") for line in block.split("\r\n")[1:]))
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        b"",
+        b"\r\n\r\n",
+        b"HTTP/1.1 200 OK",
+        b"HTTP/1.1 200 OK\r\n",
+        b"HTTP/1.1 200 OK\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n\r\n\r\nHTTP/1.1 204 No Content\r\nC:d\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nNo colon\r\n:\r\nA:\r\n x: folded\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nA: \t\x0b\x0c\x1c\x1f\x85\xa0 v \xa0\x85\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nA: b\rc\nd\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nA: b:c\r\n\r",
+    ],
+)
+def test_parse_headers_matches_python(header):
+    assert httpperf._httpperf.parse_headers(header) == python_parse_headers(header)
+
+
+def test_parse_headers_matches_python_on_random_input():
+    rng = random.Random(1)
+    alphabet = b"\r\n\r\n:: \t\x0b\x1c\x85\xa0aZ"
+    for _ in range(20000):
+        header = bytes(rng.choice(alphabet) for _ in range(rng.randrange(40)))
+        assert httpperf._httpperf.parse_headers(header) == python_parse_headers(header), header
