@@ -585,6 +585,31 @@ static void slot_release(Share *share, HostSlot *h, bool multiplexed) {
     }
 }
 
+static PyObject *limiter_state(Share *share) {
+    if (share == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject *hosts = PyDict_New();
+    if (hosts == NULL) {
+        return NULL;
+    }
+    for (HostSlot *h = share->hosts; h != NULL; h = h->next) {
+        long waiting = 0;
+        for (AcRequestData *rd = share->waiting_head; rd != NULL; rd = rd->next_waiting) {
+            waiting += rd->slot == h;
+        }
+        PyObject *state = Py_BuildValue("{s:l,s:l,s:O}", "active", h->active, "waiting", waiting, "multiplexed",
+                                        h->multiplexed ? Py_True : Py_False);
+        if (state == NULL || PyDict_SetItemString(hosts, h->key, state) == -1) {
+            Py_XDECREF(state);
+            Py_DECREF(hosts);
+            return NULL;
+        }
+        Py_DECREF(state);
+    }
+    return Py_BuildValue("{s:l,s:N}", "connections", share->connections, "hosts", hosts);
+}
+
 static void dispatch_waiting(EventLoop *loop, Share *share) {
     if (share->dispatching) {
         return;
@@ -1191,6 +1216,8 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
     return futures;
 }
 
+static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { return limiter_state(self->limiter); }
+
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
     ((EventLoop *)self)->closing = true;
     if (!pipe_write(((EventLoop *)self)->stop_write, "\0", 1)) {
@@ -1269,6 +1296,7 @@ static PyMethodDef EventLoop_methods[] = {
     {"main", (PyCFunction)EventLoop_main, METH_NOARGS, "Run the event loop"},
     {"abandon", (PyCFunction)EventLoop_abandon, METH_NOARGS, "Free requests in flight once stopped"},
     {"stop", EventLoop_stop, METH_NOARGS, "Stop the event loop"},
+    {"_limiter_state", (PyCFunction)EventLoop_limiter_state, METH_NOARGS, "The limiter's counts, for tests"},
     {"get_out_fd", Eventloop_get_out_fd, METH_NOARGS, "Get the outbound file dscriptor"},
     {"get_completed", Eventloop_get_completed, METH_NOARGS, "Get the user_object, response and error"},
     {NULL, NULL, 0, NULL}};
@@ -1659,6 +1687,11 @@ error_cleanup:
     return NULL;
 }
 
+static PyObject *Session_limiter_state(Session *self, PyObject *args) {
+    bool limited = self->shared != NULL && (self->shared->max_host_connections || self->shared->max_connections);
+    return limiter_state(limited ? self->shared : NULL);
+}
+
 static PyObject *Session_cancel(Session *self, PyObject *handle) {
     AcRequestData *rd = PyLong_AsVoidPtr(handle);
     if (rd == NULL) {
@@ -1739,6 +1772,7 @@ static PyMethodDef Session_methods[] = {
     {"get_cookielist", (PyCFunction)Session_get_cookielist, METH_NOARGS, "Get the session's cookies"},
     {"apply_cookielist", (PyCFunction)Session_apply_cookielist, METH_VARARGS, "Apply CURLOPT_COOKIELIST lines"},
     {"cancel", (PyCFunction)Session_cancel, METH_O, "Stop a request in flight"},
+    {"_limiter_state", (PyCFunction)Session_limiter_state, METH_NOARGS, "The limiter's counts, for tests"},
     {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
     {"attach", (PyCFunction)Session_attach, METH_VARARGS, "Attach the session to an EventLoop"},
     {NULL, NULL, 0, NULL}};
