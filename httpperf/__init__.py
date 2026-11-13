@@ -571,6 +571,16 @@ class Response:
         return self._header
 
 
+class _Future(asyncio.Future):
+    __slots__ = ("_session", "_handle")
+
+    def cancel(self, *args):
+        if not super().cancel(*args):
+            return False
+        self._session.cancel(self._handle)
+        return True
+
+
 class Session:
     def __init__(
         self,
@@ -747,8 +757,9 @@ class Session:
             self._session.attach(engine._ae_loop)
         if loop is not engine._loop():
             engine._bind(loop)
-        future = loop.create_future()
-        self._session.request(
+        future = _Future(loop=loop)
+        future._session = self._session
+        future._handle = self._session.request(
             future,
             method,
             url,

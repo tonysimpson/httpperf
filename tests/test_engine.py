@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 
 import pytest
 
@@ -238,15 +239,16 @@ def test_close_with_requests_in_flight_warns(silent_url):
     asyncio.run(main())
 
 
-def test_dropped_loop_with_requests_in_flight_frees_them(silent_url):
+def test_dropped_loop_after_cancelling_does_not_warn(silent_url):
     gc.collect()
     before = wait_for_engine_threads(engine_threads())
     loop = asyncio.new_event_loop()
     task = loop.create_task(httpperf.Session().get(silent_url))
     loop.run_until_complete(asyncio.sleep(0.1))
     task.cancel()
-    loop.run_until_complete(asyncio.sleep(0))
-    with pytest.warns(ResourceWarning, match="1 requests in flight"):
+    loop.run_until_complete(asyncio.sleep(0.1))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         loop.close()
         del task, loop
         gc.collect()

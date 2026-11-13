@@ -76,6 +76,7 @@ typedef struct {
     struct AcRequestData *unsent_tail;
     struct AcRequestData *live_head;
     bool running;
+    bool closing;
     struct Share *limiter;
     CURL *free_handles[HANDLE_POOL_SIZE];
     int free_handle_count;
@@ -286,7 +287,12 @@ typedef struct AcRequestData {
     struct AcRequestData *live_next;
     double queued_at;
     double queue_time;
+    atomic_int state;
+    bool waiting;
+    bool finished;
 } AcRequestData;
+
+enum { REQUEST_RUNNING, REQUEST_SENT, REQUEST_CANCELLING };
 
 typedef struct {
     PyObject_HEAD Buffer header;
@@ -602,6 +608,7 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
                 share->waiting_tail = prev;
             }
             rd->next_waiting = NULL;
+            rd->waiting = false;
             rd->queue_time = monotonic_time() - rd->queued_at;
             slot_acquire(share, rd->slot);
             add_transfer(loop, rd);
@@ -613,7 +620,7 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
     share_decref(share);
 }
 
-static void complete_request(EventLoop *loop, AcRequestData *rd) {
+static void release_request(EventLoop *loop, AcRequestData *rd) {
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
     curl_easy_setopt(rd->curl, CURLOPT_ERRORBUFFER, NULL);
     if (rd->slot != NULL) {
@@ -627,6 +634,9 @@ static void complete_request(EventLoop *loop, AcRequestData *rd) {
     }
     share_decref(rd->share);
     rd->share = NULL;
+}
+
+static void send_request(EventLoop *loop, AcRequestData *rd) {
     if (loop->unsent_head == NULL) {
         if (pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
             return;
@@ -643,6 +653,49 @@ static void complete_request(EventLoop *loop, AcRequestData *rd) {
         loop->unsent_tail->next_unsent = rd;
     }
     loop->unsent_tail = rd;
+}
+
+static void complete_request(EventLoop *loop, AcRequestData *rd) {
+    release_request(loop, rd);
+    int expected = REQUEST_RUNNING;
+    if (atomic_compare_exchange_strong(&rd->state, &expected, REQUEST_SENT)) {
+        send_request(loop, rd);
+    } else {
+        rd->finished = true;
+    }
+}
+
+static void cancel_request(EventLoop *loop, AcRequestData *rd) {
+    if (rd->finished) {
+        send_request(loop, rd);
+        return;
+    }
+    if (rd->waiting) {
+        AcRequestData *prev = NULL;
+        for (AcRequestData *w = rd->limiter->waiting_head; w != rd; prev = w, w = w->next_waiting) {
+        }
+        if (prev != NULL) {
+            prev->next_waiting = rd->next_waiting;
+        } else {
+            rd->limiter->waiting_head = rd->next_waiting;
+        }
+        if (rd->limiter->waiting_tail == rd) {
+            rd->limiter->waiting_tail = prev;
+        }
+        rd->next_waiting = NULL;
+        rd->waiting = false;
+        rd->slot = NULL;
+    } else {
+        check_multi(loop, curl_multi_remove_handle(loop->multi, rd->curl));
+    }
+    rd->result = CURLE_ABORTED_BY_CALLBACK;
+    curl_slist_free_all(rd->headers);
+    rd->headers = NULL;
+    free(rd->req_data_buf);
+    rd->req_data_buf = NULL;
+    rd->req_data_len = 0;
+    release_request(loop, rd);
+    send_request(loop, rd);
 }
 
 static void send_completed(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
@@ -724,6 +777,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     AcRequestData *rd;
     EventLoop *loop = (EventLoop *)clientData;
     if (pipe_read(loop->req_in_read, &rd, sizeof(rd)) != 1) {
+        return;
+    }
+    if ((uintptr_t)rd & 1) {
+        cancel_request(loop, (AcRequestData *)((uintptr_t)rd & ~(uintptr_t)1));
         return;
     }
     REQUEST_TRACE_PRINT("start_request", rd);
@@ -819,6 +876,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     rd->cookies_str = NULL;
     if (rd->slot != NULL && !slot_free(rd->limiter, rd->slot)) {
         rd->queued_at = monotonic_time();
+        rd->waiting = true;
         if (rd->limiter->waiting_tail != NULL) {
             rd->limiter->waiting_tail->next_waiting = rd;
         } else {
@@ -1134,6 +1192,7 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
 }
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
+    ((EventLoop *)self)->closing = true;
     if (!pipe_write(((EventLoop *)self)->stop_write, "\0", 1)) {
         PyErr_SetFromErrno(PyExc_OSError);
         return NULL;
@@ -1577,7 +1636,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     }
     self->loop->live_head = rd;
     DEBUG_PRINT("scheduling request");
-    Py_RETURN_NONE;
+    return PyLong_FromVoidPtr(rd);
 
 error_cleanup:
     if (rd->headers) {
@@ -1598,6 +1657,24 @@ error_cleanup:
     free(rd->req_data_buf);
     free(rd);
     return NULL;
+}
+
+static PyObject *Session_cancel(Session *self, PyObject *handle) {
+    AcRequestData *rd = PyLong_AsVoidPtr(handle);
+    if (rd == NULL) {
+        return NULL;
+    }
+    if (self->loop == NULL || self->loop->closing) {
+        Py_RETURN_NONE;
+    }
+    int expected = REQUEST_RUNNING;
+    if (atomic_compare_exchange_strong(&rd->state, &expected, REQUEST_CANCELLING)) {
+        uintptr_t message = (uintptr_t)rd | 1;
+        if (!pipe_write(self->loop->req_in_write, &message, sizeof(message))) {
+            return PyErr_SetFromErrno(PyExc_OSError);
+        }
+    }
+    Py_RETURN_NONE;
 }
 
 static PyObject *Session_close(Session *self, PyObject *args) {
@@ -1661,6 +1738,7 @@ static PyMethodDef Session_methods[] = {
     {"request", (PyCFunction)Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"},
     {"get_cookielist", (PyCFunction)Session_get_cookielist, METH_NOARGS, "Get the session's cookies"},
     {"apply_cookielist", (PyCFunction)Session_apply_cookielist, METH_VARARGS, "Apply CURLOPT_COOKIELIST lines"},
+    {"cancel", (PyCFunction)Session_cancel, METH_O, "Stop a request in flight"},
     {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
     {"attach", (PyCFunction)Session_attach, METH_VARARGS, "Attach the session to an EventLoop"},
     {NULL, NULL, 0, NULL}};
