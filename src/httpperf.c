@@ -84,6 +84,8 @@ typedef struct {
 
 typedef struct HostSlot {
     char *key;
+    char *prefix;
+    size_t prefix_len;
     long active;
     long waiting;
     bool multiplexed;
@@ -170,6 +172,7 @@ static void share_decref(Share *share) {
     while (share->hosts != NULL) {
         HostSlot *next = share->hosts->next;
         free(share->hosts->key);
+        free(share->hosts->prefix);
         free(share->hosts);
         share->hosts = next;
     }
@@ -587,17 +590,37 @@ static void host_prune(Share *share) {
         }
         host_unlink(share, h);
         free(h->key);
+        free(h->prefix);
         free(h);
     }
 }
 
+static size_t url_prefix(const char *url) {
+    size_t n = strspn(url, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.");
+    if (n == 0 || strncmp(url + n, "://", 3) != 0) {
+        return 0;
+    }
+    return n + 3 + strcspn(url + n + 3, "/?#");
+}
+
 static HostSlot *host_slot(Share *share, const char *url) {
     host_prune(share);
+    size_t len = url_prefix(url);
+    HostSlot *h = share->hosts;
+    if (len > 0) {
+        while (h != NULL && (h->prefix_len != len || memcmp(h->prefix, url, len) != 0)) {
+            h = h->next;
+        }
+        if (h != NULL) {
+            host_touch(share, h);
+            return h;
+        }
+        h = share->hosts;
+    }
     char *key = host_key(url);
     if (key == NULL) {
         return NULL;
     }
-    HostSlot *h = share->hosts;
     while (h != NULL && strcmp(h->key, key) != 0) {
         h = h->next;
     }
@@ -610,6 +633,13 @@ static HostSlot *host_slot(Share *share, const char *url) {
             return NULL;
         }
         h->key = key;
+    }
+    char *prefix = len > 0 ? malloc(len) : NULL;
+    if (prefix != NULL) {
+        memcpy(prefix, url, len);
+        free(h->prefix);
+        h->prefix = prefix;
+        h->prefix_len = len;
     }
     host_touch(share, h);
     return h;

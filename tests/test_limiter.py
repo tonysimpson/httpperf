@@ -185,3 +185,55 @@ def test_busy_host_records_are_kept(server, short_host_idle):
             return busy
 
     assert asyncio.run(main()) == {"active": 1, "waiting": 1, "multiplexed": False}
+
+
+def test_spellings_of_a_host_share_its_slots(server):
+    port = server.url.rsplit(":", 1)[1]
+    spellings = [
+        server.url + "/slow",
+        "HTTP://127.0.0.1:%s/slow?a=1" % port,
+        "http://user:pw@127.0.0.1:%s/slow" % port,
+        "http://127.0.0.1:%s?b=2#c" % port,
+        server.url + "/slow",
+        server.url + "/slow",
+    ]
+
+    async def main():
+        async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=1) as s:
+            state = s._session._limiter_state
+            tasks = [asyncio.create_task(s.get(url)) for url in spellings]
+            busy = await wait_until(state, lambda st: st["hosts"] and st["hosts"][key(server.url)]["waiting"] == 5)
+            server.release.set()
+            await asyncio.gather(*tasks)
+            return busy, check(state())
+
+    busy, idle = asyncio.run(main())
+    assert list(busy["hosts"]) == [key(server.url)]
+    assert busy["hosts"][key(server.url)]["active"] == 1
+    assert idle["hosts"] == {key(server.url): {"active": 0, "waiting": 0, "multiplexed": False}}
+
+
+def test_host_keys_of_unusual_urls():
+    urls = [
+        "http://[::1]:9/",
+        "http://127.0.0.1:9?q=1",
+        "http://127.0.0.1:9#f",
+        "http://u@127.0.0.2:9/",
+        "http://127.0.0.1:90/",
+    ]
+
+    async def main():
+        async with httpperf.Session(connections="session", max_host_connections=1) as s:
+            for url in urls + urls:
+                with pytest.raises(httpperf.RequestError):
+                    await s.get(url)
+            return check(s._session._limiter_state())
+
+    state = asyncio.run(main())
+    assert sorted(state["hosts"]) == [
+        "http://127.0.0.1:9",
+        "http://127.0.0.1:90",
+        "http://127.0.0.2:9",
+        "http://[::1]:9",
+    ]
+    assert all(h["active"] == h["waiting"] == 0 for h in state["hosts"].values())
