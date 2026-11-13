@@ -271,7 +271,10 @@ class Request:
 
     @property
     def headers(self):
-        return dict(header.split(": ", 1) for header in self.header_list)
+        return {
+            name.strip(): value.strip()
+            for name, _, value in (header.partition(":") for header in self.header_list or ())
+        }
 
     @property
     def cookie_list(self):
@@ -279,7 +282,7 @@ class Request:
 
     @property
     def cookies(self):
-        return _cookie_list_to_cookie_dict(self.cookie_list)
+        return _cookie_list_to_cookie_dict(self.cookie_list or ())
 
     @property
     def auth(self):
@@ -655,15 +658,10 @@ class Session:
             headers_list.append("Content-Type: " + content_type)
 
         if headers:
-            if headers_list is None:
-                headers_list = []
-            headers_list.extend("%s: %s" % i for i in headers.items())
+            headers_list = list(headers_list or ()) + ["%s: %s" % i for i in headers.items()]
 
         if cookies:
-            if cookie_list is None:
-                cookie_list = []
-            for k, v in cookies.items():
-                cookie_list.append(session_cookie_for_url(url, k, v))
+            cookie_list = list(cookie_list or ()) + [session_cookie_for_url(url, k, v) for k, v in cookies.items()]
 
         return await self._request(
             method,
