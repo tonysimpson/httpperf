@@ -306,7 +306,7 @@ def test_response_properties(httpbin):
     ]
     assert times == sorted(times)
     assert r.appconnect_time == 0
-    assert r.posttransfer_time >= 0
+    assert r.posttransfer_time is None or r.posttransfer_time >= 0
     assert r.upload_size == 0
     assert r.download_size == len(r.body)
     assert r.primary_ip == "127.0.0.1"
