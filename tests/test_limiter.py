@@ -1,6 +1,10 @@
 import asyncio
+import socket
+
+import pytest
 
 import httpperf
+from httpperf import _httpperf
 
 
 def usage(host):
@@ -125,3 +129,59 @@ def test_hosts_take_turns_under_the_total_limit(server):
 
     asyncio.run(main())
     assert server.started == ["/slow", "/a0", "/b0", "/a1", "/b1", "/a2", "/b2"]
+
+
+@pytest.fixture
+def short_host_idle():
+    _httpperf._set_host_idle_seconds(0.1)
+    yield
+    _httpperf._set_host_idle_seconds(60)
+
+
+def refused_urls(n):
+    sockets = [socket.socket() for _ in range(n)]
+    for sock in sockets:
+        sock.bind(("127.0.0.1", 0))
+    urls = ["http://127.0.0.1:%d/" % sock.getsockname()[1] for sock in sockets]
+    for sock in sockets:
+        sock.close()
+    return urls
+
+
+def test_idle_host_records_are_freed(short_host_idle):
+    async def main():
+        async with httpperf.Session(connections="session", max_host_connections=1) as s:
+            state = s._session._limiter_state
+            for url in refused_urls(100):
+                with pytest.raises(httpperf.RequestError):
+                    await s.get(url)
+            before = len(check(state())["hosts"])
+            await asyncio.sleep(0.2)
+            (url,) = refused_urls(1)
+            for _ in range(60):
+                with pytest.raises(httpperf.RequestError):
+                    await s.get(url)
+            return before, check(state())["hosts"]
+
+    before, after = asyncio.run(main())
+    assert before == 100
+    assert len(after) == 1
+
+
+def test_busy_host_records_are_kept(server, short_host_idle):
+    async def main():
+        async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=1) as s:
+            state = s._session._limiter_state
+            slow = asyncio.create_task(s.get(server.url + "/slow"))
+            queued = asyncio.create_task(s.get(server.url + "/slow"))
+            await wait_until(state, lambda st: st["hosts"] and st["hosts"][key(server.url)]["waiting"] == 1)
+            await asyncio.sleep(0.2)
+            for url in refused_urls(10):
+                with pytest.raises(httpperf.RequestError):
+                    await s.get(url)
+            busy = check(state())["hosts"][key(server.url)]
+            server.release.set()
+            await asyncio.gather(slow, queued)
+            return busy
+
+    assert asyncio.run(main()) == {"active": 1, "waiting": 1, "multiplexed": False}

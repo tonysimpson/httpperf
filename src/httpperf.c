@@ -92,8 +92,12 @@ typedef struct HostSlot {
     struct AcRequestData *waiting_tail;
     struct HostSlot *prev_ready;
     struct HostSlot *next_ready;
+    struct HostSlot *prev;
     struct HostSlot *next;
+    double last_used;
 } HostSlot;
+
+static double host_idle_seconds = 60;
 
 typedef struct Share {
     CURLSH *share;
@@ -103,6 +107,7 @@ typedef struct Share {
     long max_connections;
     long connections;
     HostSlot *hosts;
+    HostSlot *hosts_tail;
     HostSlot *ready_head;
     HostSlot *ready_tail;
     bool dispatching;
@@ -542,25 +547,70 @@ static char *host_key(const char *url) {
     return key;
 }
 
+static void host_unlink(Share *share, HostSlot *h) {
+    if (h->prev != NULL) {
+        h->prev->next = h->next;
+    } else {
+        share->hosts = h->next;
+    }
+    if (h->next != NULL) {
+        h->next->prev = h->prev;
+    } else {
+        share->hosts_tail = h->prev;
+    }
+    h->prev = h->next = NULL;
+}
+
+static void host_touch(Share *share, HostSlot *h) {
+    h->last_used = monotonic_time();
+    if (share->hosts != h) {
+        if (h->prev != NULL) {
+            host_unlink(share, h);
+        }
+        h->next = share->hosts;
+        if (share->hosts != NULL) {
+            share->hosts->prev = h;
+        } else {
+            share->hosts_tail = h;
+        }
+        share->hosts = h;
+    }
+}
+
+static void host_prune(Share *share) {
+    double cutoff = monotonic_time() - host_idle_seconds;
+    for (int i = 0; i < 2; i++) {
+        HostSlot *h = share->hosts_tail;
+        if (h == NULL || h->active > 0 || h->waiting > 0 || h->last_used > cutoff) {
+            return;
+        }
+        host_unlink(share, h);
+        free(h->key);
+        free(h);
+    }
+}
+
 static HostSlot *host_slot(Share *share, const char *url) {
+    host_prune(share);
     char *key = host_key(url);
     if (key == NULL) {
         return NULL;
     }
-    for (HostSlot *h = share->hosts; h != NULL; h = h->next) {
-        if (strcmp(h->key, key) == 0) {
-            free(key);
-            return h;
-        }
+    HostSlot *h = share->hosts;
+    while (h != NULL && strcmp(h->key, key) != 0) {
+        h = h->next;
     }
-    HostSlot *h = calloc(1, sizeof(HostSlot));
-    if (h == NULL) {
+    if (h != NULL) {
         free(key);
-        return NULL;
+    } else {
+        h = calloc(1, sizeof(HostSlot));
+        if (h == NULL) {
+            free(key);
+            return NULL;
+        }
+        h->key = key;
     }
-    h->key = key;
-    h->next = share->hosts;
-    share->hosts = h;
+    host_touch(share, h);
     return h;
 }
 
@@ -704,6 +754,7 @@ static void release_request(EventLoop *loop, AcRequestData *rd) {
             multiplexed = version == CURL_HTTP_VERSION_2_0 || version == CURL_HTTP_VERSION_3;
         }
         host_update(rd->limiter, rd->slot, -1, multiplexed);
+        host_touch(rd->limiter, rd->slot);
         rd->slot = NULL;
         dispatch_waiting(loop, rd->limiter);
     }
@@ -1870,7 +1921,17 @@ static PyObject *module_default_ca_file(PyObject *self, PyObject *args) {
 #endif
 }
 
+static PyObject *module_set_host_idle_seconds(PyObject *self, PyObject *arg) {
+    double seconds = PyFloat_AsDouble(arg);
+    if (seconds == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    host_idle_seconds = seconds;
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
+    {"_set_host_idle_seconds", module_set_host_idle_seconds, METH_O, "How long idle host records are kept, for tests"},
     {"default_ca_file", module_default_ca_file, METH_NOARGS, "libcurl's built-in CA bundle path, or None"},
     {NULL, NULL, 0, NULL}};
 

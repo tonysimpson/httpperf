@@ -41,6 +41,14 @@ Where a limit is set depends on where the connections live.
 
 httpperf does the queueing, not curl, because curl starts its timers before a request waits in its queue, so the wait would be counted as response time. All the limits count connections in use, which for HTTP/1.1 means requests in flight. Once a host has answered over HTTP/2 or HTTP/3, its requests share one connection and are not held back by `max_host_connections`. Until the first response shows that, a burst to a new host is capped like HTTP/1.1. Time spent in the queue is reported as `Response.queue_time` and kept out of `client_lag`.
 
+Waiting requests queue per host, first come first served. When a connection frees up, hosts with waiting requests take turns, so under `max_total_connections` one busy host cannot starve the others, and a host that is stuck at its own limit does not slow down requests to other hosts.
+
+A host's HTTP/2 status follows its latest successful response, so a host that falls back to HTTP/1.1 is counted per request again. Failed requests leave it unchanged. httpperf counts a multiplexed host as one connection, even if curl opens a second one when the server's limit on concurrent streams is reached.
+
+Time spent waiting in the queue has no limit: `timeout` starts when the request reaches curl. To bound the whole wait, use `asyncio.wait_for`, which cancels the request wherever it is.
+
+httpperf keeps what it has learnt about each host until the host has had nothing in flight or waiting for 60 seconds, so talking to many hosts over time does not grow memory without bound.
+
 Idle connections do not count towards `max_connections`, so a session can hold more open connections than the cap if it talks to several hosts. `max_idle_connections` bounds those.
 
 ### Connection lifetime
