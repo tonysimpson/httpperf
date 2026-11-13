@@ -16,6 +16,7 @@ wheels/
 # Virtual environments
 .venv*/
 venv/
+.tools/
 env/
 
 # Testing and tooling caches

@@ -3,15 +3,20 @@ VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 C_SOURCES := src/httpperf.c
 INSTALLED := $(VENV)/.installed
+UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 
 .PHONY: venv test lint lint-fix clean distclean release
 
 venv: $(INSTALLED)
 
-$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/ae/*.c src/ae/*.h)
-	test -x $(VENV)/bin/python || uv venv -p $(PY_VERSION) $(VENV)
-	uv pip install --python $(VENV)/bin/python --group dev --reinstall-package httpperf -e .
+$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/ae/*.c src/ae/*.h) | $(UV)
+	test -x $(VENV)/bin/python || $(UV) venv -p $(PY_VERSION) $(VENV)
+	$(UV) pip install --python $(VENV)/bin/python --group dev --reinstall-package httpperf -e .
 	touch $@
+
+.tools/bin/uv:
+	python3 -m venv .tools
+	.tools/bin/pip install uv
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest
@@ -31,7 +36,7 @@ clean:
 	find httpperf tests -name __pycache__ -prune -exec rm -rf {} +
 
 distclean: clean
-	rm -rf $(VENV)
+	rm -rf $(VENV) .tools
 
 release:
 	git diff --quiet HEAD || { echo "commit your changes first"; exit 1; }
