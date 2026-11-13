@@ -2,8 +2,6 @@
 
 An asyncio HTTP client for load testing, built on libcurl.
 
-httpperf was called acurl until version 1.0.
-
 ## Design
 
 A load-testing client has three jobs: drive as much load as possible from each machine, report the server's response times rather than time spent waiting on the client, and read responses promptly so the server never sees a slow reader. httpperf is built around these.
