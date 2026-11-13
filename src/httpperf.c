@@ -274,6 +274,7 @@ typedef struct AcRequestData {
     char *key_file;
     bool verify;
     char *ca_file;
+    char *ca_path;
     long timeout_ms;
     long connect_timeout_ms;
     char error[CURL_ERROR_SIZE];
@@ -948,6 +949,9 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         if (rd->ca_file != NULL) {
             curl_easy_setopt(rd->curl, CURLOPT_CAINFO, rd->ca_file);
         }
+        if (rd->ca_path != NULL) {
+            curl_easy_setopt(rd->curl, CURLOPT_CAPATH, rd->ca_path);
+        }
     } else {
         curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -986,6 +990,8 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     rd->key_file = NULL;
     free(rd->ca_file);
     rd->ca_file = NULL;
+    free(rd->ca_path);
+    rd->ca_path = NULL;
     free(rd->cookies_str);
     rd->cookies_str = NULL;
     if (rd->slot != NULL && !slot_free(rd->limiter, rd->slot)) {
@@ -1287,6 +1293,7 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
         free(rd->cert_file);
         free(rd->key_file);
         free(rd->ca_file);
+        free(rd->ca_path);
         free(rd->cookies_str);
         Py_XDECREF(rd->cookies);
         free(rd->req_data_buf);
@@ -1678,19 +1685,37 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         CHECK_ALLOC(rd->cert_file);
         CHECK_ALLOC(rd->key_file);
     }
-    if (verify == Py_True) {
-        rd->verify = true;
-    } else if (PyUnicode_CheckExact(verify)) {
-        const char *ca_file = PyUnicode_AsUTF8(verify);
-        if (ca_file == NULL) {
+    PyObject *ca_file = Py_None;
+    PyObject *ca_path = Py_None;
+    if (PyUnicode_CheckExact(verify)) {
+        ca_file = verify;
+    } else if (PyTuple_CheckExact(verify) && PyTuple_GET_SIZE(verify) == 2) {
+        ca_file = PyTuple_GET_ITEM(verify, 0);
+        ca_path = PyTuple_GET_ITEM(verify, 1);
+    }
+    if ((verify != Py_True && verify != Py_False && ca_file == Py_None && ca_path == Py_None) ||
+        (ca_file != Py_None && !PyUnicode_CheckExact(ca_file)) ||
+        (ca_path != Py_None && !PyUnicode_CheckExact(ca_path))) {
+        PyErr_SetString(PyExc_ValueError,
+                        "verify should be True, False, a CA bundle path or a (CA file, CA directory) tuple");
+        goto error_cleanup;
+    }
+    rd->verify = verify != Py_False;
+    if (ca_file != Py_None) {
+        const char *path = PyUnicode_AsUTF8(ca_file);
+        if (path == NULL) {
             goto error_cleanup;
         }
-        rd->verify = true;
-        rd->ca_file = strdup(ca_file);
+        rd->ca_file = strdup(path);
         CHECK_ALLOC(rd->ca_file);
-    } else if (verify != Py_False) {
-        PyErr_SetString(PyExc_ValueError, "verify should be True, False or a CA bundle path");
-        goto error_cleanup;
+    }
+    if (ca_path != Py_None) {
+        const char *path = PyUnicode_AsUTF8(ca_path);
+        if (path == NULL) {
+            goto error_cleanup;
+        }
+        rd->ca_path = strdup(path);
+        CHECK_ALLOC(rd->ca_path);
     }
     if (cookies != Py_None) {
         Py_INCREF(cookies);
@@ -1759,6 +1784,7 @@ error_cleanup:
     free(rd->cert_file);
     free(rd->key_file);
     free(rd->ca_file);
+    free(rd->ca_path);
     if (rd->cookies) {
         Py_DECREF(rd->cookies);
         free(rd->cookies_str);

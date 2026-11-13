@@ -139,14 +139,68 @@ def test_verify(tls_url):
     loop.close()
 
 
-def test_ca_file_lookup(monkeypatch, tmp_path):
-    monkeypatch.setenv("SSL_CERT_FILE", "/custom/ca.pem")
-    assert httpperf._find_ca_file() == "/custom/ca.pem"
-    monkeypatch.delenv("SSL_CERT_FILE")
-    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: None)
+@pytest.fixture
+def ca_lookup(monkeypatch, tmp_path):
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(name, raising=False)
     bundle = tmp_path / "ca.pem"
     bundle.write_text("")
+    python_bundle = tmp_path / "python.pem"
+    python_bundle.write_text("")
+    paths = ssl.DefaultVerifyPaths(
+        str(python_bundle), str(tmp_path), "SSL_CERT_FILE", str(python_bundle), "SSL_CERT_DIR", str(tmp_path)
+    )
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: paths)
+    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: None)
     monkeypatch.setattr(httpperf, "_CA_FILES", ("/missing/ca.pem", str(bundle)))
-    assert httpperf._find_ca_file() == str(bundle)
-    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: str(bundle))
-    assert httpperf._find_ca_file() is None
+    return tmp_path
+
+
+def test_ca_lookup_uses_the_environment_first(ca_lookup, monkeypatch):
+    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: str(ca_lookup / "ca.pem"))
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_lookup / "ca.pem"))
+    assert httpperf._find_ca() == (str(ca_lookup / "ca.pem"), None)
+    monkeypatch.setenv("SSL_CERT_DIR", str(ca_lookup))
+    assert httpperf._find_ca() == (str(ca_lookup / "ca.pem"), str(ca_lookup))
+    monkeypatch.delenv("SSL_CERT_FILE")
+    assert httpperf._find_ca() == (None, str(ca_lookup))
+
+
+def test_ca_lookup_ignores_missing_environment_paths(ca_lookup, monkeypatch):
+    monkeypatch.setenv("SSL_CERT_FILE", "/missing/ca.pem")
+    monkeypatch.setenv("SSL_CERT_DIR", "/missing/certs")
+    assert httpperf._find_ca() == (str(ca_lookup / "python.pem"), None)
+
+
+def test_ca_lookup_leaves_libcurls_own_bundle_alone(ca_lookup, monkeypatch):
+    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: str(ca_lookup / "ca.pem"))
+    assert httpperf._find_ca() == (None, None)
+    monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: "/missing/ca.pem")
+    assert httpperf._find_ca() == (str(ca_lookup / "python.pem"), None)
+
+
+def test_ca_lookup_uses_pythons_bundle_without_its_directory(ca_lookup):
+    assert httpperf._find_ca() == (str(ca_lookup / "python.pem"), None)
+
+
+def test_ca_lookup_falls_back_to_known_bundles(ca_lookup, monkeypatch):
+    (ca_lookup / "python.pem").unlink()
+    assert httpperf._find_ca() == (str(ca_lookup / "ca.pem"), None)
+    monkeypatch.setattr(httpperf, "_CA_FILES", ("/missing/ca.pem",))
+    assert httpperf._find_ca() == (None, None)
+
+
+def test_verify_with_ssl_cert_dir(tls_url, monkeypatch, tmp_path):
+    with open(pytest_httpbin.certs.where()) as f:
+        (tmp_path / "ca.pem").write_text(f.read())
+    subprocess.run(["openssl", "rehash", str(tmp_path)], check=True, capture_output=True)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    monkeypatch.setattr(httpperf, "_ca", httpperf._find_ca())
+    assert httpperf._ca == (None, str(tmp_path))
+    loop = asyncio.new_event_loop()
+    el = httpperf.Engine()
+    response = loop.run_until_complete(httpperf.Session(engine=el, verify=True).get(tls_url))
+    assert response.status_code == 200
+    el.close()
+    loop.close()

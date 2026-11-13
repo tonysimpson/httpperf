@@ -79,7 +79,7 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 | `cert` | `None` | `(certfile, keyfile)` paths for a client certificate, used by every request unless the request overrides it. |
 | `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. Cancelling the task (or `asyncio.wait_for`) also stops the transfer and frees its connection slot; on HTTP/1.1 that closes the connection, on HTTP/2 and HTTP/3 it resets only that stream. |
 | `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
-| `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CA bundle: `SSL_CERT_FILE` if set, otherwise libcurl's own default, or the usual system locations if it has none. A path: check against that CA bundle. Requests can override it. |
+| `verify` | `False` | Server certificate checking. `False`: none, as most load tests want. `True`: check against the system CAs, from the first of: `SSL_CERT_FILE` and `SSL_CERT_DIR`, if set and present; libcurl's own default bundle, if present; Python's default bundle (`ssl.get_default_verify_paths()`); the usual system locations. A path: check against that CA bundle. Requests can override it. |
 | `json_dumps` | `None` | Function that turns a `json=` argument into the request body (`str` or `bytes`). `None` means the engine's. |
 | `json_loads` | `None` | Function that turns the response body (`bytes`) into the result of `json()`. `None` means the engine's. |
 

@@ -5,6 +5,7 @@ import email.utils
 import http
 import json as _json
 import os
+import ssl
 import sys
 import threading
 import time
@@ -26,26 +27,33 @@ _CA_FILES = (
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
     "/etc/ssl/cert.pem",
 )
 
 
-def _find_ca_file():
-    env = os.environ.get("SSL_CERT_FILE")
-    if env:
-        return env
+def _find_ca():
+    paths = ssl.get_default_verify_paths()
+    ca_file = os.environ.get(paths.openssl_cafile_env)
+    ca_dir = os.environ.get(paths.openssl_capath_env)
+    ca_file = ca_file if ca_file and os.path.isfile(ca_file) else None
+    ca_dir = ca_dir if ca_dir and os.path.isdir(ca_dir) else None
+    if ca_file or ca_dir:
+        return ca_file, ca_dir
     builtin = _httpperf.default_ca_file()
     if builtin and os.path.exists(builtin):
-        return None
-    return next((path for path in _CA_FILES if os.path.exists(path)), None)
+        return None, None
+    if paths.cafile and os.path.isfile(paths.cafile):
+        return paths.cafile, None
+    return next((path for path in _CA_FILES if os.path.exists(path)), None), None
 
 
-_ca_file = _find_ca_file()
+_ca = _find_ca()
 
 
 def _verify(verify):
-    return _ca_file if verify is True and _ca_file is not None else verify
+    return _ca if verify is True and _ca != (None, None) else verify
 
 
 class RequestError(Exception):
