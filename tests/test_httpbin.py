@@ -10,13 +10,6 @@ import pytest
 import httpperf
 
 
-@pytest.fixture
-def s():
-    session = httpperf.Session()
-    yield session
-    session.close()
-
-
 async def test_get(httpbin, s):
     assert (await s.get(httpbin.url + "/ip")).json()["origin"] == "127.0.0.1"
 

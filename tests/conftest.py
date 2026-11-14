@@ -8,6 +8,8 @@ import time
 
 import pytest
 
+import httpperf
+
 
 class Server:
     def __init__(self):
@@ -71,6 +73,13 @@ def make_server():
 @pytest.fixture
 def server(make_server):
     return make_server()
+
+
+@pytest.fixture
+def s():
+    session = httpperf.Session()
+    yield session
+    session.close()
 
 
 @pytest.hookimpl(tryfirst=True)
