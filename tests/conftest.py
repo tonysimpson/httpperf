@@ -44,7 +44,7 @@ class Server:
         self.httpd = http_server(("127.0.0.1", 0), Handler)
         self.httpd.daemon_threads = True
         self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self.httpd.serve_forever, args=(0.01,), daemon=True).start()
 
     def wait_for(self, condition, timeout=5):
         deadline = time.monotonic() + timeout

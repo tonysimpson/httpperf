@@ -16,7 +16,7 @@ import httpperf
 async def app(scope, receive, send):
     if scope["type"] != "http":
         return
-    await asyncio.sleep(1 if scope["path"] == "/slow" else 0.05)
+    await asyncio.sleep(0.5 if scope["path"] == "/slow" else 0.05)
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
     await send({"type": "http.response.body", "body": scope["http_version"].encode()})
 

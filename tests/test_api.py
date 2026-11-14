@@ -271,9 +271,9 @@ async def test_redirects_keep_headers(httpbin, s):
     assert r.json()["headers"]["X-A"] == "1"
 
 
-async def test_a_timeout_has_curls_timeout_code(httpbin, s):
+async def test_a_timeout_has_curls_timeout_code(server, s):
     with pytest.raises(httpperf.Timeout) as e:
-        await s.get(httpbin.url + "/delay/2", timeout=0.2)
+        await s.get(server.url + "/slow", timeout=0.2)
     assert e.value.code == httpperf.CURLE_OPERATION_TIMEDOUT
 
 

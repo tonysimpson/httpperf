@@ -33,7 +33,7 @@ def tls_url():
     context.load_cert_chain(os.path.join(certs, "server.pem"), os.path.join(certs, "server.key"))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReusedHandler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
     yield "https://127.0.0.1:%d/" % server.server_address[1]
     server.shutdown()
     server.server_close()
@@ -91,7 +91,7 @@ def mtls_url(client_certs):
         context.load_verify_locations(cert)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ClientCertHandler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
     yield "https://127.0.0.1:%d/" % server.server_address[1]
     server.shutdown()
     server.server_close()
