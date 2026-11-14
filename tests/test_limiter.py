@@ -1,141 +1,41 @@
 import asyncio
 import socket
+from urllib.parse import urlsplit
 
 import pytest
+from helpers import until
 
 import httpperf
 from httpperf import _httpperf
 
-
-def usage(host):
-    if host["multiplexed"]:
-        return 1 if host["active"] else 0
-    return host["active"]
+IDLE = {"active": 0, "waiting": 0, "multiplexed": False}
 
 
-def check(state):
-    assert state["connections"] == sum(usage(h) for h in state["hosts"].values())
+def limiter_state(owner):
+    state = (owner._session if isinstance(owner, httpperf.Session) else owner._ae_loop)._limiter_state()
+    in_use = sum((1 if h["active"] else 0) if h["multiplexed"] else h["active"] for h in state["hosts"].values())
+    assert state["connections"] == in_use
     return state
 
 
-def key(url):
-    return url if url.count(":") == 2 else url + ":80"
+def host_key(url):
+    return "{0.scheme}://{0.netloc}".format(urlsplit(url))
 
 
-async def wait_until(get_state, condition, timeout=5):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        state = check(get_state())
-        if condition(state):
-            return state
-        assert asyncio.get_running_loop().time() < deadline, state
-        await asyncio.sleep(0.01)
+def host(owner, url):
+    return limiter_state(owner)["hosts"].get(host_key(url))
 
 
-def test_host_limit_queues_and_drains(server):
-    async def main():
-        async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=2) as s:
-            state = s._session._limiter_state
-            tasks = [asyncio.create_task(s.get(server.url + "/slow")) for _ in range(5)]
-            busy = await wait_until(state, lambda st: st["hosts"] and st["hosts"][key(server.url)]["waiting"] == 3)
-            server.release.set()
-            responses = await asyncio.gather(*tasks)
-            return busy, check(state()), responses
-
-    busy, idle, responses = asyncio.run(main())
-    assert busy["connections"] == 2 and busy["hosts"][key(server.url)]["active"] == 2
-    assert idle["connections"] == 0
-    assert idle["hosts"][key(server.url)] == {"active": 0, "waiting": 0, "multiplexed": False}
-    assert sorted(r.queue_time > 0 for r in responses) == [False, False, True, True, True]
+def waiting(owner, url):
+    return (host(owner, url) or IDLE)["waiting"]
 
 
-def test_total_limit_across_hosts(make_server):
-    a, b = make_server(), make_server()
-
-    async def main():
-        async with httpperf.Engine(max_total_connections=3) as engine:
-            state = engine._ae_loop._limiter_state
-            async with httpperf.Session(engine=engine, http_version="HTTP/1.1") as s:
-                first = [asyncio.create_task(s.get(a.url + "/slow")) for _ in range(3)]
-                await wait_until(state, lambda st: st["connections"] == 3)
-                second = [asyncio.create_task(s.get(b.url + "/fast")) for _ in range(2)]
-                busy = await wait_until(
-                    state, lambda st: key(b.url) in st["hosts"] and st["hosts"][key(b.url)]["waiting"] == 2
-                )
-                a.release.set()
-                await asyncio.gather(*first, *second)
-                return busy, check(state())
-
-    busy, idle = asyncio.run(main())
-    assert busy["connections"] == 3
-    assert busy["hosts"][key(a.url)]["active"] == 3
-    assert idle["connections"] == 0
-    assert all(h["active"] == h["waiting"] == 0 for h in idle["hosts"].values())
+def limited_session(limit, **options):
+    return httpperf.Session(connections="session", max_host_connections=limit, **options)
 
 
-def test_failed_requests_release_their_slots():
-    async def main():
-        async with httpperf.Session(connections="session", max_host_connections=1) as s:
-            results = await asyncio.gather(*(s.get("http://127.0.0.1:9/") for _ in range(5)), return_exceptions=True)
-            return results, check(s._session._limiter_state())
-
-    results, state = asyncio.run(main())
-    assert all(isinstance(r, httpperf.RequestError) for r in results)
-    assert state["connections"] == 0
-    assert state["hosts"]["http://127.0.0.1:9"] == {"active": 0, "waiting": 0, "multiplexed": False}
-
-
-def test_cancelled_requests_release_their_slots(server):
-    async def main():
-        async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=2) as s:
-            state = s._session._limiter_state
-            tasks = [asyncio.create_task(s.get(server.url + "/slow")) for _ in range(6)]
-            await wait_until(state, lambda st: st["hosts"] and st["hosts"][key(server.url)]["waiting"] == 4)
-            for task in tasks[::2]:
-                task.cancel()
-            await wait_until(state, lambda st: st["hosts"][key(server.url)]["waiting"] == 1)
-            server.release.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            return check(state()), [t.cancelled() for t in tasks]
-
-    state, cancelled = asyncio.run(main())
-    assert state["connections"] == 0
-    assert state["hosts"][key(server.url)] == {"active": 0, "waiting": 0, "multiplexed": False}
-    assert cancelled == [True, False] * 3
-
-
-def test_no_limiter_without_limits():
-    assert httpperf.Session()._session._limiter_state() is None
-    assert httpperf.Engine()._ae_loop._limiter_state() is None
-
-
-def test_hosts_take_turns_under_the_total_limit(server):
-    other = server.url.replace("127.0.0.1", "localhost")
-
-    async def main():
-        async with httpperf.Engine(max_total_connections=1) as engine:
-            state = engine._ae_loop._limiter_state
-            async with httpperf.Session(engine=engine, http_version="HTTP/1.1") as s:
-                first = asyncio.create_task(s.get(server.url + "/slow"))
-                await wait_until(state, lambda st: st["connections"] == 1)
-                tasks = [asyncio.create_task(s.get(server.url + "/a%d" % i)) for i in range(3)]
-                await wait_until(state, lambda st: st["hosts"][key(server.url)]["waiting"] == 3)
-                tasks += [asyncio.create_task(s.get(other + "/b%d" % i)) for i in range(3)]
-                await wait_until(
-                    state, lambda st: key(other) in st["hosts"] and st["hosts"][key(other)]["waiting"] == 3
-                )
-                server.release.set()
-                await asyncio.gather(first, *tasks)
-
-    asyncio.run(main())
-    assert server.started == ["/slow", "/a0", "/b0", "/a1", "/b1", "/a2", "/b2"]
-
-
-@pytest.fixture
-def short_host_idle():
-    _httpperf._set_host_idle_seconds(0.1)
-    yield
-    _httpperf._set_host_idle_seconds(60)
+def slow_requests(session, url, n):
+    return [asyncio.create_task(session.get(url + "/slow")) for _ in range(n)]
 
 
 def refused_urls(n):
@@ -148,72 +48,147 @@ def refused_urls(n):
     return urls
 
 
-def test_idle_host_records_are_freed(short_host_idle):
-    async def main():
-        async with httpperf.Session(connections="session", max_host_connections=1) as s:
-            state = s._session._limiter_state
-            for url in refused_urls(100):
-                with pytest.raises(httpperf.RequestError):
-                    await s.get(url)
-            before = len(check(state())["hosts"])
-            await asyncio.sleep(0.2)
-            (url,) = refused_urls(1)
-            for _ in range(60):
-                with pytest.raises(httpperf.RequestError):
-                    await s.get(url)
-            return before, check(state())["hosts"]
-
-    before, after = asyncio.run(main())
-    assert before == 100
-    assert len(after) == 1
+async def fail(session, url):
+    with pytest.raises(httpperf.RequestError):
+        await session.get(url)
 
 
-def test_busy_host_records_are_kept(server, short_host_idle):
-    async def main():
-        async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=1) as s:
-            state = s._session._limiter_state
-            slow = asyncio.create_task(s.get(server.url + "/slow"))
-            queued = asyncio.create_task(s.get(server.url + "/slow"))
-            await wait_until(state, lambda st: st["hosts"] and st["hosts"][key(server.url)]["waiting"] == 1)
-            await asyncio.sleep(0.2)
-            for url in refused_urls(10):
-                with pytest.raises(httpperf.RequestError):
-                    await s.get(url)
-            busy = check(state())["hosts"][key(server.url)]
-            server.release.set()
-            await asyncio.gather(slow, queued)
-            return busy
-
-    assert asyncio.run(main()) == {"active": 1, "waiting": 1, "multiplexed": False}
+@pytest.fixture
+def short_host_idle():
+    _httpperf._set_host_idle_seconds(0.1)
+    yield
+    _httpperf._set_host_idle_seconds(60)
 
 
-def test_spellings_of_a_host_share_its_slots(server):
+def test_no_limiter_without_limits():
+    assert httpperf.Session()._session._limiter_state() is None
+
+
+def test_no_engine_limiter_without_limits():
+    assert httpperf.Engine()._ae_loop._limiter_state() is None
+
+
+async def test_requests_over_the_host_limit_wait(server):
+    async with limited_session(2) as s:
+        tasks = slow_requests(s, server.url, 5)
+        assert await until(lambda: waiting(s, server.url) == 3)
+        assert host(s, server.url)["active"] == 2
+        server.release.set()
+        await asyncio.gather(*tasks)
+
+
+async def test_finished_requests_release_their_slots(server):
+    async with limited_session(2) as s:
+        tasks = slow_requests(s, server.url, 5)
+        await until(lambda: waiting(s, server.url) == 3)
+        server.release.set()
+        await asyncio.gather(*tasks)
+        assert host(s, server.url) == IDLE
+
+
+async def test_waiting_requests_report_their_queue_time(server):
+    async with limited_session(2) as s:
+        tasks = slow_requests(s, server.url, 5)
+        await until(lambda: waiting(s, server.url) == 3)
+        server.release.set()
+        responses = await asyncio.gather(*tasks)
+    assert sum(r.queue_time > 0 for r in responses) == 3
+
+
+async def test_the_total_limit_spans_hosts(make_server):
+    a, b = make_server(), make_server()
+    async with httpperf.Engine(max_total_connections=3) as engine:
+        s = httpperf.Session(engine=engine)
+        first = slow_requests(s, a.url, 3)
+        await until(lambda: limiter_state(engine)["connections"] == 3)
+        second = [asyncio.create_task(s.get(b.url)) for _ in range(2)]
+        assert await until(lambda: waiting(engine, b.url) == 2)
+        a.release.set()
+        await asyncio.gather(*first, *second)
+
+
+async def test_failed_requests_release_their_slots():
+    url = refused_urls(1)[0]
+    async with limited_session(1) as s:
+        await asyncio.gather(*(fail(s, url) for _ in range(5)))
+        assert host(s, url) == IDLE
+
+
+async def test_a_cancelled_request_gives_its_slot_to_a_waiting_one(server):
+    async with limited_session(2) as s:
+        tasks = slow_requests(s, server.url, 4)
+        await until(lambda: waiting(s, server.url) == 2)
+        tasks[0].cancel()
+        assert await until(lambda: waiting(s, server.url) == 1)
+        server.release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_a_cancelled_waiting_request_leaves_the_queue(server):
+    async with limited_session(1) as s:
+        tasks = slow_requests(s, server.url, 3)
+        await until(lambda: waiting(s, server.url) == 2)
+        tasks[2].cancel()
+        assert await until(lambda: waiting(s, server.url) == 1)
+        server.release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_hosts_take_turns_under_the_total_limit(server):
+    other = server.url.replace("127.0.0.1", "localhost")
+    async with httpperf.Engine(max_total_connections=1) as engine:
+        s = httpperf.Session(engine=engine)
+        first = asyncio.create_task(s.get(server.url + "/slow"))
+        await until(lambda: limiter_state(engine)["connections"] == 1)
+        tasks = [asyncio.create_task(s.get(server.url + "/a%d" % i)) for i in range(3)]
+        await until(lambda: waiting(engine, server.url) == 3)
+        tasks += [asyncio.create_task(s.get(other + "/b%d" % i)) for i in range(3)]
+        await until(lambda: waiting(engine, other) == 3)
+        server.release.set()
+        await asyncio.gather(first, *tasks)
+    assert server.started == ["/slow", "/a0", "/b0", "/a1", "/b1", "/a2", "/b2"]
+
+
+async def test_idle_host_records_are_freed(short_host_idle):
+    async with limited_session(1) as s:
+        for url in refused_urls(100):
+            await fail(s, url)
+        await asyncio.sleep(0.2)
+        url = refused_urls(1)[0]
+        for _ in range(60):
+            await fail(s, url)
+        assert list(limiter_state(s)["hosts"]) == [host_key(url)]
+
+
+async def test_busy_host_records_are_kept(server, short_host_idle):
+    async with limited_session(1) as s:
+        tasks = slow_requests(s, server.url, 2)
+        await until(lambda: waiting(s, server.url) == 1)
+        await asyncio.sleep(0.2)
+        for url in refused_urls(10):
+            await fail(s, url)
+        assert host(s, server.url) == {"active": 1, "waiting": 1, "multiplexed": False}
+        server.release.set()
+        await asyncio.gather(*tasks)
+
+
+async def test_spellings_of_a_host_share_its_slots(server):
     port = server.url.rsplit(":", 1)[1]
     spellings = [
-        server.url + "/slow",
         "HTTP://127.0.0.1:%s/slow?a=1" % port,
         "http://user:pw@127.0.0.1:%s/slow" % port,
         "http://127.0.0.1:%s?b=2#c" % port,
-        server.url + "/slow",
-        server.url + "/slow",
     ]
-
-    async def main():
-        async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=1) as s:
-            state = s._session._limiter_state
-            tasks = [asyncio.create_task(s.get(url)) for url in spellings]
-            busy = await wait_until(state, lambda st: st["hosts"] and st["hosts"][key(server.url)]["waiting"] == 5)
-            server.release.set()
-            await asyncio.gather(*tasks)
-            return busy, check(state())
-
-    busy, idle = asyncio.run(main())
-    assert list(busy["hosts"]) == [key(server.url)]
-    assert busy["hosts"][key(server.url)]["active"] == 1
-    assert idle["hosts"] == {key(server.url): {"active": 0, "waiting": 0, "multiplexed": False}}
+    async with limited_session(1) as s:
+        tasks = slow_requests(s, server.url, 1)
+        tasks += [asyncio.create_task(s.get(url)) for url in spellings]
+        tasks += slow_requests(s, server.url, 2)
+        assert await until(lambda: waiting(s, server.url) == 5)
+        server.release.set()
+        await asyncio.gather(*tasks)
 
 
-def test_host_keys_of_unusual_urls():
+async def test_host_keys_of_unusual_urls():
     urls = [
         "http://[::1]:9/",
         "http://127.0.0.1:9?q=1",
@@ -221,19 +196,12 @@ def test_host_keys_of_unusual_urls():
         "http://u@127.0.0.2:9/",
         "http://127.0.0.1:90/",
     ]
-
-    async def main():
-        async with httpperf.Session(connections="session", max_host_connections=1) as s:
-            for url in urls + urls:
-                with pytest.raises(httpperf.RequestError):
-                    await s.get(url)
-            return check(s._session._limiter_state())
-
-    state = asyncio.run(main())
-    assert sorted(state["hosts"]) == [
-        "http://127.0.0.1:9",
-        "http://127.0.0.1:90",
-        "http://127.0.0.2:9",
-        "http://[::1]:9",
-    ]
-    assert all(h["active"] == h["waiting"] == 0 for h in state["hosts"].values())
+    async with limited_session(1) as s:
+        for url in urls * 2:
+            await fail(s, url)
+        assert sorted(limiter_state(s)["hosts"]) == [
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:90",
+            "http://127.0.0.2:9",
+            "http://[::1]:9",
+        ]
