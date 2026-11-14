@@ -1,4 +1,6 @@
+import asyncio
 import http.server
+import inspect
 import select
 import socket
 import threading
@@ -68,3 +70,11 @@ def make_server():
 @pytest.fixture
 def server(make_server):
     return make_server()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem):
+    if inspect.iscoroutinefunction(pyfuncitem.obj):
+        args = {name: pyfuncitem.funcargs[name] for name in pyfuncitem._fixtureinfo.argnames}
+        asyncio.run(pyfuncitem.obj(**args))
+        return True
