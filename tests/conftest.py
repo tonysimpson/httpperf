@@ -65,6 +65,7 @@ def make_server():
     for s in servers:
         s.release.set()
         s.httpd.shutdown()
+        s.httpd.server_close()
 
 
 @pytest.fixture

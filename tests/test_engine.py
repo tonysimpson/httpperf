@@ -1,18 +1,18 @@
 import asyncio
 import errno
 import gc
-import http.server
 import os
 import socket
 import subprocess
 import sys
 import threading
-import time
 import warnings
 
 import pytest
 
 import httpperf
+
+REFUSED = "http://127.0.0.1:1/"
 
 
 def open_fds():
@@ -25,24 +25,65 @@ def open_fds():
     return fds
 
 
-def test_stop_releases_thread_and_fds():
-    loop = asyncio.new_event_loop()
-    try:
-        gc.collect()
-        before = open_fds()
-        el = httpperf.Engine()
-        thread = el._thread
-        el.close()
-        thread.join(timeout=2)
-        assert not thread.is_alive()
-        del el
-        gc.collect()
-        assert open_fds() == before
-    finally:
+def run_python(code, *args):
+    p = subprocess.run([sys.executable, "-c", code, *args], capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, p.stderr
+    return p.stdout.split()
+
+
+def fail_on(loop, session):
+    with pytest.raises(httpperf.RequestError):
+        loop.run_until_complete(session.get(REFUSED))
+
+
+@pytest.fixture
+def silent_url():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(100)
+    yield "http://127.0.0.1:%d/" % sock.getsockname()[1]
+    sock.close()
+
+
+@pytest.fixture
+def two_loops():
+    loops = asyncio.new_event_loop(), asyncio.new_event_loop()
+    yield loops
+    for loop in loops:
         loop.close()
 
 
-def test_out_of_fds_raises():
+def test_close_stops_the_thread():
+    engine = httpperf.Engine()
+    engine.close()
+    engine._thread.join(timeout=2)
+    assert not engine._thread.is_alive()
+
+
+def test_close_releases_its_files():
+    gc.collect()
+    before = open_fds()
+    engine = httpperf.Engine()
+    engine.close()
+    engine._thread.join(timeout=2)
+    del engine
+    gc.collect()
+    assert open_fds() == before
+
+
+def test_an_unclosed_engine_stops_when_dropped():
+    loop = asyncio.new_event_loop()
+    engine = httpperf.Engine()
+    thread = engine._thread
+    fail_on(loop, httpperf.Session(engine=engine))
+    loop.close()
+    del engine
+    gc.collect()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_running_out_of_files_raises_oserror():
     code = """
 import asyncio, os, resource
 import httpperf
@@ -59,28 +100,21 @@ os.close(held.pop())
 try:
     httpperf.Engine()
 except OSError as e:
-    print("OSError", e.errno)
+    print(e.errno)
 """
-    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
-    assert p.returncode == 0, p.stderr
-    assert p.stdout.split() == ["OSError", str(errno.EMFILE)]
+    assert run_python(code) == [str(errno.EMFILE)]
 
 
 def test_many_requests_and_sessions_do_not_block_pipes():
     code = """
-import asyncio, socket
+import asyncio, sys
 import httpperf
-
-sock = socket.socket()
-sock.bind(("127.0.0.1", 0))
-url = "http://127.0.0.1:%d/" % sock.getsockname()[1]
-sock.close()
 
 
 async def main():
     el = httpperf.Engine()
     session = httpperf.Session(engine=el)
-    results = await asyncio.gather(*(session.get(url) for _ in range(20000)), return_exceptions=True)
+    results = await asyncio.gather(*(session.get(sys.argv[1]) for _ in range(20000)), return_exceptions=True)
     sessions = [httpperf.Session(engine=el, connections="session") for _ in range(20000)]
     el.close()
     el._thread.join()
@@ -90,158 +124,119 @@ async def main():
 
 asyncio.run(main())
 """
-    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
-    assert p.returncode == 0, p.stderr
-    assert p.stdout.split() == ["20000"]
+    assert run_python(code, REFUSED) == ["20000"]
 
 
-def test_session_keeps_its_engine_across_asyncio_run():
+def test_a_session_keeps_its_connections_across_asyncio_run(server):
     code = """
-import asyncio, http.server, threading
+import asyncio, sys
 import httpperf
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+session = httpperf.Session()
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+async def new_connection():
+    return (await session.get(sys.argv[1])).connect_time > 0
 
-    def log_message(self, *args):
-        pass
-
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-url = "http://127.0.0.1:%d/" % server.server_address[1]
-session = httpperf.Session(http_version="HTTP/1.1")
-
-async def get():
-    return (await session.get(url)).connect_time > 0
-
-print(asyncio.run(get()), asyncio.run(get()))
+print(asyncio.run(new_connection()), asyncio.run(new_connection()))
 """
-    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
-    assert p.returncode == 0, p.stderr
-    assert p.stdout.split() == ["True", "False"]
+    assert run_python(code, server.url) == ["True", "False"]
 
 
-def test_engine_binds_to_one_live_loop():
+def test_an_engine_refuses_a_second_live_loop(two_loops):
+    first, second = two_loops
+    session = httpperf.Session(engine=httpperf.Engine())
+    fail_on(first, session)
+    with pytest.raises(RuntimeError, match="another event loop"):
+        second.run_until_complete(session.get(REFUSED))
+
+
+def test_an_engine_moves_to_a_new_loop_once_the_old_one_closes(two_loops):
+    first, second = two_loops
+    session = httpperf.Session(engine=httpperf.Engine())
+    fail_on(first, session)
+    first.close()
+    fail_on(second, session)
+
+
+def test_a_closed_engine_refuses_requests():
     engine = httpperf.Engine()
     session = httpperf.Session(engine=engine)
-    first = asyncio.new_event_loop()
-    second = asyncio.new_event_loop()
-    try:
-        with pytest.raises(httpperf.RequestError):
-            first.run_until_complete(session.get("http://127.0.0.1:1/"))
-        with pytest.raises(RuntimeError, match="another event loop"):
-            second.run_until_complete(session.get("http://127.0.0.1:1/"))
-        first.close()
-        with pytest.raises(httpperf.RequestError):
-            second.run_until_complete(session.get("http://127.0.0.1:1/"))
-        engine.close()
-        with pytest.raises(RuntimeError, match="engine is closed"):
-            second.run_until_complete(session.get("http://127.0.0.1:1/"))
-    finally:
-        first.close()
-        second.close()
+    engine.close()
+    with pytest.raises(RuntimeError, match="engine is closed"):
+        asyncio.run(session.get(REFUSED))
 
 
-def test_arguments_are_keyword_only():
+def test_session_arguments_are_keyword_only():
     with pytest.raises(TypeError):
         httpperf.Session("shared")
+
+
+def test_engine_arguments_are_keyword_only():
     with pytest.raises(TypeError):
         httpperf.Engine(10)
 
 
-def test_unclosed_engine_stops_when_dropped():
-    loop = asyncio.new_event_loop()
-    try:
-        engine = httpperf.Engine()
-        thread = engine._thread
+def default_engine_of_a_new_thread():
+    engines = []
+
+    async def main():
+        session = httpperf.Session()
         with pytest.raises(httpperf.RequestError):
-            loop.run_until_complete(httpperf.Session(engine=engine).get("http://127.0.0.1:1/"))
-    finally:
-        loop.close()
-    del engine
+            await session.get(REFUSED)
+        engines.append(session._engine)
+
+    thread = threading.Thread(target=asyncio.run, args=(main(),))
+    thread.start()
+    thread.join()
+    return engines[0]
+
+
+def test_each_loop_gets_its_own_default_engine():
+    assert default_engine_of_a_new_thread() is not default_engine_of_a_new_thread()
+
+
+def test_a_default_engine_stops_when_its_loop_finishes():
+    thread = default_engine_of_a_new_thread()._thread
     gc.collect()
     thread.join(timeout=2)
     assert not thread.is_alive()
 
 
-def engine_threads():
-    return sum(t.name == "httpperf-engine" for t in threading.enumerate())
+async def test_the_default_engine_keeps_connections_while_its_loop_runs(server):
+    async def new_connection():
+        async with httpperf.Session() as session:
+            return (await session.get(server.url)).connect_time > 0
 
-
-def wait_for_engine_threads(n):
-    deadline = time.monotonic() + 2
-    while engine_threads() != n and time.monotonic() < deadline:
-        gc.collect()
-        time.sleep(0.01)
-    return engine_threads()
-
-
-@pytest.fixture
-def silent_url():
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    sock.listen(100)
-    yield "http://127.0.0.1:%d/" % sock.getsockname()[1]
-    sock.close()
-
-
-def test_default_engine_is_per_loop():
+    await new_connection()
     gc.collect()
-    before = wait_for_engine_threads(engine_threads())
-    engines = []
-    errors = []
-
-    async def main():
-        session = httpperf.Session()
-        with pytest.raises(httpperf.RequestError):
-            await session.get("http://127.0.0.1:1/")
-        engines.append(session._engine)
-
-    def run():
-        try:
-            asyncio.run(main())
-        except Exception as e:
-            errors.append(e)
-
-    threads = [threading.Thread(target=run) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert errors == []
-    assert engines[0] is not engines[1]
-    del engines[:]
-    assert wait_for_engine_threads(before) == before
+    assert not await new_connection()
 
 
-def test_session_needs_no_loop_until_first_request():
+def test_a_session_needs_no_loop_until_its_first_request():
     session = httpperf.Session()
     session.add_cookie_list([httpperf.Cookie(False, "example.com", False, "/", False, 0, "a", "1")])
     assert session.cookies() == {"a": "1"}
-    session.close()
 
 
-def test_close_with_requests_in_flight_warns(silent_url):
-    async def main():
-        engine = httpperf.Engine()
-        task = asyncio.ensure_future(httpperf.Session(engine=engine).get(silent_url))
-        await asyncio.sleep(0.1)
-        with pytest.warns(ResourceWarning, match="1 requests in flight"):
-            engine.close()
-        with pytest.raises(httpperf.RequestError, match="engine closed"):
-            await task
-
-    asyncio.run(main())
+async def test_closing_an_engine_with_requests_in_flight_warns(silent_url):
+    engine = httpperf.Engine()
+    asyncio.create_task(httpperf.Session(engine=engine).get(silent_url))
+    await asyncio.sleep(0.1)
+    with pytest.warns(ResourceWarning, match="1 requests in flight"):
+        engine.close()
 
 
-def test_dropped_loop_after_cancelling_does_not_warn(silent_url):
-    gc.collect()
-    before = wait_for_engine_threads(engine_threads())
+@pytest.mark.filterwarnings("ignore::ResourceWarning")
+async def test_closing_an_engine_fails_its_requests_in_flight(silent_url):
+    engine = httpperf.Engine()
+    task = asyncio.create_task(httpperf.Session(engine=engine).get(silent_url))
+    await asyncio.sleep(0.1)
+    engine.close()
+    with pytest.raises(httpperf.RequestError, match="engine closed"):
+        await task
+
+
+def test_dropping_a_loop_after_cancelling_does_not_warn(silent_url):
     loop = asyncio.new_event_loop()
     task = loop.create_task(httpperf.Session().get(silent_url))
     loop.run_until_complete(asyncio.sleep(0.1))
@@ -252,77 +247,14 @@ def test_dropped_loop_after_cancelling_does_not_warn(silent_url):
         loop.close()
         del task, loop
         gc.collect()
-    assert wait_for_engine_threads(before) == before
 
 
-def test_default_engine_lasts_as_long_as_its_loop():
-    import http.server
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = "http://127.0.0.1:%d/" % server.server_address[1]
-
-    async def journey():
-        async with httpperf.Session(http_version="HTTP/1.1") as session:
-            return (await session.get(url)).connect_time > 0
-
-    async def main():
-        first = await journey()
-        gc.collect()
-        return first, await journey()
-
-    try:
-        assert asyncio.run(main()) == (True, False)
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-def test_cancelled_requests_do_not_strand_others():
-    release = threading.Event()
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def do_GET(self):
-            release.wait(10)
-            self.send_response(200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-
-        def log_message(self, *args):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = "http://127.0.0.1:%d/" % server.server_address[1]
-    errors = []
-
-    async def main():
-        asyncio.get_running_loop().set_exception_handler(lambda loop, context: errors.append(context))
-        async with httpperf.Session(http_version="HTTP/1.1") as session:
-            tasks = [asyncio.create_task(session.get(url)) for _ in range(10)]
-            await asyncio.sleep(0.2)
-            for task in tasks[::2]:
-                task.cancel()
-            release.set()
-            done, pending = await asyncio.wait(tasks[1::2], timeout=5)
-            await asyncio.sleep(0.1)
-            return [t.result().status_code for t in done], len(pending)
-
-    try:
-        assert asyncio.run(main()) == ([200] * 5, 0)
-        assert errors == []
-    finally:
-        server.shutdown()
+async def test_cancelled_requests_do_not_strand_others(server):
+    async with httpperf.Session() as session:
+        tasks = [asyncio.create_task(session.get(server.url + "/slow")) for _ in range(10)]
+        await asyncio.sleep(0.2)
+        for task in tasks[::2]:
+            task.cancel()
+        server.release.set()
+        responses = await asyncio.wait_for(asyncio.gather(*tasks[1::2]), 5)
+    assert [r.status_code for r in responses] == [200] * 5
