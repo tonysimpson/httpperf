@@ -106,6 +106,15 @@ An engine binds to the asyncio loop running when it is first used, and so does a
 
 `engine.stats()` gives the counts for all the engine's sessions. See [Statistics](#statistics).
 
+Each engine has one curl thread. When the Python code does real work on each response, Python is the limit and one engine is plenty. A simple load driver that does little per response can make the curl thread the limit instead. Several engines can share one asyncio loop, so spreading sessions over them drives more throughput:
+
+```python
+engines = [httpperf.Engine() for _ in range(4)]
+sessions = [httpperf.Session(engine=engines[i % len(engines)]) for i in range(100)]
+```
+
+Each engine has its own connections and limits. On 4 cores against a local server, 4 engines took a closed loop of 100 requests from 104k to 223k requests per second for small responses, and from 60k to 183k for 100 KB ones, at which point the Python thread was the limit.
+
 ### Session methods
 
 - `await session.get(url, **kwargs)`, and likewise `post`, `put`, `patch`, `delete`, `head` and `options`.
