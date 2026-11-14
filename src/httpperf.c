@@ -59,6 +59,26 @@ struct AcRequestData;
 #define HANDLE_POOL_SIZE 256
 
 typedef struct {
+    atomic_long requests;
+    atomic_long errors;
+    atomic_long cancelled;
+    atomic_long connections;
+    atomic_long tls_handshakes;
+    atomic_long http_versions[4];
+    atomic_long bytes_sent;
+    atomic_long bytes_received;
+    atomic_long running;
+    atomic_long queued;
+} Stats;
+
+typedef struct OpenCount {
+    atomic_long open;
+    atomic_long *engine;
+} OpenCount;
+
+static const char *http_version_names[] = {"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"};
+
+typedef struct {
     PyObject_HEAD aeEventLoop *event_loop;
     PyThreadState *thread_state;
     CURLM *multi;
@@ -80,6 +100,8 @@ typedef struct {
     struct Share *limiter;
     CURL *free_handles[HANDLE_POOL_SIZE];
     int free_handle_count;
+    Stats stats;
+    OpenCount open_count;
 } EventLoop;
 
 typedef struct HostSlot {
@@ -113,6 +135,7 @@ typedef struct Share {
     HostSlot *ready_head;
     HostSlot *ready_tail;
     bool dispatching;
+    OpenCount open_count;
 } Share;
 
 typedef struct {
@@ -227,6 +250,7 @@ typedef struct {
     char *http_proxy;
     char *https_proxy;
     char *no_proxy;
+    Stats stats;
 } Session;
 
 typedef struct {
@@ -306,7 +330,84 @@ typedef struct AcRequestData {
     atomic_int state;
     bool waiting;
     bool finished;
+    bool in_multi;
 } AcRequestData;
+
+static void stat_add(AcRequestData *rd, size_t offset, long n) {
+    Stats *both[] = {&rd->session->loop->stats, &rd->session->stats};
+    for (int i = 0; i < 2; i++) {
+        atomic_fetch_add_explicit((atomic_long *)((char *)both[i] + offset), n, memory_order_relaxed);
+    }
+}
+
+#define STAT_ADD(rd, field, n) stat_add((rd), offsetof(Stats, field), (n))
+
+static void stats_finish(AcRequestData *rd) {
+    if (rd->in_multi) {
+        STAT_ADD(rd, running, -1);
+        rd->in_multi = false;
+    }
+    long connects = 0;
+    curl_off_t appconnect = 0, uploaded = 0, downloaded = 0;
+    long request_size = 0, header_size = 0;
+    curl_easy_getinfo(rd->curl, CURLINFO_NUM_CONNECTS, &connects);
+    curl_easy_getinfo(rd->curl, CURLINFO_APPCONNECT_TIME_T, &appconnect);
+    curl_easy_getinfo(rd->curl, CURLINFO_REQUEST_SIZE, &request_size);
+    curl_easy_getinfo(rd->curl, CURLINFO_SIZE_UPLOAD_T, &uploaded);
+    curl_easy_getinfo(rd->curl, CURLINFO_HEADER_SIZE, &header_size);
+    curl_easy_getinfo(rd->curl, CURLINFO_SIZE_DOWNLOAD_T, &downloaded);
+    STAT_ADD(rd, connections, connects);
+    if (connects > 0 && appconnect > 0) {
+        STAT_ADD(rd, tls_handshakes, connects);
+    }
+    STAT_ADD(rd, bytes_sent, request_size + (long)uploaded);
+    STAT_ADD(rd, bytes_received, header_size + (long)downloaded);
+    if (rd->result == CURLE_ABORTED_BY_CALLBACK) {
+        STAT_ADD(rd, cancelled, 1);
+        return;
+    }
+    if (rd->result != CURLE_OK) {
+        STAT_ADD(rd, errors, 1);
+        return;
+    }
+    STAT_ADD(rd, requests, 1);
+    long version = 0;
+    curl_easy_getinfo(rd->curl, CURLINFO_HTTP_VERSION, &version);
+    int index = version == CURL_HTTP_VERSION_1_0   ? 0
+                : version == CURL_HTTP_VERSION_1_1 ? 1
+                : version == CURL_HTTP_VERSION_2_0 ? 2
+                : version == CURL_HTTP_VERSION_3   ? 3
+                                                   : -1;
+    if (index >= 0) {
+        STAT_ADD(rd, http_versions[index], 1);
+    }
+}
+
+static PyObject *stats_dict(Stats *stats, PyObject *open) {
+    PyObject *versions = PyDict_New();
+    if (open == NULL || versions == NULL) {
+        Py_XDECREF(open);
+        Py_XDECREF(versions);
+        return NULL;
+    }
+    for (int i = 0; i < 4; i++) {
+        PyObject *n = PyLong_FromLong(atomic_load_explicit(&stats->http_versions[i], memory_order_relaxed));
+        if (n == NULL || PyDict_SetItemString(versions, http_version_names[i], n) == -1) {
+            Py_XDECREF(n);
+            Py_DECREF(versions);
+            Py_DECREF(open);
+            return NULL;
+        }
+        Py_DECREF(n);
+    }
+#define LOAD(field) atomic_load_explicit(&stats->field, memory_order_relaxed)
+    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:N,s:l,s:N,s:l,s:l,s:l,s:l}", "requests", LOAD(requests), "errors",
+                         LOAD(errors), "cancelled", LOAD(cancelled), "connections", LOAD(connections),
+                         "connections_open", open, "tls_handshakes", LOAD(tls_handshakes), "http_versions", versions,
+                         "bytes_sent", LOAD(bytes_sent), "bytes_received", LOAD(bytes_received), "running",
+                         LOAD(running), "queued", LOAD(queued));
+#undef LOAD
+}
 
 enum { REQUEST_RUNNING, REQUEST_SENT, REQUEST_CANCELLING };
 
@@ -722,6 +823,7 @@ static void queue_push(Share *share, AcRequestData *rd) {
     h->waiting_tail = rd;
     h->waiting++;
     rd->waiting = true;
+    STAT_ADD(rd, queued, 1);
     if (!h->ready) {
         ready_append(share, h);
     }
@@ -742,6 +844,7 @@ static void queue_remove(Share *share, AcRequestData *rd) {
     rd->prev_waiting = rd->next_waiting = NULL;
     h->waiting--;
     rd->waiting = false;
+    STAT_ADD(rd, queued, -1);
     if (h->waiting_head == NULL) {
         ready_remove(share, h);
     }
@@ -775,6 +878,7 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
 }
 
 static void release_request(EventLoop *loop, AcRequestData *rd) {
+    stats_finish(rd);
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
     curl_easy_setopt(rd->curl, CURLOPT_ERRORBUFFER, NULL);
     if (rd->slot != NULL) {
@@ -918,6 +1022,30 @@ size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     return buffer_append(&rd->body, ptr, n, initial) ? n : 0;
 }
 
+static void count_open(OpenCount *count, long n) {
+    atomic_fetch_add_explicit(&count->open, n, memory_order_relaxed);
+    if (count->engine != NULL) {
+        atomic_fetch_add_explicit(count->engine, n, memory_order_relaxed);
+    }
+}
+
+static curl_socket_t open_socket(void *clientp, curlsocktype purpose, struct curl_sockaddr *address) {
+    int type = address->socktype;
+#ifdef SOCK_CLOEXEC
+    type |= SOCK_CLOEXEC;
+#endif
+    curl_socket_t s = socket(address->family, type, address->protocol);
+    if (s != CURL_SOCKET_BAD) {
+        count_open(clientp, 1);
+    }
+    return s;
+}
+
+static int close_socket(void *clientp, curl_socket_t item) {
+    count_open(clientp, -1);
+    return close(item);
+}
+
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     AcRequestData *rd;
     EventLoop *loop = (EventLoop *)clientData;
@@ -998,6 +1126,15 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_WRITEDATA, rd);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(rd->curl, CURLOPT_HEADERDATA, rd);
+    curl_easy_setopt(rd->curl, CURLOPT_OPENSOCKETFUNCTION, open_socket);
+    OpenCount *count = &loop->open_count;
+    if (rd->session->own_pool) {
+        count = &rd->share->open_count;
+        count->engine = &loop->open_count.open;
+    }
+    curl_easy_setopt(rd->curl, CURLOPT_OPENSOCKETDATA, count);
+    curl_easy_setopt(rd->curl, CURLOPT_CLOSESOCKETFUNCTION, close_socket);
+    curl_easy_setopt(rd->curl, CURLOPT_CLOSESOCKETDATA, count);
     if (rd->share->max_host_connections || rd->share->max_connections) {
         rd->limiter = rd->share;
     } else if (loop->limiter != NULL && !rd->session->own_pool) {
@@ -1038,7 +1175,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
 static void add_transfer(EventLoop *loop, AcRequestData *rd) {
     DEBUG_PRINT("adding handle");
     CURLMcode rc = curl_multi_add_handle(loop->multi, rd->curl);
-    if (rc != CURLM_OK) {
+    if (rc == CURLM_OK) {
+        rd->in_multi = true;
+        STAT_ADD(rd, running, 1);
+    } else {
         check_multi(loop, rc);
         rd->result = CURLE_FAILED_INIT;
         curl_slist_free_all(rd->headers);
@@ -1338,6 +1478,11 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
 
 static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { return limiter_state(self->limiter); }
 
+static PyObject *EventLoop_stats(EventLoop *self, PyObject *args) {
+    return stats_dict(&self->stats,
+                      PyLong_FromLong(atomic_load_explicit(&self->open_count.open, memory_order_relaxed)));
+}
+
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
     ((EventLoop *)self)->closing = true;
     if (!pipe_write(((EventLoop *)self)->stop_write, "\0", 1)) {
@@ -1417,6 +1562,7 @@ static PyMethodDef EventLoop_methods[] = {
     {"abandon", (PyCFunction)EventLoop_abandon, METH_NOARGS, "Free requests in flight once stopped"},
     {"stop", EventLoop_stop, METH_NOARGS, "Stop the event loop"},
     {"_limiter_state", (PyCFunction)EventLoop_limiter_state, METH_NOARGS, "The limiter's counts, for tests"},
+    {"stats", (PyCFunction)EventLoop_stats, METH_NOARGS, "The engine's request and connection counts"},
     {"get_out_fd", Eventloop_get_out_fd, METH_NOARGS, "Get the outbound file dscriptor"},
     {"get_completed", Eventloop_get_completed, METH_NOARGS, "Get the user_object, response and error"},
     {NULL, NULL, 0, NULL}};
@@ -1826,6 +1972,15 @@ error_cleanup:
     return NULL;
 }
 
+static PyObject *Session_stats(Session *self, PyObject *args) {
+    if (!self->own_pool) {
+        Py_INCREF(Py_None);
+        return stats_dict(&self->stats, Py_None);
+    }
+    long open = self->shared ? atomic_load_explicit(&self->shared->open_count.open, memory_order_relaxed) : 0;
+    return stats_dict(&self->stats, PyLong_FromLong(open));
+}
+
 static PyObject *Session_limiter_state(Session *self, PyObject *args) {
     bool limited = self->shared != NULL && (self->shared->max_host_connections || self->shared->max_connections);
     return limiter_state(limited ? self->shared : NULL);
@@ -1912,6 +2067,7 @@ static PyMethodDef Session_methods[] = {
     {"apply_cookielist", (PyCFunction)Session_apply_cookielist, METH_VARARGS, "Apply CURLOPT_COOKIELIST lines"},
     {"cancel", (PyCFunction)Session_cancel, METH_O, "Stop a request in flight"},
     {"_limiter_state", (PyCFunction)Session_limiter_state, METH_NOARGS, "The limiter's counts, for tests"},
+    {"stats", (PyCFunction)Session_stats, METH_NOARGS, "The session's request counts"},
     {"close", (PyCFunction)Session_close, METH_NOARGS, "Close the session's connections"},
     {"attach", (PyCFunction)Session_attach, METH_VARARGS, "Attach the session to an EventLoop"},
     {NULL, NULL, 0, NULL}};

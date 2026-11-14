@@ -652,6 +652,13 @@ class Session:
     async def __aexit__(self, *exc_info):
         self.close()
 
+    @property
+    def engine(self):
+        return self._engine
+
+    def stats(self):
+        return self._session.stats()
+
     def cookies(self):
         return _cookie_list_to_cookie_dict(parse_cookie_string(c) for c in self._session.get_cookielist())
 
@@ -856,6 +863,9 @@ class Engine:
         self._closed = False
         self._thread = threading.Thread(target=self._ae_loop.main, name="httpperf-engine", daemon=True)
         self._thread.start()
+
+    def stats(self):
+        return self._ae_loop.stats()
 
     def _bind(self, loop):
         if self._closed:
