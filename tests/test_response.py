@@ -51,8 +51,8 @@ class RawResponse:
         return self._header
 
 
-def test_headers():
-    r = httpperf.Response(
+def response_with_headers():
+    return httpperf.Response(
         None,
         RawResponse(
             b"HTTP/1.1 100 Continue\r\n\r\n"
@@ -62,19 +62,47 @@ def test_headers():
         0,
         0,
     )
-    assert r.headers_tuple == (
+
+
+def test_headers_tuple_keeps_the_final_responses_headers_in_order():
+    assert response_with_headers().headers_tuple == (
         ("Content-Type", "text/plain"),
         ("X-Name", "café"),
         ("X-Dup", "a"),
         ("x-dup", "b"),
         ("X-Tight", "v"),
     )
-    assert r.headers["content-type"] == r.headers["CONTENT-TYPE"] == "text/plain"
-    assert r.headers["x-dup"] == "a, b"
-    assert "x-name" in r.headers and "missing" not in r.headers and 1 not in r.headers
-    assert list(r.headers) == ["Content-Type", "X-Name", "X-Dup", "X-Tight"]
-    assert r.headers.get("missing", "default") == "default"
-    assert dict(r.headers) == {"Content-Type": "text/plain", "X-Name": "café", "X-Dup": "a, b", "X-Tight": "v"}
+
+
+@pytest.mark.parametrize("name", ["content-type", "CONTENT-TYPE"])
+def test_header_names_ignore_case(name):
+    assert response_with_headers().headers[name] == "text/plain"
+
+
+def test_repeated_headers_are_joined():
+    assert response_with_headers().headers["x-dup"] == "a, b"
+
+
+@pytest.mark.parametrize("name, present", [("x-name", True), ("missing", False), (1, False)])
+def test_header_membership(name, present):
+    assert (name in response_with_headers().headers) == present
+
+
+def test_iterating_headers_gives_each_name_once_in_order():
+    assert list(response_with_headers().headers) == ["Content-Type", "X-Name", "X-Dup", "X-Tight"]
+
+
+def test_header_get_with_a_default():
+    assert response_with_headers().headers.get("missing", "default") == "default"
+
+
+def test_headers_as_a_dict():
+    assert dict(response_with_headers().headers) == {
+        "Content-Type": "text/plain",
+        "X-Name": "café",
+        "X-Dup": "a, b",
+        "X-Tight": "v",
+    }
 
 
 def python_parse_headers(header):

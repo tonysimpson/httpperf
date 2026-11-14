@@ -1,14 +1,15 @@
 import time
 
+import pytest
+
 import httpperf
 
-
-def cookie(expiration):
-    return httpperf.Cookie(False, "example.com", False, "/", False, expiration, "name", "value")
+NOW = int(time.time())
 
 
-def test_has_expired():
-    now = int(time.time())
-    assert not cookie(0).has_expired
-    assert not cookie(now + 3600).has_expired
-    assert cookie(now - 3600).has_expired
+@pytest.mark.parametrize(
+    "expiration, expired", [(0, False), (NOW + 3600, False), (NOW - 3600, True)], ids=["session", "future", "past"]
+)
+def test_has_expired(expiration, expired):
+    cookie = httpperf.Cookie(False, "example.com", False, "/", False, expiration, "name", "value")
+    assert cookie.has_expired == expired
