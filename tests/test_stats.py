@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 
+from helpers import until
+
 import httpperf
 
 REFUSED = "http://127.0.0.1:9/"
@@ -16,14 +18,6 @@ async def count(name, url, requests=1):
 
 async def get_together(session, url, requests):
     await asyncio.gather(*(session.get(url) for _ in range(requests)))
-
-
-async def until(condition):
-    for _ in range(100):
-        if condition():
-            return True
-        await asyncio.sleep(0.01)
-    return False
 
 
 def test_a_new_session_has_counted_nothing():

@@ -76,5 +76,12 @@ def server(make_server):
 def pytest_pyfunc_call(pyfuncitem):
     if inspect.iscoroutinefunction(pyfuncitem.obj):
         args = {name: pyfuncitem.funcargs[name] for name in pyfuncitem._fixtureinfo.argnames}
-        asyncio.run(pyfuncitem.obj(**args))
+        assert asyncio.run(without_loop_errors(pyfuncitem.obj(**args))) == []
         return True
+
+
+async def without_loop_errors(test):
+    errors = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, context: errors.append(context))
+    await test
+    return errors
