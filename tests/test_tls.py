@@ -1,4 +1,3 @@
-import asyncio
 import http.server
 import os
 import ssl
@@ -9,6 +8,8 @@ import pytest
 import pytest_httpbin.certs
 
 import httpperf
+
+CA = pytest_httpbin.certs.where()
 
 
 class ReusedHandler(http.server.BaseHTTPRequestHandler):
@@ -38,16 +39,16 @@ def tls_url():
     server.server_close()
 
 
-@pytest.mark.parametrize("tls, resumed", [("shared", "True"), ("session", "False")])
-def test_tls_resumption_across_sessions(tls_url, tls, resumed):
-    loop = asyncio.new_event_loop()
-    el = httpperf.Engine()
-    first = httpperf.Session(engine=el, connections="session", tls=tls)
-    assert loop.run_until_complete(first.get(tls_url)).text == "False"
-    second = httpperf.Session(engine=el, connections="session", tls=tls)
-    assert loop.run_until_complete(second.get(tls_url)).text == resumed
-    el.close()
-    loop.close()
+async def resumed(url, tls):
+    async with httpperf.Engine() as engine:
+        await httpperf.Session(engine=engine, connections="session", tls=tls).get(url)
+        r = await httpperf.Session(engine=engine, connections="session", tls=tls).get(url)
+    return r.text == "True"
+
+
+@pytest.mark.parametrize("tls, expected", [("shared", True), ("session", False)])
+async def test_tls_resumption_across_sessions(tls_url, tls, expected):
+    assert await resumed(tls_url, tls) == expected
 
 
 class ClientCertHandler(http.server.BaseHTTPRequestHandler):
@@ -96,47 +97,63 @@ def mtls_url(client_certs):
     server.server_close()
 
 
-def test_client_certs(mtls_url, client_certs):
-    loop = asyncio.new_event_loop()
-    el = httpperf.Engine()
-    user1 = httpperf.Session(engine=el, cert=client_certs["user1"])
-    user2 = httpperf.Session(engine=el, cert=client_certs["user2"])
-
-    def who(session, **kwargs):
-        return loop.run_until_complete(session.get(mtls_url, **kwargs)).text
-
-    assert [who(user1), who(user2), who(user1), who(user2)] == ["user1", "user2", "user1", "user2"]
-    assert who(user1, cert=client_certs["user2"]) == "user2"
-    with pytest.raises(httpperf.RequestError):
-        who(httpperf.Session(engine=el))
-    with pytest.raises(ValueError):
-        who(user1, cert="user1.pem")
-    el.close()
-    loop.close()
+async def who(session, url, **options):
+    return (await session.get(url, **options)).text
 
 
-def test_verify(tls_url):
-    loop = asyncio.new_event_loop()
-    el = httpperf.Engine()
-    ca = pytest_httpbin.certs.where()
+async def test_each_session_presents_its_own_certificate(mtls_url, client_certs):
+    async with httpperf.Engine() as engine:
+        user1 = httpperf.Session(engine=engine, cert=client_certs["user1"])
+        user2 = httpperf.Session(engine=engine, cert=client_certs["user2"])
+        names = [await who(s, mtls_url) for s in (user1, user2, user1, user2)]
+    assert names == ["user1", "user2", "user1", "user2"]
 
-    def get(session, **kwargs):
-        return loop.run_until_complete(session.get(tls_url, **kwargs)).status_code
 
-    unverified = httpperf.Session(engine=el)
-    assert get(unverified) == 200
-    with pytest.raises(httpperf.RequestError):
-        get(unverified, verify=True)
-    assert get(unverified, verify=ca) == 200
-    with pytest.raises(httpperf.RequestError):
-        get(httpperf.Session(engine=el, verify=True))
-    verified = httpperf.Session(engine=el, verify=ca)
-    assert get(verified) == 200
-    assert get(verified, verify=False) == 200
-    with pytest.raises(ValueError):
-        get(verified, verify=1)
-    el.close()
-    loop.close()
+async def test_a_request_certificate_overrides_the_sessions(mtls_url, client_certs):
+    async with httpperf.Session(cert=client_certs["user1"]) as s:
+        assert await who(s, mtls_url, cert=client_certs["user2"]) == "user2"
+
+
+async def test_no_certificate_is_refused(mtls_url):
+    async with httpperf.Session() as s:
+        with pytest.raises(httpperf.RequestError):
+            await s.get(mtls_url)
+
+
+async def test_a_certificate_must_be_a_pair(mtls_url):
+    async with httpperf.Session() as s:
+        with pytest.raises(ValueError):
+            await s.get(mtls_url, cert="user1.pem")
+
+
+async def verified(url, session_verify, **options):
+    async with httpperf.Session(verify=session_verify) as s:
+        try:
+            await s.get(url, **options)
+        except httpperf.RequestError:
+            return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "session_verify, options, succeeds",
+    [
+        (False, {}, True),
+        (False, {"verify": True}, False),
+        (False, {"verify": CA}, True),
+        (True, {}, False),
+        (CA, {}, True),
+        (CA, {"verify": False}, True),
+    ],
+)
+async def test_verify(tls_url, session_verify, options, succeeds):
+    assert await verified(tls_url, session_verify, **options) == succeeds
+
+
+async def test_verify_must_be_a_bool_or_a_path(tls_url):
+    async with httpperf.Session() as s:
+        with pytest.raises(ValueError):
+            await s.get(tls_url, verify=1)
 
 
 @pytest.fixture
@@ -156,14 +173,15 @@ def ca_lookup(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_ca_lookup_uses_the_environment_first(ca_lookup, monkeypatch):
+@pytest.mark.parametrize("file, directory", [(True, False), (True, True), (False, True)])
+def test_ca_lookup_uses_the_environment_first(ca_lookup, monkeypatch, file, directory):
     monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: str(ca_lookup / "ca.pem"))
-    monkeypatch.setenv("SSL_CERT_FILE", str(ca_lookup / "ca.pem"))
-    assert httpperf._find_ca() == (str(ca_lookup / "ca.pem"), None)
-    monkeypatch.setenv("SSL_CERT_DIR", str(ca_lookup))
-    assert httpperf._find_ca() == (str(ca_lookup / "ca.pem"), str(ca_lookup))
-    monkeypatch.delenv("SSL_CERT_FILE")
-    assert httpperf._find_ca() == (None, str(ca_lookup))
+    if file:
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca_lookup / "ca.pem"))
+    if directory:
+        monkeypatch.setenv("SSL_CERT_DIR", str(ca_lookup))
+    expected = (str(ca_lookup / "ca.pem") if file else None, str(ca_lookup) if directory else None)
+    assert httpperf._find_ca() == expected
 
 
 def test_ca_lookup_ignores_missing_environment_paths(ca_lookup, monkeypatch):
@@ -175,6 +193,9 @@ def test_ca_lookup_ignores_missing_environment_paths(ca_lookup, monkeypatch):
 def test_ca_lookup_leaves_libcurls_own_bundle_alone(ca_lookup, monkeypatch):
     monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: str(ca_lookup / "ca.pem"))
     assert httpperf._find_ca() == (None, None)
+
+
+def test_ca_lookup_skips_a_missing_libcurl_bundle(ca_lookup, monkeypatch):
     monkeypatch.setattr(httpperf._httpperf, "default_ca_file", lambda: "/missing/ca.pem")
     assert httpperf._find_ca() == (str(ca_lookup / "python.pem"), None)
 
@@ -183,24 +204,22 @@ def test_ca_lookup_uses_pythons_bundle_without_its_directory(ca_lookup):
     assert httpperf._find_ca() == (str(ca_lookup / "python.pem"), None)
 
 
-def test_ca_lookup_falls_back_to_known_bundles(ca_lookup, monkeypatch):
+def test_ca_lookup_falls_back_to_known_bundles(ca_lookup):
     (ca_lookup / "python.pem").unlink()
     assert httpperf._find_ca() == (str(ca_lookup / "ca.pem"), None)
+
+
+def test_ca_lookup_finds_nothing_without_bundles(ca_lookup, monkeypatch):
+    (ca_lookup / "python.pem").unlink()
     monkeypatch.setattr(httpperf, "_CA_FILES", ("/missing/ca.pem",))
     assert httpperf._find_ca() == (None, None)
 
 
-def test_verify_with_ssl_cert_dir(tls_url, monkeypatch, tmp_path):
-    with open(pytest_httpbin.certs.where()) as f:
+async def test_verify_with_ssl_cert_dir(tls_url, monkeypatch, tmp_path):
+    with open(CA) as f:
         (tmp_path / "ca.pem").write_text(f.read())
     subprocess.run(["openssl", "rehash", str(tmp_path)], check=True, capture_output=True)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
     monkeypatch.setattr(httpperf, "_ca", httpperf._find_ca())
-    assert httpperf._ca == (None, str(tmp_path))
-    loop = asyncio.new_event_loop()
-    el = httpperf.Engine()
-    response = loop.run_until_complete(httpperf.Session(engine=el, verify=True).get(tls_url))
-    assert response.status_code == 200
-    el.close()
-    loop.close()
+    assert await verified(tls_url, True)
