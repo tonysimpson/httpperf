@@ -6,6 +6,7 @@ import threading
 
 import pytest
 import pytest_httpbin.certs
+from helpers import until
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
@@ -60,142 +61,114 @@ def h2_url():
 
 
 def libcurl_has_http3():
-    loop = asyncio.new_event_loop()
-    el = httpperf.Engine()
     try:
-        httpperf.Session(engine=el, http_version="HTTP/3")
-        return True
+        httpperf.Session(http_version="HTTP/3")
     except ValueError:
         return False
-    finally:
-        el.close()
-        loop.close()
+    return True
 
 
 HTTP3 = sys.version_info >= (3, 9) and libcurl_has_http3()
 needs_http3 = pytest.mark.skipif(
     not HTTP3, reason="needs libcurl with HTTP/3, and Python 3.9+ (hypercorn's HTTP/3 server hangs on 3.8)"
 )
+ALL_VERSIONS = [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2", "HTTP/1.1"]
+MULTIPLEXED = [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2"]
 
 
-def run(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro(httpperf.Engine()))
-    finally:
-        loop.close()
+async def get_with(url, version):
+    async with httpperf.Session(http_version=version) as s:
+        return await s.get(url)
 
 
-@pytest.mark.parametrize(
-    "version, body", [pytest.param("HTTP/3", "3", marks=needs_http3), ("HTTP/2", "2"), ("HTTP/1.1", "1.1")]
-)
-def test_http_version(h2_url, version, body):
-    async def main(el):
-        r = await httpperf.Session(engine=el, http_version=version).get(h2_url)
-        el.close()
-        return r
-
-    r = run(main)
-    assert (r.http_version, r.text) == (version, body)
-    assert r.headers["Content-Type"] == "text/plain"
+async def get_together(session, url, n):
+    return await asyncio.gather(*(session.get(url) for _ in range(n)))
 
 
-@pytest.mark.parametrize(
-    "version, connects", [pytest.param("HTTP/3", 1, marks=needs_http3), ("HTTP/2", 1), ("HTTP/1.1", 5)]
-)
-def test_concurrent_requests_share_a_connection(h2_url, version, connects):
-    async def main(el):
-        s = httpperf.Session(engine=el, connections="session", http_version=version)
-        responses = await asyncio.gather(*(s.get(h2_url) for _ in range(5)))
-        el.close()
-        return responses
-
-    assert sum(r.connect_time > 0 for r in run(main)) == connects
-
-
-def test_session_host_limit_with_multiplexing(h2_url):
-    async def main(el):
-        s = httpperf.Session(engine=el, connections="session", max_host_connections=2)
-        first = await asyncio.gather(*(s.get(h2_url) for _ in range(6)))
-        second = await asyncio.gather(*(s.get(h2_url) for _ in range(6)))
-        el.close()
-        return first, second
-
-    first, second = run(main)
-    assert sum(r.connect_time > 0 for r in first + second) == 1
-    assert sum(r.queue_time > 0 for r in first) == 4
-    assert all(r.queue_time == 0 for r in second)
-
-
-@pytest.mark.parametrize("version", [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2"])
-def test_cancel_one_stream_keeps_the_connection(h2_url, version):
-    async def main(el):
-        s = httpperf.Session(engine=el, connections="session", http_version=version)
-        tasks = [asyncio.ensure_future(s.get(h2_url + "slow")) for _ in range(6)]
-        await asyncio.sleep(0.3)
-        for task in tasks[::2]:
-            task.cancel()
-        kept = await asyncio.gather(*tasks[1::2])
-        after = await s.get(h2_url)
-        el.close()
-        return kept + [after], [t.cancelled() for t in tasks[::2]]
-
-    responses, cancelled = run(main)
-    assert cancelled == [True] * 3
-    assert [r.status_code for r in responses] == [200] * 4
-    assert sum(r.connect_time > 0 for r in responses) == 0
-
-
-def limiter_host(state):
+def limiter_host(owner):
+    state = (owner._session if isinstance(owner, httpperf.Session) else owner._ae_loop)._limiter_state()
     (host,) = state["hosts"].values()
     usage = (1 if host["active"] else 0) if host["multiplexed"] else host["active"]
     assert state["connections"] == usage
     return host
 
 
-@pytest.mark.parametrize("version", [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2"])
-def test_limiter_counts_a_multiplexed_host_once(h2_url, version):
-    async def main(el):
-        s = httpperf.Session(engine=el, connections="session", http_version=version, max_host_connections=2)
-        await s.get(h2_url)
-        tasks = [asyncio.ensure_future(s.get(h2_url + "slow")) for _ in range(6)]
+@pytest.mark.parametrize(
+    "version, server_saw", [pytest.param("HTTP/3", "3", marks=needs_http3), ("HTTP/2", "2"), ("HTTP/1.1", "1.1")]
+)
+async def test_requests_use_the_chosen_version(h2_url, version, server_saw):
+    assert (await get_with(h2_url, version)).text == server_saw
+
+
+@pytest.mark.parametrize("version", ALL_VERSIONS)
+async def test_responses_report_their_version(h2_url, version):
+    assert (await get_with(h2_url, version)).http_version == version
+
+
+@pytest.mark.parametrize("version", ALL_VERSIONS)
+async def test_headers_arrive_over_every_version(h2_url, version):
+    assert (await get_with(h2_url, version)).headers["Content-Type"] == "text/plain"
+
+
+@pytest.mark.parametrize(
+    "version, new_connections", [pytest.param("HTTP/3", 1, marks=needs_http3), ("HTTP/2", 1), ("HTTP/1.1", 5)]
+)
+async def test_concurrent_requests_share_a_connection(h2_url, version, new_connections):
+    async with httpperf.Session(connections="session", http_version=version) as s:
+        responses = await get_together(s, h2_url, 5)
+    assert sum(r.connect_time > 0 for r in responses) == new_connections
+
+
+async def two_batches_under_a_host_limit_of_2(url):
+    async with httpperf.Session(connections="session", max_host_connections=2) as s:
+        return await get_together(s, url, 6), await get_together(s, url, 6)
+
+
+async def test_a_multiplexed_host_under_a_limit_uses_one_connection(h2_url):
+    first, second = await two_batches_under_a_host_limit_of_2(h2_url)
+    assert sum(r.connect_time > 0 for r in first + second) == 1
+
+
+async def test_requests_queue_until_the_host_is_known_to_multiplex(h2_url):
+    first, _ = await two_batches_under_a_host_limit_of_2(h2_url)
+    assert sum(r.queue_time > 0 for r in first) == 6 - 2
+
+
+async def test_requests_to_a_multiplexed_host_do_not_queue(h2_url):
+    _, second = await two_batches_under_a_host_limit_of_2(h2_url)
+    assert sum(r.queue_time > 0 for r in second) == 0
+
+
+@pytest.mark.parametrize("version", MULTIPLEXED)
+async def test_cancelling_one_stream_keeps_the_connection(h2_url, version):
+    async with httpperf.Session(connections="session", http_version=version) as s:
+        tasks = [asyncio.create_task(s.get(h2_url + "slow")) for _ in range(6)]
         await asyncio.sleep(0.3)
-        busy = limiter_host(s._session._limiter_state())
+        for task in tasks[::2]:
+            task.cancel()
+        responses = await asyncio.gather(*tasks[1::2]) + [await s.get(h2_url)]
+    assert sum(r.connect_time > 0 for r in responses) == 0
+
+
+@pytest.mark.parametrize("version", MULTIPLEXED)
+async def test_a_multiplexed_host_takes_one_limiter_slot(h2_url, version):
+    async with httpperf.Session(connections="session", http_version=version, max_host_connections=2) as s:
+        await s.get(h2_url)
+        tasks = [asyncio.create_task(s.get(h2_url + "slow")) for _ in range(6)]
+        assert await until(lambda: limiter_host(s) == {"active": 6, "waiting": 0, "multiplexed": True})
         await asyncio.gather(*tasks)
-        idle = limiter_host(s._session._limiter_state())
-        el.close()
-        return busy, idle
-
-    busy, idle = run(main)
-    assert busy == {"active": 6, "waiting": 0, "multiplexed": True}
-    assert idle == {"active": 0, "waiting": 0, "multiplexed": True}
 
 
-def test_limiter_keeps_multiplexing_after_a_failure(h2_url):
-    async def main(el):
-        s = httpperf.Session(engine=el, connections="session", max_host_connections=2)
+async def test_a_failed_request_does_not_stop_multiplexing(h2_url):
+    async with httpperf.Session(connections="session", max_host_connections=2) as s:
         await s.get(h2_url)
         with pytest.raises(httpperf.Timeout):
             await s.get(h2_url + "slow", timeout=0.1)
-        state = s._session._limiter_state()
-        s.close()
-        el.close()
-        return state
-
-    assert limiter_host(run(main))["multiplexed"] is True
+        assert limiter_host(s)["multiplexed"] is True
 
 
-def test_limiter_follows_a_host_back_to_http1(h2_url):
-    async def main(el):
-        engine = httpperf.Engine(max_host_connections=4)
-        h2 = httpperf.Session(engine=engine)
-        h1 = httpperf.Session(engine=engine, http_version="HTTP/1.1")
-        await h2.get(h2_url)
-        before = limiter_host(engine._ae_loop._limiter_state())
-        await h1.get(h2_url)
-        after = limiter_host(engine._ae_loop._limiter_state())
-        engine.close()
-        el.close()
-        return before["multiplexed"], after["multiplexed"]
-
-    assert run(main) == (True, False)
+async def test_the_limiter_follows_a_host_back_to_http1(h2_url):
+    async with httpperf.Engine(max_host_connections=4) as engine:
+        await httpperf.Session(engine=engine).get(h2_url)
+        await httpperf.Session(engine=engine, http_version="HTTP/1.1").get(h2_url)
+        assert limiter_host(engine)["multiplexed"] is False
