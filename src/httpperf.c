@@ -2268,6 +2268,7 @@ PyMODINIT_FUNC PyInit__httpperf(void) {
         PyModule_AddObject(m, "EventLoop", (PyObject *)&EventLoopType);
         Py_INCREF(&ResponseType);
         PyModule_AddObject(m, "Response", (PyObject *)&ResponseType);
+        PyModule_AddIntConstant(m, "libcurl_version_num", curl_version_info(CURLVERSION_NOW)->version_num);
     }
 
     return m;

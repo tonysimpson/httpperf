@@ -46,7 +46,13 @@ async def resumed(url, tls):
     return r.text == "True"
 
 
-@pytest.mark.parametrize("tls, expected", [("shared", True), ("session", False)])
+SHARED_TLS_CACHE = pytest.mark.skipif(
+    httpperf._httpperf.libcurl_version_num < 0x080C00,
+    reason="before libcurl 8.12, TLS sessions are kept per curl handle, not per engine",
+)
+
+
+@pytest.mark.parametrize("tls, expected", [pytest.param("shared", True, marks=SHARED_TLS_CACHE), ("session", False)])
 async def test_tls_resumption_across_sessions(tls_url, tls, expected):
     assert await resumed(tls_url, tls) == expected
 

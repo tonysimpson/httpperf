@@ -233,6 +233,7 @@ The counts are updated on the curl thread, so they can lag a moment behind: a ca
 
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `Engine.close()` is called never complete.
+- With a system libcurl older than 8.12, `tls="shared"` doesn't share TLS sessions across the engine: curl keeps them per curl handle, so a new connection only resumes if it happens to reuse the handle of an earlier request to that host. The wheels bundle a newer curl.
 
 ## Development
 
