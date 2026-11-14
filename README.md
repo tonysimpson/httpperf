@@ -222,7 +222,7 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 | `http_versions` | `requests` by HTTP version: a dict with keys `"HTTP/1.0"`, `"HTTP/1.1"`, `"HTTP/2"` and `"HTTP/3"`. |
 | `connections` | New connections opened. A reused connection doesn't count. |
 | `tls_handshakes` | New connections that did a TLS handshake. |
-| `bytes_sent`, `bytes_received` | Request and response headers and bodies, with bodies as transferred (so compressed if the server compressed them). TLS and HTTP/2 and HTTP/3 framing aren't counted, so for those versions the figures are approximate. |
+| `bytes_sent`, `bytes_received` | Application-layer bytes only: request and response headers and bodies, with bodies as transferred (so compressed if the server compressed them). TLS, HTTP/2 and HTTP/3 framing, and TCP/IP overheads aren't counted. |
 | `running` | Requests with curl now. |
 | `queued` | Requests now waiting for a connection under the engine or session limits. |
 | `connections_open` | Connections open now, idle or in use, including any still connecting. For the engine, every pool. For a session with `connections="session"`, its own pool, and 0 once it is closed. `None` for other sessions, whose connections belong to the engine. |
