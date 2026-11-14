@@ -3,12 +3,21 @@ import http.server
 import inspect
 import select
 import socket
+import sys
 import threading
-import time
 
 import pytest
 
 import httpperf
+
+
+class TestHTTPServer(http.server.ThreadingHTTPServer):
+    request_queue_size = 1024
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], ConnectionError):
+            super().handle_error(request, client_address)
 
 
 class Server:
@@ -40,19 +49,9 @@ class Server:
             def log_message(self, *args):
                 pass
 
-        http_server = type("HTTPServer", (http.server.ThreadingHTTPServer,), {"request_queue_size": 1024})
-        self.httpd = http_server(("127.0.0.1", 0), Handler)
-        self.httpd.daemon_threads = True
+        self.httpd = TestHTTPServer(("127.0.0.1", 0), Handler)
         self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, args=(0.01,), daemon=True).start()
-
-    def wait_for(self, condition, timeout=5):
-        deadline = time.monotonic() + timeout
-        while not condition():
-            if time.monotonic() > deadline:
-                return False
-            time.sleep(0.01)
-        return True
 
 
 @pytest.fixture
