@@ -41,6 +41,13 @@ class Server:
                             with server.lock:
                                 server.hung_up += 1
                             return
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/")
+                    self.send_header("Content-Length", "5")
+                    self.end_headers()
+                    self.wfile.write(b"moved")
+                    return
                 self.send_response(200)
                 self.send_header("Content-Length", "2")
                 self.end_headers()

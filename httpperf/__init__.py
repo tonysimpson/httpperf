@@ -3,6 +3,7 @@ import collections.abc
 import datetime
 import email.utils
 import http
+import io
 import json as _json
 import os
 import ssl
@@ -378,6 +379,42 @@ class Headers(collections.abc.Mapping):
 _UNSET = object()
 
 
+class _Discard:
+    def __repr__(self):
+        return "httpperf.DISCARD"
+
+
+DISCARD = _Discard()
+
+
+def _body_to_options(body_to):
+    if body_to is None:
+        return {}
+    if body_to is DISCARD:
+        return {"discard_body": True}
+    if isinstance(body_to, io.TextIOBase):
+        raise TypeError("body_to must be a file opened in binary mode")
+    if body_to.closed:
+        raise ValueError("body_to is closed")
+    if not body_to.writable():
+        raise ValueError("body_to is not open for writing")
+    try:
+        body_to.write(b"")
+    except TypeError:
+        raise TypeError("body_to must be a file opened in binary mode") from None
+    try:
+        fd = body_to.fileno()
+    except (AttributeError, io.UnsupportedOperation):
+        raise TypeError("body_to must be a file on disk; leave it out to keep the body in memory") from None
+    body_to.flush()
+    return {"body_fd": fd}
+
+
+def _sync_position(body_to):
+    if body_to is not None and body_to is not DISCARD and not body_to.closed and body_to.seekable():
+        body_to.seek(os.lseek(body_to.fileno(), 0, os.SEEK_CUR))
+
+
 class Response:
     __slots__ = (
         "_req",
@@ -404,7 +441,7 @@ class Response:
         self._end_time = end_time
         self._redirect_url = _UNSET
         self._prev = None
-        self._body = None
+        self._body = _UNSET
         self._text = None
         self._header = None
         self._headers_tuple = None
@@ -538,9 +575,14 @@ class Response:
 
     @property
     def body(self):
-        if self._body is None:
+        if self._body is _UNSET:
             self._body = self._resp.get_body()
         return self._body
+
+    def _kept_body(self):
+        if self.body is None:
+            raise ValueError("the body was sent to body_to, not kept")
+        return self.body
 
     @property
     def encoding(self):
@@ -556,12 +598,12 @@ class Response:
     @property
     def text(self):
         if self._text is None:
-            self._text = self.body.decode(self.encoding)
+            self._text = self._kept_body().decode(self.encoding)
         return self._text
 
     def json(self):
         if self._json is _UNSET:
-            self._json = self._json_loads(self.body)
+            self._json = self._json_loads(self._kept_body())
         return self._json
 
     @property
@@ -703,10 +745,14 @@ class Session:
         verify=None,
         timeout=None,
         connect_timeout=None,
+        body_to=None,
     ):
         options = self._options
-        if cert is not None or verify is not None or timeout is not None or connect_timeout is not None:
-            options = dict(options)
+        body_options = _body_to_options(body_to)
+        if cert is not None or verify is not None or timeout is not None or connect_timeout is not None or body_options:
+            options = dict(options, **body_options)
+            if body_options:
+                options["follow_redirects"] = allow_redirects
             if cert is not None:
                 options["cert"] = cert
             if verify is not None:
@@ -741,17 +787,20 @@ class Session:
         if cookies:
             cookie_list = list(cookie_list or ()) + [session_cookie_for_url(url, k, v) for k, v in cookies.items()]
 
-        return await self._request(
-            method,
-            url,
-            tuple(headers_list) if headers_list else None,
-            tuple(cookie_list) if cookie_list else None,
-            auth,
-            data,
-            options,
-            allow_redirects,
-            max_redirects,
-        )
+        try:
+            return await self._request(
+                method,
+                url,
+                tuple(headers_list) if headers_list else None,
+                tuple(cookie_list) if cookie_list else None,
+                auth,
+                data,
+                options,
+                allow_redirects,
+                max_redirects,
+            )
+        finally:
+            _sync_position(body_to)
 
     def set_response_callback(self, callback):
         self._response_callback = callback

@@ -319,6 +319,12 @@ typedef struct AcRequestData {
     CURLcode result;
     Buffer header;
     Buffer body;
+    int body_fd;
+    int body_errno;
+    bool discard_body;
+    bool follow_redirects;
+    bool has_location;
+    signed char body_kept;
     HostSlot *slot;
     struct AcRequestData *prev_waiting;
     struct AcRequestData *next_waiting;
@@ -414,6 +420,7 @@ enum { REQUEST_RUNNING, REQUEST_SENT, REQUEST_CANCELLING };
 typedef struct {
     PyObject_HEAD Buffer header;
     Buffer body;
+    bool body_diverted;
     PyObject *header_bytes;
     PyObject *body_bytes;
     Session *session;
@@ -441,6 +448,9 @@ static PyObject *Response_get_header(Response *self, PyObject *args) {
 
 static PyObject *Response_get_body(Response *self, PyObject *args) {
     DEBUG_PRINT("");
+    if (self->body_diverted) {
+        Py_RETURN_NONE;
+    }
     return buffer_to_bytes(&self->body, &self->body_bytes);
 }
 
@@ -1003,14 +1013,56 @@ void socket_action_and_response_complete(EventLoop *loop, curl_socket_t socket, 
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     AcRequestData *rd = (AcRequestData *)userdata;
     size_t n = size * nmemb;
+    if (n >= 5 && strncmp(ptr, "HTTP/", 5) == 0) {
+        rd->has_location = false;
+    } else if (n >= 9 && strncasecmp(ptr, "location:", 9) == 0) {
+        rd->has_location = true;
+    }
     return buffer_append(&rd->header, ptr, n, n > 1024 ? n : 1024) ? n : 0;
 }
 
 /* See docs for CURLOPT_WTIE_FUNCTION */
 
+static bool keeps_body(AcRequestData *rd) {
+    if (rd->body_fd < 0 && !rd->discard_body) {
+        return true;
+    }
+    if (!rd->follow_redirects) {
+        return false;
+    }
+    long code = 0;
+    curl_easy_getinfo(rd->curl, CURLINFO_RESPONSE_CODE, &code);
+    return code >= 300 && code < 400 && rd->has_location;
+}
+
+static size_t write_body(AcRequestData *rd, const char *ptr, size_t n) {
+    if (rd->discard_body) {
+        return n;
+    }
+    size_t done = 0;
+    while (done < n) {
+        ssize_t written = write(rd->body_fd, ptr + done, n - done);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            rd->body_errno = errno;
+            return 0;
+        }
+        done += written;
+    }
+    return n;
+}
+
 size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     AcRequestData *rd = (AcRequestData *)userdata;
     size_t n = size * nmemb;
+    if (rd->body_kept < 0) {
+        rd->body_kept = keeps_body(rd);
+    }
+    if (!rd->body_kept) {
+        return write_body(rd, ptr, n);
+    }
     size_t initial = n;
     if (rd->body.cap == 0) {
         curl_off_t length = -1;
@@ -1469,6 +1521,9 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
         free(rd->req_data_buf);
         free(rd->header.data);
         free(rd->body.data);
+        if (rd->body_fd >= 0) {
+            close(rd->body_fd);
+        }
         Py_DECREF(rd->session);
         free(rd);
     }
@@ -1514,11 +1569,15 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             rd->live_next->live_prev = rd->live_prev;
         }
         DEBUG_PRINT("read AcRequestData; address=%p", rd);
+        if (rd->body_fd >= 0) {
+            close(rd->body_fd);
+        }
         PyObject *tuple = PyTuple_New(3);
         if (rd->result == CURLE_OK) {
             Response *response = PyObject_New(Response, (PyTypeObject *)&ResponseType);
             response->header = rd->header;
             response->body = rd->body;
+            response->body_diverted = !keeps_body(rd);
             response->header_bytes = NULL;
             response->body_bytes = NULL;
             response->curl = rd->curl;
@@ -1530,8 +1589,13 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyTuple_SET_ITEM(tuple, 1, (PyObject *)response);
             PyTuple_SET_ITEM(tuple, 2, rd->future);
         } else {
-            PyObject *error =
-                Py_BuildValue("(is)", rd->result, rd->error[0] ? rd->error : curl_easy_strerror(rd->result));
+            PyObject *error;
+            if (rd->body_errno) {
+                error = PyUnicode_FromFormat("writing the body failed: %s", strerror(rd->body_errno));
+                error = error ? Py_BuildValue("(iN)", rd->result, error) : NULL;
+            } else {
+                error = Py_BuildValue("(is)", rd->result, rd->error[0] ? rd->error : curl_easy_strerror(rd->result));
+            }
             free(rd->header.data);
             free(rd->body.data);
             queue_cleanup(rd->session->loop, rd->curl, NULL);
@@ -1770,13 +1834,17 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     PyObject *verify = Py_False;
     PyObject *timeout = Py_None;
     PyObject *connect_timeout = Py_None;
+    int body_fd = -1;
+    int discard_body = 0;
+    int follow_redirects = 0;
 
-    static char *kwlist[] = {"future", "method", "url",     "headers",         "auth", "cookies", "data",
-                             "cert",   "verify", "timeout", "connect_timeout", NULL};
+    static char *kwlist[] = {"future",          "method",  "url",          "headers",          "auth",
+                             "cookies",         "data",    "cert",         "verify",           "timeout",
+                             "connect_timeout", "body_fd", "discard_body", "follow_redirects", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOO", kwlist, &future, &method, &url, &headers, &auth,
-                                     &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout,
-                                     &connect_timeout)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOipp", kwlist, &future, &method, &url, &headers, &auth,
+                                     &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout, &connect_timeout,
+                                     &body_fd, &discard_body, &follow_redirects)) {
         return NULL;
     }
     long timeout_ms, connect_timeout_ms;
@@ -1800,6 +1868,17 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         return NULL;
     }
     REQUEST_TRACE_PRINT("Session_request", rd);
+    rd->body_fd = -1;
+    rd->body_kept = -1;
+    rd->discard_body = discard_body;
+    rd->follow_redirects = follow_redirects;
+    if (body_fd >= 0) {
+        rd->body_fd = fcntl(body_fd, F_DUPFD_CLOEXEC, 0);
+        if (rd->body_fd < 0) {
+            PyErr_SetFromErrno(PyExc_OSError);
+            goto error_cleanup;
+        }
+    }
     rd->timeout_ms = timeout_ms;
     rd->connect_timeout_ms = connect_timeout_ms;
     bool has_content_type = false;
@@ -1968,6 +2047,9 @@ error_cleanup:
     free(rd->method);
     free(rd->url);
     free(rd->req_data_buf);
+    if (rd->body_fd >= 0) {
+        close(rd->body_fd);
+    }
     free(rd);
     return NULL;
 }

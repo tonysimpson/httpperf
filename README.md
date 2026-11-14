@@ -144,8 +144,34 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
+| `body_to` | Where the response body goes instead of memory: an open binary file, or `httpperf.DISCARD` to drop it. See [Large responses](#large-responses). |
 
 Failed transfers raise `httpperf.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `httpperf.Timeout`, a subclass, so they can be counted separately.
+
+### Large responses
+
+By default the whole response body is kept in memory. To write a large body to disk instead, pass an open file as `body_to`:
+
+```python
+with open("big.iso", "wb") as f:
+    r = await session.get(url, body_to=f)
+r.raise_for_status()
+```
+
+The file must be open in binary mode for writing and have a file descriptor, so `io.BytesIO` is refused. The body is written from the file's current position, or appended in `"ab"` mode, and afterwards the file is positioned just after it. The temporary files from `tempfile` work too:
+
+```python
+with tempfile.TemporaryFile() as f:
+    await session.get(url, body_to=f)
+    f.seek(0)
+    process(f)
+```
+
+`SpooledTemporaryFile` goes to disk straight away, since httpperf needs its file descriptor.
+
+`body_to=httpperf.DISCARD` drops the body as it arrives, for when only the status, headers or timings matter.
+
+Either way `r.body` is `None`, and `r.text` and `r.json()` raise `ValueError`. `r.download_size` gives the body's size. When a redirect is followed, each redirect response keeps its own small body in `history` and only the final body goes to `body_to`. The writes happen on the engine's curl thread, so a slow disk holds up the engine's other requests. A failed write raises `RequestError`, and the file keeps what had arrived. Two requests writing to one file at the same time would mix their bodies.
 
 ### Response
 
@@ -161,7 +187,7 @@ Failed transfers raise `httpperf.RequestError` with curl's detailed error messag
 | `history` | Earlier responses in a redirect chain. |
 | `http_version` | `"HTTP/1.0"`, `"HTTP/1.1"`, `"HTTP/2"` or `"HTTP/3"`. |
 | `headers` | Case-insensitive mapping of the response headers. Repeated headers are joined with `, `, as in requests. `headers_tuple` keeps repeats and order. Both skip interim responses such as `100 Continue`. `header` is the raw text of every header block, decoded as latin-1. |
-| `body` | Bytes. |
+| `body` | Bytes, or `None` if the request used `body_to`. |
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |
 | `json()` | Body parsed with the session's `json_loads`, once. By default the standard library, always as UTF-8, as RFC 8259 requires. |
