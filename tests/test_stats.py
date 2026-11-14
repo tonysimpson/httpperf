@@ -57,12 +57,13 @@ def test_body_counts_as_bytes_sent(server):
     async def main():
         async with httpperf.Session(http_version="HTTP/1.1") as s:
             await s.get(server.url + "/fast")
-            before = s.stats()["bytes_sent"]
+            without_body = s.stats()["bytes_sent"]
             await s.get(server.url + "/fast", data=b"x" * 1000)
-            return before, s.stats()["bytes_sent"]
+            with_body = s.stats()["bytes_sent"] - without_body
+            return without_body, with_body
 
-    before, after = asyncio.run(main())
-    assert after - 2 * before > 1000
+    without_body, with_body = asyncio.run(main())
+    assert with_body - without_body > 1000
 
 
 def test_sessions_count_separately(server):
@@ -72,9 +73,12 @@ def test_sessions_count_separately(server):
             b = httpperf.Session(engine=engine)
             await a.get(server.url + "/fast")
             await asyncio.gather(b.get(server.url + "/fast"), b.get(server.url + "/fast"))
-            return a.stats()["requests"], b.stats()["requests"], engine.stats()["requests"]
+            return a.stats(), b.stats(), engine.stats()
 
-    assert asyncio.run(main()) == (1, 2, 3)
+    a, b, engine = asyncio.run(main())
+    assert a["requests"] == 1
+    assert b["requests"] == 2
+    assert engine["requests"] == 1 + 2
 
 
 def test_errors():
@@ -84,7 +88,9 @@ def test_errors():
             return s.stats()
 
     stats = asyncio.run(main())
-    assert (stats["requests"], stats["errors"], stats["running"]) == (0, 3, 0)
+    assert stats["errors"] == 3
+    assert stats["requests"] == 0
+    assert stats["running"] == 0
 
 
 def test_running_queued_and_cancelled(server):
@@ -94,15 +100,20 @@ def test_running_queued_and_cancelled(server):
             while s.stats()["queued"] < 3:
                 await asyncio.sleep(0.01)
             busy = s.stats()
-            tasks[0].cancel()
-            tasks[4].cancel()
+            running, queued = tasks[0], tasks[4]
+            running.cancel()
+            queued.cancel()
             server.release.set()
             await asyncio.gather(*tasks, return_exceptions=True)
             return busy, s.stats()
 
     busy, idle = asyncio.run(main())
-    assert (busy["running"], busy["queued"]) == (2, 3)
-    assert (idle["running"], idle["queued"], idle["requests"], idle["cancelled"]) == (0, 0, 3, 2)
+    assert busy["running"] == 2
+    assert busy["queued"] == 3
+    assert idle["cancelled"] == 2
+    assert idle["requests"] == 5 - 2
+    assert idle["running"] == 0
+    assert idle["queued"] == 0
 
 
 def open_connections(session):
