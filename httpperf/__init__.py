@@ -396,12 +396,12 @@ def _body_to_options(body_to):
         raise TypeError("body_to must be a file opened in binary mode")
     if body_to.closed:
         raise ValueError("body_to is closed")
-    if not body_to.writable():
-        raise ValueError("body_to is not open for writing")
     try:
         body_to.write(b"")
     except TypeError:
         raise TypeError("body_to must be a file opened in binary mode") from None
+    except io.UnsupportedOperation:
+        raise ValueError("body_to is not open for writing") from None
     try:
         fd = body_to.fileno()
     except (AttributeError, io.UnsupportedOperation):
@@ -411,8 +411,13 @@ def _body_to_options(body_to):
 
 
 def _sync_position(body_to):
-    if body_to is not None and body_to is not DISCARD and not body_to.closed and body_to.seekable():
-        body_to.seek(os.lseek(body_to.fileno(), 0, os.SEEK_CUR))
+    if body_to is None or body_to is DISCARD or body_to.closed:
+        return
+    try:
+        position = os.lseek(body_to.fileno(), 0, os.SEEK_CUR)
+    except OSError:
+        return
+    body_to.seek(position)
 
 
 class Response:
