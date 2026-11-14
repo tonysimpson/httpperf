@@ -64,6 +64,8 @@ Both times are whole seconds. curl does not close expired connections on a timer
 
 With `connections="session"`, a session's connections stay open until `close()` is called or the session is garbage-collected. Responses do not keep them open.
 
+`engine.stats()["connections_open"]` shows how many connections are open across all pools, and `session.stats()["connections_open"]` how many a session with `connections="session"` holds. See [Statistics](../README.md#statistics).
+
 ## Examples
 
 These are starting points, not exact models of any product. Check the behaviour of the client you want to imitate.

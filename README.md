@@ -104,6 +104,8 @@ An engine binds to the asyncio loop running when it is first used, and so does a
 
 `engine.close()` stops the curl thread and closes the shared pool's connections, and later requests raise `RuntimeError`. Requests still in flight fail with `RequestError`, and a `ResourceWarning` says how many there were. `with` and `async with` call `close()` on exit. An engine that is no longer referenced is closed automatically. See [docs/connections.md](docs/connections.md) for how these fit together.
 
+`engine.stats()` gives the counts for all the engine's sessions. See [Statistics](#statistics).
+
 ### Session methods
 
 - `await session.get(url, **kwargs)`, and likewise `post`, `put`, `patch`, `delete`, `head` and `options`.
@@ -112,6 +114,8 @@ An engine binds to the asyncio loop running when it is first used, and so does a
 - `session.cookies()`: the cookie jar as a dict.
 - `session.get_cookie_list()`, `session.add_cookie_list(cookies)`, `session.erase_all_cookies()` and `session.erase_session_cookies()`: work with `Cookie` objects. These are ordinary methods, not coroutines.
 - `session.set_response_callback(callback)`: called with each `Response`, including each hop of a redirect.
+- `session.stats()`: the session's request and connection counts. See [Statistics](#statistics).
+- `session.engine`: the session's `Engine`.
 
 ### Request arguments
 
@@ -205,6 +209,25 @@ All in seconds.
 curl measures its timings on the curl thread, so a busy Python process does not inflate them. `client_lag` is how you see that Python is the bottleneck: if it grows, the client cannot keep up, and achieved request rates describe the client rather than the server. Report it alongside response times (p50, p99, max).
 
 `queue_time` is real waiting that a user would see (a browser's "stalled" time), but it is client-side, so keep it out of server latency.
+
+## Statistics
+
+`session.stats()` and `engine.stats()` return a dict of counts since the session or engine was created. The engine's counts cover all its sessions. Reading them is cheap, so a load test can sample them every second and report the differences as rates.
+
+| Key | Meaning |
+|---|---|
+| `requests` | Requests that got a response, whatever its status. Each hop of a redirect counts. |
+| `errors` | Requests that failed with `RequestError`, including timeouts. |
+| `cancelled` | Requests cancelled before they finished. |
+| `http_versions` | `requests` by HTTP version: a dict with keys `"HTTP/1.0"`, `"HTTP/1.1"`, `"HTTP/2"` and `"HTTP/3"`. |
+| `connections` | New connections opened. A reused connection doesn't count. |
+| `tls_handshakes` | New connections that did a TLS handshake. |
+| `bytes_sent`, `bytes_received` | Request and response headers and bodies, with bodies as transferred (so compressed if the server compressed them). TLS and HTTP/2 and HTTP/3 framing aren't counted, so for those versions the figures are approximate. |
+| `running` | Requests with curl now. |
+| `queued` | Requests now waiting for a connection under the engine or session limits. |
+| `connections_open` | Connections open now, idle or in use, including any still connecting. For the engine, every pool. For a session with `connections="session"`, its own pool, and 0 once it is closed. `None` for other sessions, whose connections belong to the engine. |
+
+The counts are updated on the curl thread, so they can lag a moment behind: a cancelled request is counted just after the cancel.
 
 ## Known limitations
 
