@@ -105,19 +105,50 @@ def test_running_queued_and_cancelled(server):
     assert (idle["running"], idle["queued"], idle["requests"], idle["cancelled"]) == (0, 0, 3, 2)
 
 
-def test_connections_open(server):
+def open_connections(session):
+    return session.stats()["connections_open"]
+
+
+def test_a_shared_pool_session_has_no_connection_count(server):
+    async def main():
+        async with httpperf.Session(http_version="HTTP/1.1") as s:
+            await s.get(server.url + "/fast")
+            return open_connections(s)
+
+    assert asyncio.run(main()) is None
+
+
+def test_own_pool_sessions_count_their_connections_and_the_engine_counts_all(server):
     async def main():
         async with httpperf.Engine() as engine:
             shared = httpperf.Session(engine=engine, http_version="HTTP/1.1")
-            a = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
-            b = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
+            three = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
+            one = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
             await asyncio.gather(*(shared.get(server.url + "/fast") for _ in range(2)))
-            await asyncio.gather(*(a.get(server.url + "/fast") for _ in range(3)))
-            await b.get(server.url + "/fast")
-            busy = [s.stats()["connections_open"] for s in (shared, a, b)] + [engine.stats()["connections_open"]]
-            a.close()
-            while engine.stats()["connections_open"] > 3:
-                await asyncio.sleep(0.01)
-            return busy, a.stats()["connections_open"]
+            await asyncio.gather(*(three.get(server.url + "/fast") for _ in range(3)))
+            await one.get(server.url + "/fast")
+            return open_connections(three), open_connections(one), open_connections(engine)
 
-    assert asyncio.run(main()) == ([None, 3, 1, 6], 0)
+    three, one, engine = asyncio.run(main())
+    assert three == 3
+    assert one == 1
+    assert engine == 2 + 3 + 1
+
+
+def test_closing_a_session_closes_its_connections(server):
+    async def main():
+        async with httpperf.Engine() as engine:
+            s = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
+            await asyncio.gather(*(s.get(server.url + "/fast") for _ in range(3)))
+            before = open_connections(engine)
+            s.close()
+            for _ in range(100):
+                if open_connections(engine) == 0:
+                    break
+                await asyncio.sleep(0.01)
+            return before, open_connections(engine), open_connections(s)
+
+    engine_before, engine_after, closed_session = asyncio.run(main())
+    assert engine_before == 3
+    assert engine_after == 0
+    assert closed_session == 0
