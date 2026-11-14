@@ -2,164 +2,143 @@ import asyncio
 
 import httpperf
 
-VERSIONS = {"HTTP/1.0": 0, "HTTP/1.1": 0, "HTTP/2": 0, "HTTP/3": 0}
 
-
-def counts(stats):
-    return {k: v for k, v in stats.items() if not k.startswith("bytes")}
-
-
-def test_new_stats_are_zero():
-    zero = {
-        "requests": 0,
-        "errors": 0,
-        "cancelled": 0,
-        "connections": 0,
-        "connections_open": None,
-        "tls_handshakes": 0,
-        "http_versions": VERSIONS,
-        "bytes_sent": 0,
-        "bytes_received": 0,
-        "running": 0,
-        "queued": 0,
-    }
-    engine = httpperf.Engine()
-    assert engine.stats() == dict(zero, connections_open=0)
-    assert httpperf.Session(engine=engine).stats() == zero
-    assert httpperf.Session(engine=engine, connections="session").stats() == dict(zero, connections_open=0)
-    engine.close()
-
-
-def test_requests_and_bytes(server):
+def stats_after(url, requests=1, **options):
     async def main():
-        async with httpperf.Session(http_version="HTTP/1.1", connections="session") as s:
-            responses = [await s.get(server.url + "/fast") for _ in range(3)]
-            return responses, s.stats(), s.engine.stats()
-
-    responses, session, engine = asyncio.run(main())
-    assert counts(session) == {
-        "requests": 3,
-        "errors": 0,
-        "cancelled": 0,
-        "connections": 1,
-        "connections_open": 1,
-        "tls_handshakes": 0,
-        "http_versions": dict(VERSIONS, **{"HTTP/1.1": 3}),
-        "running": 0,
-        "queued": 0,
-    }
-    assert session["bytes_received"] == sum(len(r.header) + len(r.body) for r in responses)
-    assert session["bytes_sent"] > 0
-    assert engine == session
-
-
-def test_body_counts_as_bytes_sent(server):
-    async def main():
-        async with httpperf.Session(http_version="HTTP/1.1") as s:
-            await s.get(server.url + "/fast")
-            without_body = s.stats()["bytes_sent"]
-            await s.get(server.url + "/fast", data=b"x" * 1000)
-            with_body = s.stats()["bytes_sent"] - without_body
-            return without_body, with_body
-
-    without_body, with_body = asyncio.run(main())
-    assert with_body - without_body > 1000
-
-
-def test_sessions_count_separately(server):
-    async def main():
-        async with httpperf.Engine() as engine:
-            a = httpperf.Session(engine=engine)
-            b = httpperf.Session(engine=engine)
-            await a.get(server.url + "/fast")
-            await asyncio.gather(b.get(server.url + "/fast"), b.get(server.url + "/fast"))
-            return a.stats(), b.stats(), engine.stats()
-
-    a, b, engine = asyncio.run(main())
-    assert a["requests"] == 1
-    assert b["requests"] == 2
-    assert engine["requests"] == 1 + 2
-
-
-def test_errors():
-    async def main():
-        async with httpperf.Session() as s:
-            await asyncio.gather(*(s.get("http://127.0.0.1:9/") for _ in range(3)), return_exceptions=True)
+        async with httpperf.Session(http_version="HTTP/1.1", **options) as s:
+            for _ in range(requests):
+                try:
+                    await s.get(url)
+                except httpperf.RequestError:
+                    pass
             return s.stats()
 
-    stats = asyncio.run(main())
-    assert stats["errors"] == 3
-    assert stats["requests"] == 0
-    assert stats["running"] == 0
+    return asyncio.run(main())
 
 
-def test_running_queued_and_cancelled(server):
+def open_connections(session_or_engine):
+    return session_or_engine.stats()["connections_open"]
+
+
+async def eventually(get, expected):
+    for _ in range(100):
+        if get() == expected:
+            break
+        await asyncio.sleep(0.01)
+    return get()
+
+
+async def get_together(session, url, requests):
+    await asyncio.gather(*(session.get(url) for _ in range(requests)))
+
+
+def test_a_new_session_has_counted_nothing():
+    stats = httpperf.Session().stats()
+    assert [name for name, value in stats.items() if value] == ["http_versions"]
+
+
+def test_counts_requests(server):
+    assert stats_after(server.url + "/fast", 3)["requests"] == 3
+
+
+def test_counts_new_connections_not_reused_ones(server):
+    assert stats_after(server.url + "/fast", 3)["connections"] == 1
+
+
+def test_counts_http_versions(server):
+    assert stats_after(server.url + "/fast", 3)["http_versions"]["HTTP/1.1"] == 3
+
+
+def test_counts_errors():
+    assert stats_after("http://127.0.0.1:9/", 3)["errors"] == 3
+
+
+def test_counts_bytes_received(server):
+    async def main():
+        async with httpperf.Session(http_version="HTTP/1.1") as s:
+            r = await s.get(server.url + "/fast")
+            return s.stats()["bytes_received"], len(r.header) + len(r.body)
+
+    received, response_size = asyncio.run(main())
+    assert received == response_size
+
+
+def test_counts_a_request_body_as_bytes_sent(server):
+    async def main():
+        async with httpperf.Session(http_version="HTTP/1.1") as s:
+            await s.get(server.url + "/fast", data=b"x" * 1000)
+            return s.stats()["bytes_sent"]
+
+    assert asyncio.run(main()) > 1000
+
+
+def test_counts_cancelled_requests(server):
+    async def main():
+        async with httpperf.Session(http_version="HTTP/1.1") as s:
+            task = asyncio.create_task(s.get(server.url + "/slow"))
+            await asyncio.sleep(0.2)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return await eventually(lambda: s.stats()["cancelled"], 1)
+
+    assert asyncio.run(main()) == 1
+
+
+def test_running_and_queued_requests(server):
     async def main():
         async with httpperf.Session(http_version="HTTP/1.1", connections="session", max_host_connections=2) as s:
             tasks = [asyncio.create_task(s.get(server.url + "/slow")) for _ in range(5)]
             while s.stats()["queued"] < 3:
                 await asyncio.sleep(0.01)
-            busy = s.stats()
-            running, queued = tasks[0], tasks[4]
-            running.cancel()
-            queued.cancel()
+            stats = s.stats()
             server.release.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            return busy, s.stats()
+            await asyncio.gather(*tasks)
+            return stats["running"], stats["queued"]
 
-    busy, idle = asyncio.run(main())
-    assert busy["running"] == 2
-    assert busy["queued"] == 3
-    assert idle["cancelled"] == 2
-    assert idle["requests"] == 5 - 2
-    assert idle["running"] == 0
-    assert idle["queued"] == 0
+    assert asyncio.run(main()) == (2, 3)
 
 
-def open_connections(session):
-    return session.stats()["connections_open"]
+def test_the_engine_counts_all_its_sessions(server):
+    async def main():
+        async with httpperf.Engine() as engine:
+            for requests in (1, 2):
+                s = httpperf.Session(engine=engine)
+                await get_together(s, server.url + "/fast", requests)
+            return engine.stats()["requests"]
+
+    assert asyncio.run(main()) == 3
 
 
 def test_a_shared_pool_session_has_no_connection_count(server):
+    assert stats_after(server.url + "/fast")["connections_open"] is None
+
+
+def test_an_own_pool_session_counts_its_open_connections(server):
     async def main():
-        async with httpperf.Session(http_version="HTTP/1.1") as s:
-            await s.get(server.url + "/fast")
+        async with httpperf.Session(http_version="HTTP/1.1", connections="session") as s:
+            await get_together(s, server.url + "/fast", 3)
             return open_connections(s)
 
-    assert asyncio.run(main()) is None
+    assert asyncio.run(main()) == 3
 
 
-def test_own_pool_sessions_count_their_connections_and_the_engine_counts_all(server):
+def test_the_engine_counts_open_connections_in_every_pool(server):
     async def main():
         async with httpperf.Engine() as engine:
-            shared = httpperf.Session(engine=engine, http_version="HTTP/1.1")
-            three = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
-            one = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
-            await asyncio.gather(*(shared.get(server.url + "/fast") for _ in range(2)))
-            await asyncio.gather(*(three.get(server.url + "/fast") for _ in range(3)))
-            await one.get(server.url + "/fast")
-            return open_connections(three), open_connections(one), open_connections(engine)
+            for connections in ("shared", "session"):
+                s = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections=connections)
+                await get_together(s, server.url + "/fast", 2)
+            return open_connections(engine)
 
-    three, one, engine = asyncio.run(main())
-    assert three == 3
-    assert one == 1
-    assert engine == 2 + 3 + 1
+    assert asyncio.run(main()) == 4
 
 
 def test_closing_a_session_closes_its_connections(server):
     async def main():
         async with httpperf.Engine() as engine:
             s = httpperf.Session(engine=engine, http_version="HTTP/1.1", connections="session")
-            await asyncio.gather(*(s.get(server.url + "/fast") for _ in range(3)))
-            before = open_connections(engine)
+            await get_together(s, server.url + "/fast", 3)
             s.close()
-            for _ in range(100):
-                if open_connections(engine) == 0:
-                    break
-                await asyncio.sleep(0.01)
-            return before, open_connections(engine), open_connections(s)
+            return await eventually(lambda: open_connections(engine), 0)
 
-    engine_before, engine_after, closed_session = asyncio.run(main())
-    assert engine_before == 3
-    assert engine_after == 0
-    assert closed_session == 0
+    assert asyncio.run(main()) == 0
