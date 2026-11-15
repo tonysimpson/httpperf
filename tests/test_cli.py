@@ -51,6 +51,11 @@ def test_a_fixed_rate_is_kept(capsys, server):
     assert steps[0]["rps"] == pytest.approx(200, rel=0.05)
 
 
+def test_a_fixed_rate_reports_send_lag(capsys, server):
+    _, steps = run(capsys, "--rate", "200", server.url)
+    assert steps[0]["send_lag"]["count"] > 0
+
+
 def test_an_error_status_is_an_error(capsys, httpbin):
     _, steps = run(capsys, httpbin.url + "/status/503")
     assert {e["error"] for e in steps[0]["error_kinds"]} == {"HTTP 503"}

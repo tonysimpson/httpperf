@@ -89,6 +89,7 @@ class Record:
         self.download = Histogram()
         self.client_lag = Histogram()
         self.queue_time = Histogram()
+        self.send_lag = Histogram()
         self.connect = Histogram()
         self.tls = Histogram()
         self.per_second = [0] * max(1, math.ceil(plan.duration))
@@ -271,13 +272,15 @@ class Worker:
         await asyncio.gather(*pending, return_exceptions=True)
 
     async def timed(self, due, plan, rec):
+        sent = time.monotonic()
         error = await self.attempt()
         done = time.monotonic()
         if rec.on:
             rec.done(done)
         if plan.t_meas <= due < plan.t_end:
+            rec.send_lag.record(sent - due)
             if error is None:
-                rec.latency.record(done - due)
+                rec.latency.record(done - sent)
             else:
                 rec.error(error)
 
@@ -321,6 +324,7 @@ def summarise(plan, recs, cpu, threads_cpu, cores_allowed):
         "download": merged("download"),
         "client_lag": merged("client_lag"),
         "queue_time": merged("queue_time"),
+        "send_lag": merged("send_lag"),
         "connect": merged("connect"),
         "tls": merged("tls"),
         "received_per_s": diff("bytes_received", 1, 2) / plan.duration,
@@ -440,6 +444,10 @@ def warnings_for(step):
         found.append("over capacity: requests piled up, so the step stopped early")
     elif step["rate"] is not None and step["rps"] < 0.99 * step["rate"]:
         found.append("behind schedule: achieved %s of %s req/s" % (fmt_int(round(step["rps"])), fmt_int(step["rate"])))
+    elif step["send_lag"] and step["send_lag"]["p99"] > 0.002:
+        found.append(
+            "behind schedule: send lag p99 %s, so the client sent requests late" % fmt_time(step["send_lag"]["p99"])
+        )
     return found
 
 
@@ -542,13 +550,13 @@ def details(step):
         "  client       %.1f of %d cores, %s CPU per request"
         % (step["cpu_cores"], step["cores_allowed"], "-" if per_request is None else "%.0fµs" % (per_request * 1e6))
     )
-    lines.append(
-        "               client lag p99 %s, connection wait p99 %s"
-        % (
-            fmt_time(step["client_lag"] and step["client_lag"]["p99"]),
-            fmt_time(step["queue_time"] and step["queue_time"]["p99"]),
-        )
+    lag = "               client lag p99 %s, connection wait p99 %s" % (
+        fmt_time(step["client_lag"] and step["client_lag"]["p99"]),
+        fmt_time(step["queue_time"] and step["queue_time"]["p99"]),
     )
+    if step["send_lag"]:
+        lag += ", send lag p99 %s" % fmt_time(step["send_lag"]["p99"])
+    lines.append(lag)
     return lines
 
 

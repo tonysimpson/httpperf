@@ -72,15 +72,15 @@ Latency is measured from when the request was sent. A server that stalls holds u
 
 Request *i* is due at *start* + *i* / *rate*, spread evenly between the threads. Each time a thread's event loop wakes, it sends every request that is due, so a late wake-up doesn't push the schedule back.
 
-Latency is measured from when the request was due, not when it was sent, as in wrk2. If the server stalls, every request due during the stall records the time it really waited.
+Latency is measured from when the request was sent. Each request is sent on schedule, whatever is happening to earlier ones, so a server that stalls can't hold back sends: every request sent during the stall records the time it really waited. This avoids coordinated omission without wrk2's approach of measuring from when each request was due, which would also count the client's own lateness.
 
 `-c` caps connections (`max_total_connections`), split between the threads. Requests over the cap wait in httpperf's queue, and that wait counts in their latency.
 
 If the server can't keep up, the queue grows without limit. A step stops early, marked **over capacity**, when more than one second's worth of requests are outstanding. Later steps in a `--rate` list are skipped.
 
-The schedule is only as precise as the event loop's timers. asyncio and uvloop wait in whole milliseconds, so requests go out up to 1 ms late, about 0.5 ms on average, and that counts in their latency. Sub-millisecond latencies at a fixed rate are not meaningful.
+How late requests went out is reported as send lag. The schedule is only as precise as the event loop's timers: asyncio and uvloop wait in whole milliseconds, so when the client is idle, requests go out up to 1 ms late. That spreads the load slightly unevenly, but it doesn't count in latency. Send lag p99 over 2 ms means the client couldn't keep to the schedule.
 
-Latency and errors cover requests that were due during the measured period, including ones that finish after it. Achieved req/s counts what finished during it.
+Latency, send lag and errors cover requests that were due during the measured period, including ones that finish after it. Achieved req/s counts what finished during it.
 
 ## Errors
 
@@ -165,13 +165,13 @@ A step with one value for `-c` or `--rate` prints only the second part.
 | Line | Meaning |
 |---|---|
 | req/s, ±/s | Requests completed per second over the measured period, errors included, and how much the per-second counts varied (coefficient of variation). |
-| latency | Flat out: from send to response. Fixed rate: from when the request was due to response. |
+| latency | From when the request was sent to the response. |
 | first byte, download | curl's `starttransfer_time`, and `total_time` minus it. A slow server shows up in first byte. A large body or slow network shows up in download. |
 | requests | Requests completed in the measured period, and errors by kind. |
 | transfer | `bytes_received` and `bytes_sent` per second: headers and bodies, not TLS or TCP overhead. |
 | connect, TLS | Time to connect and to complete the TLS handshake, for connections opened while measuring. Shown only when there were some. |
 | connections | Connections opened during the step, warm-up included, open at the end, HTTP versions used, TLS handshakes. |
-| client | CPU used by the httpperf process, as cores and per request. `client_lag` p99: how long requests waited on Python, before they were sent and after they finished. `queue_time` p99: how long requests waited for a free connection. |
+| client | CPU used by the httpperf process, as cores and per request. `client_lag` p99: how long requests waited on Python, before they were sent and after they finished. `queue_time` p99: how long requests waited for a free connection. Send lag p99 (fixed rate): how late requests were sent. |
 
 For fixed rate, the step table has columns for the target rate and the achieved rate, and `best` is the highest rate that kept up.
 
@@ -185,7 +185,7 @@ Printed under the report when they apply:
 - **Errors**: more than 1% of requests failed. The most common kinds are listed.
 - **Unsteady**: req/s varied more than 10% from second to second. Run for longer, or check the server.
 - **Connection churn**: connections were closed during measurement, so the server or a proxy is closing them. Latency includes opening new ones.
-- **Behind schedule** (fixed rate): achieved rate was under 99% of the target.
+- **Behind schedule** (fixed rate): achieved rate was under 99% of the target, or send lag p99 was over 2 ms.
 - **Over capacity** (fixed rate): the step stopped early because requests piled up.
 - **Peak not reached** (flat out list): the best step was the last, and the client wasn't saturated. Try more connections.
 
