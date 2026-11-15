@@ -162,13 +162,16 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
-| `discard_body` | `True` drops the response body as it arrives, for when only the status, headers or timings matter. See [Discarding the body](#discarding-the-body). |
+| `discard_body` | `True` drops the response body as it arrives, for when only the status, headers or timings matter. See [Large bodies](#large-bodies). |
+| `stream` | `True` returns as soon as the headers arrive, and the body is read with `iter_content()` or `read()`. See [Large bodies](#large-bodies). |
 
 Failed transfers raise `httpperf.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `httpperf.Timeout`, a subclass, so they can be counted separately.
 
-### Discarding the body
+### Large bodies
 
-By default the whole response body is kept in memory. `discard_body=True` drops it on the curl thread as it arrives, which saves memory and CPU when only the status, headers or timings matter:
+By default the whole response body is kept in memory. For large downloads there are two other ways.
+
+`discard_body=True` drops the body on the curl thread as it arrives. Use it when only the status, headers or timings matter; it is the fastest way:
 
 ```python
 r = await session.get(url, discard_body=True)
@@ -176,6 +179,24 @@ r.status_code, r.download_size, r.total_time
 ```
 
 `r.body` is then `None`, and `r.text` and `r.json()` raise `ValueError`. `r.download_size` gives the body's size. When a redirect is followed, every response's body is dropped, including those in `history`.
+
+`stream=True` works as in requests, with `async for`. The request returns once the headers arrive, and the body is read as it comes:
+
+```python
+with open("big.iso", "wb") as f:
+    async with await session.get(url, stream=True) as r:
+        async for chunk in r.iter_content(1024 * 1024):
+            f.write(chunk)
+```
+
+- `iter_content(chunk_size)` gives `chunk_size` bytes at a time, the last chunk perhaps shorter. Without a size, chunks are whatever has arrived. `await r.read()` reads the whole body into `r.body`.
+- `r.body`, `r.text` and `r.json()` raise `RuntimeError` until the body has been read, as do the timings and sizes, since they aren't known until the transfer ends.
+- httpperf buffers up to 1 MB of each response. When Python falls behind, it stops reading that connection until Python catches up, so the server is held up by TCP back-pressure. Other requests carry on, and the curl thread never waits. The time spent stopped is `r.paused_time`.
+- Closing the response, leaving `async with`, breaking out of `iter_content()` or dropping the response stops the transfer and closes its connection. Reading to the end leaves the connection open for reuse.
+- A transfer that fails part way, say because the connection drops, raises `RequestError` from `iter_content()` or `read()`.
+- Redirects are followed as usual, and each redirect's body is read into its `history` entry.
+
+Streaming is for benchmarking large transfers, such as how fast a server sends a big file, and for checking what arrives. Each chunk passes through Python, so it can't sustain high request rates. For those, use `discard_body=True` or keep the body in memory.
 
 ### Response
 
@@ -192,6 +213,7 @@ r.status_code, r.download_size, r.total_time
 | `http_version` | `"HTTP/1.0"`, `"HTTP/1.1"`, `"HTTP/2"` or `"HTTP/3"`. |
 | `headers` | Case-insensitive mapping of the response headers. Repeated headers are joined with `, `, as in requests. `headers_tuple` keeps repeats and order. Both skip interim responses such as `100 Continue`. `header` is the raw text of every header block, decoded as latin-1. |
 | `body` | Bytes, or `None` if the request used `discard_body`. |
+| `iter_content(chunk_size=None)`, `read()`, `close()` | Read a streamed body in chunks or whole, or stop it. See [Large bodies](#large-bodies). |
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |
 | `json()` | Body parsed with the session's `json_loads`, once. By default the standard library, always as UTF-8, as RFC 8259 requires. |
@@ -234,7 +256,7 @@ All in seconds.
 
 | Attribute | Meaning |
 |---|---|
-| `start_time`, `end_time` | Wall-clock times (`time.time()`) when the request was made and when Python received the response. |
+| `start_time`, `end_time` | Wall-clock times (`time.time()`) when the request was made and when Python received the response. With `stream=True`, `end_time` is when Python received the last of the body. |
 | `namelookup_time` | DNS, measured by curl from the start of the transfer. |
 | `connect_time` | TCP connect complete. 0 when the connection was reused. |
 | `appconnect_time` | TLS handshake complete. 0 for plain http and reused connections. |
@@ -243,6 +265,7 @@ All in seconds.
 | `starttransfer_time` | First byte received. |
 | `total_time` | Transfer complete. |
 | `queue_time` | Time waiting in httpperf's queue for a connection, under the engine or session limits. 0 if the request did not wait. curl's timings start after it. |
+| `paused_time` | With `stream=True`, time the transfer was stopped waiting for Python to read the body. It is part of `total_time`. 0 otherwise. |
 | `client_lag` | `end_time − start_time − total_time − queue_time`: time the request spent waiting on Python, before it was sent and after it finished. Measured with the monotonic clock, so clock changes don't affect it. |
 
 curl measures its timings on the curl thread, so a busy Python process does not inflate them. `client_lag` is how you see that Python is the bottleneck: if it grows, the client cannot keep up, and achieved request rates describe the client rather than the server. Report it alongside response times (p50, p99, max).

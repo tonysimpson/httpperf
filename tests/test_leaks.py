@@ -14,25 +14,30 @@ def rss():
             if line.startswith("VmRSS"):
                 return int(line.split()[1]) * 1024
 
-async def main(url, n, connections):
+async def get(el, url, connections, stream):
+    r = await httpperf.Session(engine=el, connections=connections).get(url, stream=stream)
+    await r.read()
+
+async def main(url, n, connections, stream):
     el = httpperf.Engine()
     for _ in range(n // 4):
-        await httpperf.Session(engine=el, connections=connections).get(url)
+        await get(el, url, connections, stream)
     gc.collect()
     before = rss()
     for _ in range(n):
-        await httpperf.Session(engine=el, connections=connections).get(url)
+        await get(el, url, connections, stream)
     gc.collect()
     print(json.dumps((rss() - before) / n))
 
-asyncio.run(main(sys.argv[1], int(sys.argv[2]), sys.argv[3]))
+asyncio.run(main(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "stream"))
 """
 
 
+@pytest.mark.parametrize("stream", ["", "stream"])
 @pytest.mark.parametrize("connections", ["shared", "session", "none"])
-def test_session_per_request_does_not_leak(httpbin, connections):
+def test_session_per_request_does_not_leak(httpbin, connections, stream):
     p = subprocess.run(
-        [sys.executable, "-c", PROBE, httpbin.url + "/get", "1000", connections],
+        [sys.executable, "-c", PROBE, httpbin.url + "/get", "1000", connections, stream],
         capture_output=True,
         text=True,
         timeout=60,

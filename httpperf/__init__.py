@@ -394,9 +394,15 @@ class Response:
         "_encoding",
         "_json",
         "_json_loads",
+        "_stream",
+        "_consumed",
+        "_made",
     )
 
-    def __init__(self, req, resp, start_time, end_time, json_loads=_json_loads):
+    def __init__(self, req, resp, start_time, end_time, json_loads=_json_loads, stream=False):
+        self._stream = stream
+        self._consumed = False
+        self._made = time.monotonic()
         self._json_loads = json_loads
         self._req = req
         self._resp = resp
@@ -539,8 +545,83 @@ class Response:
     @property
     def body(self):
         if self._body is _UNSET:
+            if self._consumed:
+                raise RuntimeError("the body was already read by iter_content()")
+            if self._stream:
+                raise RuntimeError("the body is streamed: await r.read() first")
             self._body = self._resp.get_body()
         return self._body
+
+    async def read(self):
+        if self._body is _UNSET and self._stream:
+            self._body = b"".join([chunk async for chunk in self.iter_content()])
+        return self.body
+
+    async def iter_content(self, chunk_size=None):
+        if self._consumed:
+            raise RuntimeError("the body was already read by iter_content()")
+        if not self._stream:
+            body = self._kept_body()
+            self._consumed = True
+            step = chunk_size or len(body) or 1
+            for i in range(0, len(body), step):
+                yield body[i : i + step]
+            return
+        self._consumed = True
+        try:
+            pending = b""
+            async for data in self._chunks():
+                if chunk_size is None:
+                    yield data
+                    continue
+                pending += data
+                start = 0
+                while len(pending) - start >= chunk_size:
+                    yield pending[start : start + chunk_size]
+                    start += chunk_size
+                pending = pending[start:]
+            if pending:
+                yield pending
+        finally:
+            self._resp.stream_close()
+
+    async def _chunks(self):
+        resp = self._resp
+        loop = asyncio.get_running_loop()
+        while True:
+            data = resp.stream_take()
+            if data:
+                yield data
+            elif data is None:
+                break
+            else:
+                waiter = loop.create_future()
+                if resp.stream_wait(waiter):
+                    await waiter
+        self._end_time += time.monotonic() - self._made
+        error = resp.stream_result()
+        if error is not None:
+            raise _error(*error)
+
+    def close(self):
+        if self._stream:
+            self._resp.stream_close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        self.close()
+
+    @property
+    def paused_time(self):
+        return self._resp.get_paused_time()
 
     def _kept_body(self):
         if self.body is None:
@@ -590,6 +671,10 @@ class Response:
         if self._header is None:
             self._header = self._resp.get_header().decode("latin-1")
         return self._header
+
+
+def _error(code, message):
+    return (Timeout if code == CURLE_OPERATION_TIMEDOUT else RequestError)(message, code)
 
 
 class _Future(asyncio.Future):
@@ -709,12 +794,24 @@ class Session:
         timeout=None,
         connect_timeout=None,
         discard_body=False,
+        stream=False,
     ):
+        if stream and discard_body:
+            raise ValueError("stream cannot be combined with discard_body")
         options = self._options
-        if cert is not None or verify is not None or timeout is not None or connect_timeout is not None or discard_body:
+        if (
+            cert is not None
+            or verify is not None
+            or timeout is not None
+            or connect_timeout is not None
+            or discard_body
+            or stream
+        ):
             options = dict(options)
             if discard_body:
                 options["discard_body"] = True
+            if stream:
+                options["stream"] = True
             if cert is not None:
                 options["cert"] = cert
             if verify is not None:
@@ -801,7 +898,8 @@ class Session:
             **options,
         )
         resp = await future
-        response = Response(request, resp, start_time, start_time + time.monotonic() - start, self._json_loads)
+        stream = options.get("stream", False)
+        response = Response(request, resp, start_time, start_time + time.monotonic() - start, self._json_loads, stream)
         if prev is not None:
             response._prev = prev
 
@@ -809,8 +907,11 @@ class Session:
             self._response_callback(response)
         if allow_redirects and (300 <= response.status_code < 400) and response.redirect_url is not None:
             if remaining_redirects == 0:
+                response.close()
                 raise RequestError("Max Redirects")
-            elif response.status_code in {301, 302, 303}:
+            if stream:
+                await response.read()
+            if response.status_code in {301, 302, 303}:
                 redir_response = await self._request(
                     "GET",
                     response.redirect_url,
@@ -892,11 +993,10 @@ class Engine:
         for error, response, future in self._ae_loop.get_completed():
             if future.done():
                 continue
-            if response is not None:
+            if response is not None or error is None:
                 future.set_result(response)
             else:
-                code, message = error
-                future.set_exception((Timeout if code == CURLE_OPERATION_TIMEDOUT else RequestError)(message, code))
+                future.set_exception(_error(*error))
 
     def close(self):
         if self._closed:

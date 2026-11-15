@@ -7,6 +7,7 @@ import sys
 import threading
 
 import pytest
+from helpers import BIG
 
 import httpperf
 
@@ -41,6 +42,13 @@ class Server:
                             with server.lock:
                                 server.hung_up += 1
                             return
+                if self.path in ("/big", "/truncated"):
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(BIG)))
+                    self.end_headers()
+                    self.wfile.write(BIG if self.path == "/big" else BIG[:1000])
+                    self.close_connection = self.path == "/truncated"
+                    return
                 if self.path == "/redirect":
                     self.send_response(302)
                     self.send_header("Location", "/")

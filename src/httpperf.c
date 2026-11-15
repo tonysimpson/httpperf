@@ -114,8 +114,10 @@ typedef struct {
     int stop_write;
     int curl_easy_cleanup_read;
     int curl_easy_cleanup_write;
-    struct AcRequestData *unsent_head;
-    struct AcRequestData *unsent_tail;
+    uintptr_t *unsent;
+    size_t unsent_start;
+    size_t unsent_len;
+    size_t unsent_cap;
     struct AcRequestData *live_head;
 #ifdef Py_GIL_DISABLED
     PyMutex live_lock;
@@ -318,6 +320,52 @@ static PyObject *buffer_to_bytes(Buffer *b, PyObject **cache) {
     return *cache;
 }
 
+#define STREAM_BUFFER (1024 * 1024)
+
+enum { MSG_DONE, MSG_HEADERS, MSG_WAKE };
+enum { MSG_CANCEL = 1, MSG_RESUME = 2 };
+
+typedef struct Stream {
+    pthread_mutex_t lock;
+    atomic_int refs;
+    Buffer buf;
+    Buffer spare;
+    bool paused;
+    bool want_wake;
+    bool complete;
+    bool response_alive;
+    bool owns_curl;
+    PyObject *waiter;
+    struct AcRequestData *rd;
+    struct AcRequestData *owner;
+    double paused_since;
+    double paused_time;
+    CURLcode result;
+    char *error;
+} Stream;
+
+static Stream *stream_new(void) {
+    Stream *s = calloc(1, sizeof(Stream));
+    if (s != NULL) {
+        pthread_mutex_init(&s->lock, NULL);
+        atomic_init(&s->refs, 1);
+    }
+    return s;
+}
+
+static void stream_incref(Stream *s) { atomic_fetch_add(&s->refs, 1); }
+
+static void stream_decref(Stream *s) {
+    if (atomic_fetch_sub(&s->refs, 1) != 1) {
+        return;
+    }
+    free(s->buf.data);
+    free(s->spare.data);
+    free(s->error);
+    pthread_mutex_destroy(&s->lock);
+    free(s);
+}
+
 typedef struct AcRequestData {
     char *method;
     char *url;
@@ -345,10 +393,12 @@ typedef struct AcRequestData {
     Buffer header;
     Buffer body;
     bool discard_body;
+    Stream *stream;
+    bool headers_sent;
+    bool delivered;
     HostSlot *slot;
     struct AcRequestData *prev_waiting;
     struct AcRequestData *next_waiting;
-    struct AcRequestData *next_unsent;
     struct AcRequestData *live_prev;
     struct AcRequestData *live_next;
     double queued_at;
@@ -441,6 +491,7 @@ typedef struct {
     PyObject_HEAD Buffer header;
     Buffer body;
     bool body_discarded;
+    Stream *stream;
     PyObject *header_bytes;
     PyObject *body_bytes;
     Session *session;
@@ -450,13 +501,46 @@ typedef struct {
 
 /* Python deallocator for Response Object. For GC */
 
+static void stream_cancel(Stream *s, EventLoop *loop) {
+    pthread_mutex_lock(&s->lock);
+    AcRequestData *rd = s->owner;
+    bool send = false;
+    if (rd != NULL && !loop->closing) {
+        int expected = REQUEST_RUNNING;
+        send = atomic_compare_exchange_strong(&rd->state, &expected, REQUEST_CANCELLING);
+    }
+    pthread_mutex_unlock(&s->lock);
+    if (send) {
+        uintptr_t message = (uintptr_t)rd | MSG_CANCEL;
+        if (!pipe_write(loop->req_in_write, &message, sizeof(message))) {
+            perror("httpperf: failed to cancel a streamed request");
+        }
+    }
+}
+
 static void Response_dealloc(Response *self) {
     DEBUG_PRINT("response=%p", self);
     free(self->header.data);
     free(self->body.data);
     Py_XDECREF(self->header_bytes);
     Py_XDECREF(self->body_bytes);
-    queue_cleanup(self->session->loop, self->curl, NULL);
+    if (self->stream != NULL) {
+        Stream *s = self->stream;
+        stream_cancel(s, self->session->loop);
+        pthread_mutex_lock(&s->lock);
+        s->response_alive = false;
+        PyObject *waiter = s->waiter;
+        s->waiter = NULL;
+        bool owns_curl = s->owns_curl;
+        pthread_mutex_unlock(&s->lock);
+        Py_XDECREF(waiter);
+        if (owns_curl) {
+            queue_cleanup(self->session->loop, self->curl, NULL);
+        }
+        stream_decref(s);
+    } else {
+        queue_cleanup(self->session->loop, self->curl, NULL);
+    }
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -477,6 +561,85 @@ static PyObject *Response_get_body_unlocked(Response *self, PyObject *args) {
 }
 
 LOCKED(Response_get_body, Response)
+
+static bool response_final(Response *self) {
+    if (self->stream == NULL) {
+        return true;
+    }
+    pthread_mutex_lock(&self->stream->lock);
+    bool complete = self->stream->complete;
+    pthread_mutex_unlock(&self->stream->lock);
+    if (!complete) {
+        PyErr_SetString(PyExc_RuntimeError, "the body hasn't been read yet");
+    }
+    return complete;
+}
+
+static PyObject *Response_stream_take_unlocked(Response *self, PyObject *args) {
+    Stream *s = self->stream;
+    pthread_mutex_lock(&s->lock);
+    Buffer taken = s->buf;
+    s->buf = s->spare;
+    s->spare = taken;
+    bool resume = s->paused;
+    s->paused = false;
+    bool complete = s->complete;
+    pthread_mutex_unlock(&s->lock);
+    if (resume) {
+        stream_incref(s);
+        uintptr_t message = (uintptr_t)s | MSG_RESUME;
+        if (!pipe_write(self->session->loop->req_in_write, &message, sizeof(message))) {
+            stream_decref(s);
+            perror("httpperf: failed to resume a streamed request");
+        }
+    }
+    if (s->spare.len == 0 && complete) {
+        Py_RETURN_NONE;
+    }
+    PyObject *data = PyBytes_FromStringAndSize(s->spare.data, (Py_ssize_t)s->spare.len);
+    s->spare.len = 0;
+    return data;
+}
+
+LOCKED(Response_stream_take, Response)
+
+static PyObject *Response_stream_wait(Response *self, PyObject *waiter) {
+    Stream *s = self->stream;
+    pthread_mutex_lock(&s->lock);
+    bool wait = s->buf.len == 0 && !s->complete;
+    PyObject *old = NULL;
+    if (wait) {
+        old = s->waiter;
+        Py_INCREF(waiter);
+        s->waiter = waiter;
+        s->want_wake = true;
+    }
+    pthread_mutex_unlock(&s->lock);
+    Py_XDECREF(old);
+    return PyBool_FromLong(wait);
+}
+
+static PyObject *Response_stream_close(Response *self, PyObject *args) {
+    if (self->stream != NULL) {
+        stream_cancel(self->stream, self->session->loop);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *Response_stream_result(Response *self, PyObject *args) {
+    Stream *s = self->stream;
+    if (s == NULL || s->result == CURLE_OK) {
+        Py_RETURN_NONE;
+    }
+    return Py_BuildValue("(is)", s->result, s->error ? s->error : curl_easy_strerror(s->result));
+}
+
+static PyObject *Response_get_paused_time(Response *self, PyObject *args) {
+    if (!response_final(self)) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(self->stream ? self->stream->paused_time : 0.0);
+}
 
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
     long value;
@@ -508,20 +671,28 @@ PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
 #define RESPONSE_GETINFO(name, kind, info) \
     static PyObject *Response_get_##name(Response *self, PyObject *args) { return resp_get_info_##kind(self, info); }
 
+#define RESPONSE_GETINFO_FINAL(name, kind, info)                               \
+    static PyObject *Response_get_##name(Response *self, PyObject *args) {     \
+        return response_final(self) ? resp_get_info_##kind(self, info) : NULL; \
+    }
+
 RESPONSE_GETINFO(effective_url, unicode, CURLINFO_EFFECTIVE_URL)
 RESPONSE_GETINFO(response_code, long, CURLINFO_RESPONSE_CODE)
-RESPONSE_GETINFO(total_time, double, CURLINFO_TOTAL_TIME)
-RESPONSE_GETINFO(namelookup_time, double, CURLINFO_NAMELOOKUP_TIME)
-RESPONSE_GETINFO(connect_time, double, CURLINFO_CONNECT_TIME)
-RESPONSE_GETINFO(appconnect_time, double, CURLINFO_APPCONNECT_TIME)
-RESPONSE_GETINFO(pretransfer_time, double, CURLINFO_PRETRANSFER_TIME)
-RESPONSE_GETINFO(starttransfer_time, double, CURLINFO_STARTTRANSFER_TIME)
-RESPONSE_GETINFO(size_upload, off_t, CURLINFO_SIZE_UPLOAD_T)
-RESPONSE_GETINFO(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
+RESPONSE_GETINFO_FINAL(total_time, double, CURLINFO_TOTAL_TIME)
+RESPONSE_GETINFO_FINAL(namelookup_time, double, CURLINFO_NAMELOOKUP_TIME)
+RESPONSE_GETINFO_FINAL(connect_time, double, CURLINFO_CONNECT_TIME)
+RESPONSE_GETINFO_FINAL(appconnect_time, double, CURLINFO_APPCONNECT_TIME)
+RESPONSE_GETINFO_FINAL(pretransfer_time, double, CURLINFO_PRETRANSFER_TIME)
+RESPONSE_GETINFO_FINAL(starttransfer_time, double, CURLINFO_STARTTRANSFER_TIME)
+RESPONSE_GETINFO_FINAL(size_upload, off_t, CURLINFO_SIZE_UPLOAD_T)
+RESPONSE_GETINFO_FINAL(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
 RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
 RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
 
 static PyObject *Response_get_posttransfer_time(Response *self, PyObject *args) {
+    if (!response_final(self)) {
+        return NULL;
+    }
 #if LIBCURL_VERSION_NUM >= 0x080a00
     curl_off_t value = 0;
     curl_easy_getinfo(self->curl, CURLINFO_POSTTRANSFER_TIME_T, &value);
@@ -606,6 +777,11 @@ static PyMethodDef Response_methods[] = {
     {"get_redirect_url", (PyCFunction)Response_get_redirect_url, METH_NOARGS, "Get the redirect URL or None"},
     {"get_header", (PyCFunction)Response_get_header, METH_NOARGS, "Get the header"},
     {"get_body", (PyCFunction)Response_get_body, METH_NOARGS, "Get the body"},
+    {"get_paused_time", (PyCFunction)Response_get_paused_time, METH_NOARGS, "Time the transfer waited on Python"},
+    {"stream_take", (PyCFunction)Response_stream_take, METH_NOARGS, "Take the streamed bytes so far"},
+    {"stream_wait", (PyCFunction)Response_stream_wait, METH_O, "Resolve the future when more arrives"},
+    {"stream_close", (PyCFunction)Response_stream_close, METH_NOARGS, "Stop a streamed transfer"},
+    {"stream_result", (PyCFunction)Response_stream_result, METH_NOARGS, "The streamed transfer's error, if any"},
     {NULL, NULL, 0, NULL}};
 
 static PyMemberDef Response_members[] = {{NULL}};
@@ -662,6 +838,7 @@ static void check_multi(EventLoop *loop, CURLMcode rc) {
 
 static void add_transfer(EventLoop *loop, AcRequestData *rd);
 static void send_completed(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask);
+static PyObject *stream_finish(EventLoop *loop, struct AcRequestData *rd, CURLcode result, const char *error);
 
 static char *host_key(const char *url) {
     CURLU *u = curl_url();
@@ -911,7 +1088,20 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
     share_decref(share);
 }
 
+static void stream_paused_until_now(Stream *s) {
+    if (s->paused_since > 0) {
+        s->paused_time += monotonic_time() - s->paused_since;
+        s->paused_since = 0;
+    }
+}
+
 static void release_request(EventLoop *loop, AcRequestData *rd) {
+    if (rd->stream != NULL) {
+        pthread_mutex_lock(&rd->stream->lock);
+        stream_paused_until_now(rd->stream);
+        rd->stream->rd = NULL;
+        pthread_mutex_unlock(&rd->stream->lock);
+    }
     stats_finish(rd);
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
     curl_easy_setopt(rd->curl, CURLOPT_ERRORBUFFER, NULL);
@@ -931,9 +1121,10 @@ static void release_request(EventLoop *loop, AcRequestData *rd) {
     rd->share = NULL;
 }
 
-static void send_request(EventLoop *loop, AcRequestData *rd) {
-    if (loop->unsent_head == NULL) {
-        if (pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
+static void send_message(EventLoop *loop, AcRequestData *rd, int kind) {
+    uintptr_t message = (uintptr_t)rd | (uintptr_t)kind;
+    if (loop->unsent_len == 0) {
+        if (pipe_write(loop->req_out_write, &message, sizeof(message))) {
             return;
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -943,17 +1134,35 @@ static void send_request(EventLoop *loop, AcRequestData *rd) {
         if (aeCreateFileEvent(loop->event_loop, loop->req_out_write, AE_WRITABLE, send_completed, loop) == AE_ERR) {
             fprintf(stderr, "httpperf: failed to watch the completed request pipe\n");
         }
-        loop->unsent_head = rd;
-    } else {
-        loop->unsent_tail->next_unsent = rd;
     }
-    loop->unsent_tail = rd;
+    if (loop->unsent_len == loop->unsent_cap) {
+        size_t cap = loop->unsent_cap ? loop->unsent_cap * 2 : 256;
+        uintptr_t *unsent = malloc(cap * sizeof(uintptr_t));
+        if (unsent == NULL) {
+            fprintf(stderr, "httpperf: out of memory returning a completed request\n");
+            return;
+        }
+        for (size_t i = 0; i < loop->unsent_len; i++) {
+            unsent[i] = loop->unsent[(loop->unsent_start + i) % loop->unsent_cap];
+        }
+        free(loop->unsent);
+        loop->unsent = unsent;
+        loop->unsent_start = 0;
+        loop->unsent_cap = cap;
+    }
+    loop->unsent[(loop->unsent_start + loop->unsent_len++) % loop->unsent_cap] = message;
 }
+
+static void send_request(EventLoop *loop, AcRequestData *rd) { send_message(loop, rd, MSG_DONE); }
 
 static void complete_request(EventLoop *loop, AcRequestData *rd) {
     release_request(loop, rd);
     int expected = REQUEST_RUNNING;
     if (atomic_compare_exchange_strong(&rd->state, &expected, REQUEST_SENT)) {
+        if (rd->stream != NULL && !rd->headers_sent && rd->result == CURLE_OK) {
+            rd->headers_sent = true;
+            send_message(loop, rd, MSG_HEADERS);
+        }
         send_request(loop, rd);
     } else {
         rd->finished = true;
@@ -983,18 +1192,17 @@ static void cancel_request(EventLoop *loop, AcRequestData *rd) {
 
 static void send_completed(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     EventLoop *loop = (EventLoop *)clientData;
-    while (loop->unsent_head != NULL) {
-        AcRequestData *rd = loop->unsent_head;
-        if (!pipe_write(loop->req_out_write, &rd, sizeof(rd))) {
+    while (loop->unsent_len > 0) {
+        uintptr_t message = loop->unsent[loop->unsent_start];
+        if (!pipe_write(loop->req_out_write, &message, sizeof(message))) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             }
             perror("httpperf: failed to return completed request");
         }
-        loop->unsent_head = rd->next_unsent;
-        rd->next_unsent = NULL;
+        loop->unsent_start = (loop->unsent_start + 1) % loop->unsent_cap;
+        loop->unsent_len--;
     }
-    loop->unsent_tail = NULL;
     aeDeleteFileEvent(loop->event_loop, loop->req_out_write, AE_WRITABLE);
 }
 
@@ -1037,7 +1245,42 @@ void socket_action_and_response_complete(EventLoop *loop, curl_socket_t socket, 
 static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     AcRequestData *rd = (AcRequestData *)userdata;
     size_t n = size * nmemb;
-    return buffer_append(&rd->header, ptr, n, n > 1024 ? n : 1024) ? n : 0;
+    if (rd->headers_sent) {
+        return n;
+    }
+    if (!buffer_append(&rd->header, ptr, n, n > 1024 ? n : 1024)) {
+        return 0;
+    }
+    if (rd->stream != NULL && ((n == 2 && ptr[0] == '\r') || (n == 1 && ptr[0] == '\n'))) {
+        long code = 0;
+        curl_easy_getinfo(rd->curl, CURLINFO_RESPONSE_CODE, &code);
+        if (code >= 200) {
+            rd->headers_sent = true;
+            send_message(rd->session->loop, rd, MSG_HEADERS);
+        }
+    }
+    return n;
+}
+
+static size_t stream_write(AcRequestData *rd, char *ptr, size_t n) {
+    Stream *s = rd->stream;
+    pthread_mutex_lock(&s->lock);
+    if (s->buf.len >= STREAM_BUFFER) {
+        s->paused = true;
+        if (s->paused_since == 0) {
+            s->paused_since = monotonic_time();
+        }
+        pthread_mutex_unlock(&s->lock);
+        return CURL_WRITEFUNC_PAUSE;
+    }
+    bool ok = buffer_append(&s->buf, ptr, n, STREAM_BUFFER);
+    bool wake = s->want_wake;
+    s->want_wake = false;
+    pthread_mutex_unlock(&s->lock);
+    if (wake) {
+        send_message(rd->session->loop, rd, MSG_WAKE);
+    }
+    return ok ? n : 0;
 }
 
 /* See docs for CURLOPT_WTIE_FUNCTION */
@@ -1047,6 +1290,9 @@ size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     size_t n = size * nmemb;
     if (rd->discard_body) {
         return n;
+    }
+    if (rd->stream != NULL) {
+        return stream_write(rd, ptr, n);
     }
     size_t initial = n;
     if (rd->body.cap == 0) {
@@ -1083,14 +1329,31 @@ static int close_socket(void *clientp, curl_socket_t item) {
     return close(item);
 }
 
+static void stream_resume(EventLoop *loop, Stream *s) {
+    pthread_mutex_lock(&s->lock);
+    AcRequestData *rd = s->rd;
+    stream_paused_until_now(s);
+    pthread_mutex_unlock(&s->lock);
+    if (rd != NULL) {
+        curl_easy_pause(rd->curl, CURLPAUSE_CONT);
+        response_complete(loop);
+    }
+    stream_decref(s);
+}
+
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     AcRequestData *rd;
     EventLoop *loop = (EventLoop *)clientData;
     if (pipe_read(loop->req_in_read, &rd, sizeof(rd)) != 1) {
         return;
     }
-    if ((uintptr_t)rd & 1) {
-        cancel_request(loop, (AcRequestData *)((uintptr_t)rd & ~(uintptr_t)1));
+    uintptr_t kind = (uintptr_t)rd & 3;
+    if (kind == MSG_CANCEL) {
+        cancel_request(loop, (AcRequestData *)((uintptr_t)rd & ~(uintptr_t)3));
+        return;
+    }
+    if (kind == MSG_RESUME) {
+        stream_resume(loop, (Stream *)((uintptr_t)rd & ~(uintptr_t)3));
         return;
     }
     REQUEST_TRACE_PRINT("start_request", rd);
@@ -1448,6 +1711,7 @@ static void EventLoop_dealloc(EventLoop *self) {
     close_fd(self->stop_write);
     close_fd(self->curl_easy_cleanup_read);
     close_fd(self->curl_easy_cleanup_write);
+    free(self->unsent);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -1484,12 +1748,22 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
     while (live != NULL) {
         AcRequestData *rd = live;
         live = rd->live_next;
-        PyList_Append(futures, rd->future);
-        Py_DECREF(rd->future);
+        if (rd->future != NULL) {
+            PyList_Append(futures, rd->future);
+            Py_DECREF(rd->future);
+        }
         if (rd->waiting) {
             queue_remove(rd->limiter, rd);
         }
-        if (rd->curl != NULL) {
+        if (rd->delivered) {
+            PyObject *waiter =
+                stream_finish(NULL, rd, CURLE_ABORTED_BY_CALLBACK, "engine closed before the request finished");
+            if (waiter != NULL) {
+                PyList_Append(futures, waiter);
+                Py_DECREF(waiter);
+            }
+            Py_DECREF(rd->session);
+        } else if (rd->curl != NULL) {
             curl_easy_cleanup(rd->curl);
         }
         if (rd->share != NULL) {
@@ -1510,10 +1784,15 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
         free(rd->req_data_buf);
         free(rd->header.data);
         free(rd->body.data);
-        Py_DECREF(rd->session);
+        if (!rd->delivered) {
+            Py_DECREF(rd->session);
+        }
+        if (rd->stream != NULL) {
+            stream_decref(rd->stream);
+        }
         free(rd);
     }
-    self->unsent_head = self->unsent_tail = NULL;
+    self->unsent_len = 0;
     return futures;
 }
 
@@ -1540,58 +1819,137 @@ static PyObject *Eventloop_get_out_fd(PyObject *self, PyObject *args) {
     return Py_BuildValue("i", ((EventLoop *)self)->req_out_read);
 }
 
+static bool append_completed(PyObject *list, PyObject *error, PyObject *response, PyObject *future) {
+    PyObject *tuple = PyTuple_New(3);
+    if (tuple == NULL) {
+        Py_XDECREF(error);
+        Py_XDECREF(response);
+        Py_DECREF(future);
+        return false;
+    }
+    if (error == NULL) {
+        Py_INCREF(Py_None);
+        error = Py_None;
+    }
+    if (response == NULL) {
+        Py_INCREF(Py_None);
+        response = Py_None;
+    }
+    PyTuple_SET_ITEM(tuple, 0, error);
+    PyTuple_SET_ITEM(tuple, 1, response);
+    PyTuple_SET_ITEM(tuple, 2, future);
+    int rc = PyList_Append(list, tuple);
+    Py_DECREF(tuple);
+    return rc == 0;
+}
+
+static Response *response_from(AcRequestData *rd) {
+    Response *response = PyObject_New(Response, (PyTypeObject *)&ResponseType);
+    if (response == NULL) {
+        return NULL;
+    }
+    response->header = rd->header;
+    rd->header = (Buffer){0};
+    response->body = rd->body;
+    rd->body = (Buffer){0};
+    response->body_discarded = rd->discard_body;
+    response->stream = NULL;
+    response->header_bytes = NULL;
+    response->body_bytes = NULL;
+    response->curl = rd->curl;
+    response->session = rd->session;
+    response->queue_time = rd->queue_time;
+    return response;
+}
+
+static PyObject *stream_finish(EventLoop *loop, AcRequestData *rd, CURLcode result, const char *error) {
+    Stream *s = rd->stream;
+    pthread_mutex_lock(&s->lock);
+    s->complete = true;
+    s->result = result;
+    s->error = result == CURLE_OK ? NULL : strdup(error);
+    s->owner = NULL;
+    s->owns_curl = s->response_alive;
+    bool cleanup = !s->response_alive;
+    PyObject *waiter = s->waiter;
+    s->waiter = NULL;
+    pthread_mutex_unlock(&s->lock);
+    if (cleanup) {
+        queue_cleanup(loop, rd->curl, NULL);
+    }
+    return waiter;
+}
+
 static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
-    AcRequestData *rd;
+    EventLoop *loop = (EventLoop *)self;
+    uintptr_t message;
     PyObject *list = PyList_New(0);
+    if (list == NULL) {
+        return NULL;
+    }
     int status;
-    while ((status = pipe_read(((EventLoop *)self)->req_out_read, &rd, sizeof(rd))) == 1) {
+    while ((status = pipe_read(loop->req_out_read, &message, sizeof(message))) == 1) {
+        AcRequestData *rd = (AcRequestData *)(message & ~(uintptr_t)3);
+        int kind = (int)(message & 3);
         REQUEST_TRACE_PRINT("Eventloop_get_completed", rd);
-        LIVE_LOCK((EventLoop *)self);
+        if (kind == MSG_WAKE) {
+            pthread_mutex_lock(&rd->stream->lock);
+            PyObject *waiter = rd->stream->waiter;
+            rd->stream->waiter = NULL;
+            pthread_mutex_unlock(&rd->stream->lock);
+            if (waiter != NULL) {
+                append_completed(list, NULL, NULL, waiter);
+            }
+            continue;
+        }
+        if (kind == MSG_HEADERS) {
+            Response *response = response_from(rd);
+            if (response == NULL) {
+                break;
+            }
+            Py_INCREF(rd->session);
+            response->stream = rd->stream;
+            stream_incref(rd->stream);
+            pthread_mutex_lock(&rd->stream->lock);
+            rd->stream->response_alive = true;
+            pthread_mutex_unlock(&rd->stream->lock);
+            rd->delivered = true;
+            append_completed(list, NULL, (PyObject *)response, rd->future);
+            rd->future = NULL;
+            continue;
+        }
+        LIVE_LOCK(loop);
         if (rd->live_prev != NULL) {
             rd->live_prev->live_next = rd->live_next;
         } else {
-            ((EventLoop *)self)->live_head = rd->live_next;
+            loop->live_head = rd->live_next;
         }
         if (rd->live_next != NULL) {
             rd->live_next->live_prev = rd->live_prev;
         }
-        LIVE_UNLOCK((EventLoop *)self);
+        LIVE_UNLOCK(loop);
         DEBUG_PRINT("read AcRequestData; address=%p", rd);
-        PyObject *tuple = PyTuple_New(3);
-        if (rd->result == CURLE_OK) {
-            Response *response = PyObject_New(Response, (PyTypeObject *)&ResponseType);
-            response->header = rd->header;
-            response->body = rd->body;
-            response->body_discarded = rd->discard_body;
-            response->header_bytes = NULL;
-            response->body_bytes = NULL;
-            response->curl = rd->curl;
-            response->session = rd->session;
-            response->queue_time = rd->queue_time;
-
-            Py_INCREF(Py_None);
-            PyTuple_SET_ITEM(tuple, 0, Py_None);
-            PyTuple_SET_ITEM(tuple, 1, (PyObject *)response);
-            PyTuple_SET_ITEM(tuple, 2, rd->future);
+        const char *error = rd->error[0] ? rd->error : curl_easy_strerror(rd->result);
+        if (rd->delivered) {
+            PyObject *waiter = stream_finish(loop, rd, rd->result, error);
+            if (waiter != NULL) {
+                append_completed(list, NULL, NULL, waiter);
+            }
+            Py_DECREF(rd->session);
+        } else if (rd->result == CURLE_OK) {
+            append_completed(list, NULL, (PyObject *)response_from(rd), rd->future);
         } else {
-            PyObject *error =
-                Py_BuildValue("(is)", rd->result, rd->error[0] ? rd->error : curl_easy_strerror(rd->result));
-            free(rd->header.data);
-            free(rd->body.data);
             queue_cleanup(rd->session->loop, rd->curl, NULL);
             Py_DECREF(rd->session);
-
-            PyTuple_SET_ITEM(tuple, 0, error);
-            Py_INCREF(Py_None);
-            PyTuple_SET_ITEM(tuple, 1, Py_None);
-            PyTuple_SET_ITEM(tuple, 2, rd->future);
+            append_completed(list, Py_BuildValue("(is)", rd->result, error), NULL, rd->future);
         }
-        PyList_Append(list, tuple);
-        Py_DECREF(tuple);
-        if (rd->req_data_buf != NULL) {
-            free(rd->req_data_buf);
-        }
+        free(rd->header.data);
+        free(rd->body.data);
+        free(rd->req_data_buf);
         Py_XDECREF(rd->cookies);
+        if (rd->stream != NULL) {
+            stream_decref(rd->stream);
+        }
         free(rd);
     }
     if (status == -1 && PyList_GET_SIZE(list) == 0) {
@@ -1815,13 +2173,14 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     PyObject *timeout = Py_None;
     PyObject *connect_timeout = Py_None;
     int discard_body = 0;
+    int stream = 0;
 
     static char *kwlist[] = {"future", "method", "url",     "headers",         "auth",         "cookies", "data",
-                             "cert",   "verify", "timeout", "connect_timeout", "discard_body", NULL};
+                             "cert",   "verify", "timeout", "connect_timeout", "discard_body", "stream",  NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOp", kwlist, &future, &method, &url, &headers, &auth,
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOpp", kwlist, &future, &method, &url, &headers, &auth,
                                      &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout, &connect_timeout,
-                                     &discard_body)) {
+                                     &discard_body, &stream)) {
         return NULL;
     }
     long timeout_ms, connect_timeout_ms;
@@ -1846,6 +2205,12 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     }
     REQUEST_TRACE_PRINT("Session_request", rd);
     rd->discard_body = discard_body;
+    if (stream) {
+        rd->stream = stream_new();
+        CHECK_ALLOC(rd->stream);
+        rd->stream->rd = rd;
+        rd->stream->owner = rd;
+    }
     rd->timeout_ms = timeout_ms;
     rd->connect_timeout_ms = connect_timeout_ms;
     bool has_content_type = false;
@@ -2015,6 +2380,9 @@ error_cleanup:
     free(rd->method);
     free(rd->url);
     free(rd->req_data_buf);
+    if (rd->stream != NULL) {
+        stream_decref(rd->stream);
+    }
     free(rd);
     return NULL;
 }
