@@ -26,6 +26,9 @@ classifiers = [
     "Topic :: Software Development :: Testing :: Traffic Generation",
 ]
 
+[project.scripts]
+httpperf = "httpperf.__main__:main"
+
 [project.urls]
 Source = "https://github.com/tonysimpson/httpperf"
 
@@ -53,7 +56,7 @@ before-all = "sh {project}/tools/build-libcurl.sh"
 test-requires = ["pytest", "pytest-timeout", "pytest-httpbin"]
 test-command = [
     "python {project}/tools/wheel_smoke.py",
-    "pytest -p no:cacheprovider {project}/tests/test_httpbin.py {project}/tests/test_engine.py {project}/tests/test_response.py {project}/tests/test_cookie.py {project}/tests/test_threads.py",
+    "pytest -p no:cacheprovider {project}/tests/test_httpbin.py {project}/tests/test_engine.py {project}/tests/test_response.py {project}/tests/test_cookie.py {project}/tests/test_threads.py {project}/tests/test_cli.py",
 ]
 
 [tool.cibuildwheel.linux]
