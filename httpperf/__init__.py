@@ -937,8 +937,8 @@ class Session:
         if source is not None:
             upload_start = _upload_start(source)
             call_options = dict(options, upload_size=_upload_size(source))
-            if not _has_header("expect", None, header_tuple):
-                header_tuple = (header_tuple or ()) + ("Expect:",)
+        if data is not None and not _has_header("expect", None, header_tuple):
+            header_tuple = (header_tuple or ()) + ("Expect:",)
 
         loop = asyncio.get_running_loop()
         engine = self._engine

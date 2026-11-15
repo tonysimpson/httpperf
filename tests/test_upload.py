@@ -74,6 +74,15 @@ async def test_an_error_in_the_source_is_raised(s, server):
         await s.post(server.url, data=failing())
 
 
+async def test_a_large_body_is_sent_without_expect(s, server):
+    assert (await s.post(server.url, data=BIG)).headers["x-expect"] == ""
+
+
+async def test_an_expect_header_that_is_set_is_kept(s, server):
+    r = await s.post(server.url, data=BIG, headers={"Expect": "100-continue"})
+    assert r.headers["x-expect"] == "100-continue"
+
+
 async def test_a_307_redirect_sends_the_file_again(s, server, big_file):
     assert (await s.post(server.url + "/redirect/307", data=big_file)).body == BIG
 

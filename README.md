@@ -165,6 +165,8 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `discard_body` | `True` drops the response body as it arrives, for when only the status, headers or timings matter. See [Large bodies](#large-bodies). |
 | `stream` | `True` returns as soon as the headers arrive, and the body is read with `iter_content()` or `read()`. See [Large bodies](#large-bodies). |
 
+Request bodies are sent without `Expect: 100-continue`, as in requests, unless you set that header. curl would otherwise add it to bodies over 1 MB and wait up to a second for the server to reply `100 Continue` before sending the body.
+
 Failed transfers raise `httpperf.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `httpperf.Timeout`, a subclass, so they can be counted separately.
 
 ### Large bodies
@@ -206,7 +208,6 @@ with open("big.iso", "rb") as f:
 - A regular file is sent with a `Content-Length`. Anything else is sent chunked (on HTTP/1.1).
 - httpperf reads ahead up to 1 MB. When the source falls behind, curl pauses that transfer until there is more to send; that time is in `r.paused_time` too.
 - An exception from the source, such as a failing `read()`, stops the transfer and is raised from the request.
-- No `Expect: 100-continue` is sent, unless you set the header yourself.
 - A 307 or 308 redirect sends the body again: a seekable file is rewound to where it started, and anything else raises `RequestError`.
 
 Streaming is for benchmarking large transfers, such as how fast a server sends or receives a big file, and for checking what arrives. Each chunk passes through Python, so it can't sustain high request rates. For those, use `discard_body=True` or keep the body in memory.
