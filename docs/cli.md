@@ -54,12 +54,11 @@ Arguments after `--` are left in `sys.argv` for the script.
 
 ## What a step does
 
-1. Start `--threads` threads, each with its own event loop, `Engine` and `Session`.
-2. Run for `--warmup` without recording anything, so connections are open and the server is warm.
-3. Record for `--duration`.
-4. Stop sending and wait for requests in flight, up to `--timeout`. Responses that arrive after the measured period aren't recorded.
+1. Run for `--warmup` without recording anything, so connections are open and the server is warm.
+2. Record for `--duration`.
+3. Stop sending and wait for requests in flight, up to `--timeout`. Responses that arrive after the measured period aren't recorded.
 
-Each step opens new connections, so steps don't affect each other.
+The `--threads` threads, each with its own event loop, `Engine` and `Session`, start before the first step and stay up until the last. Connections carry over from one step to the next, so the server isn't hit with a burst of closes and new connections between steps. A step with more connections than the last opens the extra ones during its warm-up. One with fewer leaves the rest idle.
 
 ### Flat out
 
