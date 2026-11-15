@@ -41,7 +41,7 @@ python -m httpperf --rate 20000,40000,60000 http://localhost:8080/
 | `-H`, `--header "Name: value"` | | Add a header. Repeatable. |
 | `-X`, `--method M` | GET | HTTP method. |
 | `--body DATA` | | Request body. `@file` reads it from a file. |
-| `--http 1.1\|2\|3` | 2 | HTTP version to ask for. As in the library, HTTP/2 needs `https://`; plain `http://` uses HTTP/1.1. |
+| `--http 1.1\|2\|3` | 1.1 | HTTP version to ask for. HTTP/2 needs `https://`; plain `http://` stays on HTTP/1.1. The library defaults to HTTP/2, but the CLI defaults to HTTP/1.1 so that `-c` means connections, as in wrk. |
 | `--timeout T` | 2s | A request that takes longer is an error. |
 | `-s`, `--script FILE` | | Python file defining the request to make. See [Scripts](#scripts). |
 | `--json` | | Print the results as JSON instead of the report. |
@@ -64,7 +64,9 @@ The `--threads` threads, each with its own event loop, `Engine` and `Session`, s
 
 Each of the `-c` requests in flight sends the next request as soon as its response arrives. Throughput is what the server can sustain at that concurrency.
 
-`-c` is requests in flight, not a count of connections. curl opens a connection when a request needs one and none is free, so with HTTP/1.1 there are up to `-c` connections. Fewer are opened if the client can't keep that many on the wire, and HTTP/2 shares a connection between requests.
+With HTTP/1.1, the default, each request in flight has its own connection, so there are up to `-c` connections. curl opens one when a request needs it and none is free, so fewer are opened if the client can't keep that many on the wire.
+
+With `--http 2` or `--http 3`, requests in flight share connections, so `-c` is the number of streams, usually on one connection per thread.
 
 Latency is measured from when the request was sent. A server that stalls holds up the requests in flight, so fewer requests are sent during the stall and few slow ones are recorded. Flat-out latency is fine for comparing steps, but it understates the tail. Use `--rate` for latency you can quote.
 

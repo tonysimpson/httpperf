@@ -681,7 +681,7 @@ def parser():
     p.add_argument("-H", "--header", action="append", default=[], help='"Name: value", repeatable')
     p.add_argument("-X", "--method", default="GET")
     p.add_argument("--body", metavar="DATA", help="request body, or @file")
-    p.add_argument("--http", choices=sorted(HTTP_VERSIONS), default="2", help="HTTP version to ask for (default 2)")
+    p.add_argument("--http", choices=sorted(HTTP_VERSIONS), default="1.1", help="HTTP version to ask for (default 1.1)")
     p.add_argument("--timeout", type=duration, metavar="T", default=2.0, help="request timeout (default 2s)")
     p.add_argument("-s", "--script", metavar="FILE", help="Python file defining async def request(session, url)")
     p.add_argument("--json", action="store_true", help="print the results as JSON")
