@@ -118,6 +118,7 @@ import httpperf
 
 ids = open(sys.argv[1]).read().split()
 
+
 async def request(session, url):
     r = await session.get(url + "/items/" + random.choice(ids), body_to=httpperf.DISCARD)
     if r.headers.get("x-cache") != "hit":
@@ -131,66 +132,64 @@ Python work in the script is client CPU per request. A slow script limits the re
 
 ## The report
 
-lwan serving a 13-byte response, with the client on 4 cores:
+The layout follows wrk's, with p90 and p99 added. The first lines are printed before the test starts.
+
+A single step, against lwan serving a 13-byte response, with the client on 4 cores:
 
 ```
-httpperf 1.0rc4 (libcurl 8.14.1), 2 threads, http://localhost:8080/hello
-flat out, 10s per step after 1s warm-up
-
-  connections    req/s  ±/s     p50     p99   p99.9     max  errors
-           10  167,149   1%  0.06ms  0.08ms  0.40ms  8.98ms       0
-           50  205,246   1%  0.30ms  0.37ms  0.96ms  42.1ms       0  ← best
-          200  209,366   0%  0.96ms  1.35ms  2.17ms  5.05ms       0
-        1,000  210,353   0%  4.75ms  5.78ms  8.29ms  12.7ms       0
-
-best: 50 connections, 205,246 req/s
-  latency      p50 0.30ms  p90 0.32ms  p99 0.37ms  p99.9 0.96ms  max 42.1ms
-    first byte p50 0.02ms  p99 0.03ms
-    download   p50 0.00ms  p99 0.00ms
-    connect    p50 0.09ms  p99 40.5ms
-  requests     2,052,462 in 10s, 0 errors
-  transfer     received 37.6 MB/s, sent 20.5 MB/s
-  connections  29 opened, 39 open at the end, HTTP/1.1, 0 TLS handshakes
-  client       3.0 of 4 cores, 15µs CPU per request
-               client lag p99 0.35ms, connection wait p99 0.00ms
-
-warning: client saturated at 10, 50, 200 and 1,000 connections: the results describe the client, not the server
+Running 10s test @ http://127.0.0.1:8080/hello
+  2 threads and 10 connections
+  Thread Stats       Avg     Stdev       p90       p99       Max   +/- Stdev
+    Latency      62.39us   98.72us   61.50us  100.50us   10.20ms      99.61%
+    Req/Sec       79.74k     4.16k                        85.90k      73.00%
+  1594879 requests in 10.00s, 278.34MB read
+Requests/sec:  159487.90
+Transfer/sec:    27.83MB
 ```
-
-Here the client was the limit at every step, and the warning says so: lwan can serve far more than 210k req/s.
-
-A step with one value for `-c` or `--rate` prints only the second part.
 
 | Line | Meaning |
 |---|---|
-| req/s, ±/s | Requests completed per second over the measured period, errors included, and how much the per-second counts varied (coefficient of variation). |
-| latency | From when the request was sent to the response. |
-| first byte, download | curl's `starttransfer_time`, and `total_time` minus it. A slow server shows up in first byte. A large body or slow network shows up in download. |
-| requests | Requests completed in the measured period, and errors by kind. |
-| transfer | `bytes_received` and `bytes_sent` per second: headers and bodies, not TLS or TCP overhead. |
-| connect, TLS | Time to connect and to complete the TLS handshake, for connections opened while measuring. Shown only when there were some. |
-| connections | Connections opened during the step, warm-up included, open at the end, HTTP versions used, TLS handshakes. |
-| client | CPU used by the httpperf process, as cores and per request. `client_lag` p99: how long requests waited on Python, before they were sent and after they finished. `queue_time` p99: how long requests waited for a free connection. Send lag p99 (fixed rate): how late requests were sent. |
+| Latency | Per request, from all threads: mean, standard deviation, p90, p99, max, and the share of requests within one standard deviation of the mean. |
+| Req/Sec | Per thread, sampled every 100 ms: mean, standard deviation, max, and the share of samples within one standard deviation of the mean. |
+| requests, read | Requests completed in the measured period, errors included, and response bytes read (headers and bodies). |
+| Errors | Only when there were some: the count, and the most common kinds. |
+| Requests/sec, Transfer/sec | Over the measured period. |
 
-The best flat-out step is the one with the fewest connections that came within 3% of the highest req/s: the point where more concurrency stops buying throughput and only adds latency. Above, 1,000 connections managed 2% more than 50, at 16 times the latency.
+Several steps print one row each as they finish:
 
-For fixed rate, the step table has columns for the target rate and the achieved rate, and the best step is the highest rate that kept up.
+```
+Running 4 steps of 10s @ http://127.0.0.1:8080/hello
+  2 threads
+   Connections  Requests/sec       Avg       p90       p99       Max  Errors
+            10     167700.60   59.33us   59.50us   73.50us    8.76ms       0
+            50     202162.00  247.03us  331.00us  377.00us   26.16ms       0
+           200     209929.50  952.39us    1.10ms    1.29ms    4.69ms       0
+          1000     210599.10    4.75ms    4.94ms    6.22ms   14.46ms       0
 
-Neither counts a step with more than 1% errors.
+Best: 200 connections, 209929.50 requests/sec
 
-`--json` prints `{"steps": [...], "best": index}`, with every number above for each step, unrounded, in seconds and bytes, and percentiles from p50 to p99.99.
+Warning: httpperf was the limit at 50, 200 and 1000 connections, not the server, so the server can do at least 210599 requests/sec.
+```
+
+The best flat-out step is the one with the fewest connections that came within 3% of the highest requests/sec: the point where more concurrency stops buying throughput and only adds latency. For fixed rate, the first column is the target rate, and the best step is the highest rate that kept up. Neither counts a step with more than 1% errors.
+
+`--json` prints `{"steps": [...], "best": index}` at the end instead, with more detail for each step, unrounded, in seconds and bytes: latency percentiles from p50 to p99.99, time to first byte, download time, connect and TLS times, `client_lag`, `queue_time`, send lag, bytes sent, connections opened and closed, HTTP versions, TLS handshakes, and client CPU.
 
 ## Warnings
 
-Printed under the report when they apply. A warning that applies to several steps is printed once, naming the steps.
+Printed at the end when they apply. A warning that applies to several steps is printed once, naming the steps.
 
-- **Client saturated**: the process used more than 90% of the cores it was allowed, one of its threads (an event loop or a curl thread) was more than 90% busy, or `client_lag` p99 was more than a quarter of latency p99. The result describes the client, not the server. Add `--threads` if there are spare cores, simplify the script, or run the client on another machine.
-- **Errors**: more than 1% of requests failed. The most common kinds are listed.
-- **Unsteady**: req/s varied more than 10% from second to second. Run for longer, or check the server.
-- **Connection churn**: connections were closed during measurement, so the server or a proxy is closing them. Latency includes opening new ones.
-- **Behind schedule** (fixed rate): achieved rate was under 99% of the target, or send lag p99 was over 2 ms.
-- **Over capacity** (fixed rate): the step stopped early because requests piled up.
-- **Peak not reached** (flat out list): the best step was the last, and the client wasn't saturated. Try more connections.
+| Warning | When |
+|---|---|
+| httpperf was the limit, not the server, so the server can do at least N requests/sec. | The process used more than 90% of the cores it was allowed, or one of its threads (an event loop or a curl thread) was more than 90% busy. |
+| N% of requests failed. | More than 1% of requests failed. |
+| Requests/sec varied by N% from second to second. | More than 10%. |
+| The server closed connections during the test, so some requests waited for new ones. | Connections were closed while measuring. |
+| httpperf couldn't keep to the schedule, so it sent fewer requests than asked for. | Fixed rate: achieved rate under 99% of the target, or send lag p99 over 2 ms. |
+| Requests piled up, so the run stopped there. | Fixed rate: more than a second's worth of requests outstanding. |
+| Requests/sec was still rising at the last step, so try more connections. | Flat out with a list: the best step was the last, and httpperf wasn't the limit. |
+
+"httpperf was the limit" is common against fast servers. One process tops out at a few hundred thousand requests/sec, so the result is a lower bound for the server. More threads help while there are spare cores, but on Python with the GIL two threads is usually the most that helps.
 
 ## Exit status
 
@@ -205,7 +204,7 @@ Ctrl-C stops the current step, prints the results of the steps that finished, an
 ## Tips
 
 - Use the server's own machine, or one close to it, and pin the client and server to separate cores (`taskset`). Otherwise they compete and both numbers are wrong.
-- Watch the client line. If it says the client is saturated, more threads help while there are spare cores. On Python with the GIL, two threads is usually the most that helps, since the event loops share the GIL. Free-threaded Python (3.14t) scales further.
+- If the warnings say httpperf was the limit, more threads help while there are spare cores. On Python with the GIL, two threads is usually the most that helps, since the event loops share the GIL. Free-threaded Python (3.14t) scales further.
 - uvloop is used if installed.
 - For a test that needs more than one kind of request, or users with state, write the load test with the library instead.
 

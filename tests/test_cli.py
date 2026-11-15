@@ -96,9 +96,14 @@ def test_a_connection_list_with_a_rate_is_refused(capsys, server):
     assert main(["--rate", "100", "-c", "1,2", server.url]) == 2
 
 
+def test_the_header_is_printed_first(capsys, server):
+    main([*QUICK, server.url])
+    assert capsys.readouterr().out.startswith("Running 0.3s test @ " + server.url)
+
+
 def test_the_report_names_the_best_step(capsys, server):
     main([*QUICK, "-c", "1,2", server.url])
-    assert "best: " in capsys.readouterr().out
+    assert "Best: " in capsys.readouterr().out
 
 
 def step(connections=10, rate=None, rps=1000.0, **overrides):
@@ -138,11 +143,12 @@ def test_the_best_rate_is_the_highest_that_kept_up():
 def test_a_warning_on_several_steps_is_one_line():
     steps = [step(10, busiest_thread=1.0), step(50, busiest_thread=1.0)]
     assert notes(steps, 1) == [
-        "client saturated at 10 and 50 connections: the results describe the client, not the server"
+        "httpperf was the limit at 10 and 50 connections, not the server, "
+        "so the server can do at least 1000 requests/sec."
     ]
 
 
 def test_a_best_last_step_suggests_more_connections():
     assert notes([step(10, rps=500), step(50)], 1) == [
-        "peak not reached: the best step was the last, so try more connections"
+        "Requests/sec was still rising at the last step, so try more connections."
     ]

@@ -20,6 +20,7 @@ except ImportError:
     uvloop = None
 
 PERCENTILES = (50, 75, 90, 99, 99.9, 99.99)
+TICKS = 10
 HTTP_VERSIONS = {"1.1": "HTTP/1.1", "2": "HTTP/2", "3": "HTTP/3"}
 
 
@@ -28,12 +29,13 @@ class Usage(Exception):
 
 
 class Histogram:
-    __slots__ = ("counts", "n", "total", "max")
+    __slots__ = ("counts", "n", "total", "squares", "max")
 
     def __init__(self):
         self.counts = [0] * 4800
         self.n = 0
         self.total = 0.0
+        self.squares = 0.0
         self.max = 0.0
 
     def record(self, seconds):
@@ -46,6 +48,7 @@ class Histogram:
         self.counts[i] += 1
         self.n += 1
         self.total += seconds
+        self.squares += seconds * seconds
         if seconds > self.max:
             self.max = seconds
 
@@ -53,6 +56,7 @@ class Histogram:
         self.counts = [a + b for a, b in zip(self.counts, other.counts)]
         self.n += other.n
         self.total += other.total
+        self.squares += other.squares
         self.max = max(self.max, other.max)
 
     def percentile(self, p):
@@ -67,7 +71,12 @@ class Histogram:
     def summary(self):
         if not self.n:
             return None
-        result = {"count": self.n, "mean": self.total / self.n}
+        mean = self.total / self.n
+        stdev = math.sqrt(max(0.0, self.squares / self.n - mean * mean))
+        within = sum(
+            count for i, count in enumerate(self.counts) if count and abs(bucket_middle(i) / 1e6 - mean) <= stdev
+        )
+        result = {"count": self.n, "mean": mean, "stdev": stdev, "within_stdev": within / self.n}
         result.update(("p%g" % p, self.percentile(p)) for p in PERCENTILES)
         result["max"] = self.max
         return result
@@ -92,15 +101,15 @@ class Record:
         self.send_lag = Histogram()
         self.connect = Histogram()
         self.tls = Histogram()
-        self.per_second = [0] * max(1, math.ceil(plan.duration))
+        self.per_tick = [0] * max(1, math.ceil(plan.duration * TICKS))
         self.t_meas = plan.t_meas
         self.errors = {}
         self.stats = []
 
     def done(self, now):
-        i = int(now - self.t_meas)
-        if i < len(self.per_second):
-            self.per_second[i] += 1
+        i = int((now - self.t_meas) * TICKS)
+        if i < len(self.per_tick):
+            self.per_tick[i] += 1
 
     def error(self, error):
         key, message = error
@@ -295,11 +304,12 @@ def summarise(plan, recs, cpu, threads_cpu, cores_allowed):
     def diff(key, a, b):
         return sum(rec.stats[b][key] - rec.stats[a][key] for rec in recs)
 
-    per_second = [sum(counts) for counts in zip(*(rec.per_second for rec in recs))]
-    full_seconds = per_second[: int(plan.duration)] or per_second
-    mean = sum(full_seconds) / len(full_seconds)
-    cv = (math.sqrt(sum((x - mean) ** 2 for x in full_seconds) / len(full_seconds)) / mean) if mean else 0.0
-    requests = sum(per_second)
+    full_ticks = int(plan.duration * TICKS) or 1
+    per_tick = [sum(counts) for counts in zip(*(rec.per_tick for rec in recs))]
+    per_second = [sum(per_tick[i : i + TICKS]) for i in range(0, full_ticks - TICKS + 1, TICKS)] or per_tick[:1]
+    mean = sum(per_second) / len(per_second)
+    cv = (math.sqrt(sum((x - mean) ** 2 for x in per_second) / len(per_second)) / mean) if mean else 0.0
+    requests = sum(per_tick)
     errors = {}
     for rec in recs:
         for key, (count, message) in rec.errors.items():
@@ -316,6 +326,7 @@ def summarise(plan, recs, cpu, threads_cpu, cores_allowed):
         "requests": requests,
         "rps": requests / plan.duration,
         "rps_variation": cv,
+        "thread_rps": spread([count * TICKS for rec in recs for count in rec.per_tick[:full_ticks]]),
         "errors": sum(count for count, _ in errors.values()),
         "error_kinds": sorted(({"error": m, "count": c} for c, m in errors.values()), key=lambda e: -e["count"]),
         "over_capacity": any(rec.over_capacity for rec in recs),
@@ -339,6 +350,13 @@ def summarise(plan, recs, cpu, threads_cpu, cores_allowed):
         "cpu_per_request": cpu / requests if requests else None,
         "busiest_thread": threads_cpu / plan.duration,
     }
+
+
+def spread(values):
+    mean = sum(values) / len(values)
+    stdev = math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+    within = sum(1 for v in values if abs(v - mean) <= stdev) / len(values)
+    return {"mean": mean, "stdev": stdev, "max": max(values), "within_stdev": within}
 
 
 def cpu_time():
@@ -404,229 +422,188 @@ def best_step(steps):
     return min((i for i in candidates if steps[i]["rps"] >= 0.97 * top), key=lambda i: steps[i]["connections"])
 
 
-SATURATED = ", so the result describes the client, not the server"
-SUMMARIES = {
-    "client saturated": "the results describe the client, not the server",
-    "errors": "more than 1% of requests failed",
-    "unsteady": "req/s varied more than 10% from second to second",
-    "connection churn": "connections were closed while measuring",
-    "behind schedule": "the client couldn't keep to the schedule",
-}
-
-
 def client_saturated(step):
-    latency = step["latency"]
-    lag = step["client_lag"]
-    if step["cpu_cores"] > 0.9 * step["cores_allowed"]:
-        return "used %.1f of %d cores%s" % (step["cpu_cores"], step["cores_allowed"], SATURATED)
-    if step["busiest_thread"] > 0.9:
-        return "a client thread was %.0f%% busy%s" % (100 * step["busiest_thread"], SATURATED)
-    if latency and lag and lag["p99"] > 0.25 * latency["p99"]:
-        return "client lag p99 %s is over a quarter of latency p99 %s" % (
-            fmt_time(lag["p99"]),
-            fmt_time(latency["p99"]),
-        )
-    return None
+    return step["cpu_cores"] > 0.9 * step["cores_allowed"] or step["busiest_thread"] > 0.9
+
+
+def behind_schedule(step):
+    send_lag = step["send_lag"]
+    return step["rate"] is not None and (
+        step["rps"] < 0.99 * step["rate"] or bool(send_lag and send_lag["p99"] > 0.002)
+    )
 
 
 def warnings_for(step):
-    found = []
-    saturated = client_saturated(step)
-    if saturated:
-        found.append(("client saturated", saturated))
-    if not few_errors(step):
-        found.append(
-            (
-                "errors",
-                "%s of %s requests failed (%s)" % (fmt_int(step["errors"]), fmt_int(step["requests"]), kinds(step)),
-            )
-        )
-    if step["rps_variation"] > 0.1:
-        found.append(("unsteady", "req/s varied %.0f%% from second to second" % (100 * step["rps_variation"])))
-    if step["connections_closed_measuring"]:
-        found.append(
-            (
-                "connection churn",
-                "%s connections closed while measuring, so latency includes opening new ones"
-                % fmt_int(step["connections_closed_measuring"]),
-            )
-        )
-    if step["over_capacity"]:
-        found.append(("over capacity", "requests piled up, so the step stopped early"))
-    elif step["rate"] is not None and step["rps"] < 0.99 * step["rate"]:
-        found.append(
-            ("behind schedule", "achieved %s of %s req/s" % (fmt_int(round(step["rps"])), fmt_int(step["rate"])))
-        )
-    elif step["send_lag"] and step["send_lag"]["p99"] > 0.002:
-        found.append(
-            ("behind schedule", "send lag p99 %s, so requests went out late" % fmt_time(step["send_lag"]["p99"]))
-        )
-    return found
+    checks = (
+        ("client", client_saturated(step)),
+        ("errors", not few_errors(step)),
+        ("unsteady", step["rps_variation"] > 0.1),
+        ("churn", step["connections_closed_measuring"] > 0),
+        ("over capacity", step["over_capacity"]),
+        ("behind", not step["over_capacity"] and behind_schedule(step)),
+    )
+    return [kind for kind, found in checks if found]
+
+
+def message(kind, steps, many):
+    at = " at " + step_labels(steps) if many else ""
+    step = steps[0]
+    if kind == "client":
+        most = max(s["rps"] for s in steps)
+        return "httpperf was the limit%s, not the server, so the server can do at least %.0f requests/sec." % (at, most)
+    if kind == "errors":
+        if many:
+            return "More than 1%% of requests failed%s." % at
+        return "%.1f%% of requests failed." % (100 * step["errors"] / max(1, step["requests"]))
+    if kind == "unsteady":
+        by = "more than 10%" if many else "%.0f%%" % (100 * step["rps_variation"])
+        return "Requests/sec varied by %s from second to second%s. Try a longer run (-d)." % (by, at)
+    if kind == "churn":
+        return "The server closed connections during the test%s, so some requests waited for new ones." % at
+    if kind == "over capacity":
+        return "Requests piled up at %s, so the run stopped there." % step_labels(steps)
+    return "httpperf couldn't keep to the schedule%s, so it sent fewer requests than asked for." % at
 
 
 def step_labels(steps):
-    values = [fmt_int(step["rate"] if step["rate"] is not None else step["connections"]) for step in steps]
+    values = ["%d" % (step["rate"] if step["rate"] is not None else step["connections"]) for step in steps]
     joined = values[0] if len(values) == 1 else "%s and %s" % (", ".join(values[:-1]), values[-1])
-    return joined + (" req/s" if steps[0]["rate"] is not None else " connections")
+    return joined + (" requests/sec" if steps[0]["rate"] is not None else " connections")
 
 
 def notes(steps, best):
-    if len(steps) == 1:
-        found = ["%s: %s" % warning for warning in warnings_for(steps[0])]
-    else:
-        by_kind = {}
-        for step in steps:
-            for kind, detail in warnings_for(step):
-                by_kind.setdefault(kind, []).append((step, detail))
-        found = []
-        for kind, hits in by_kind.items():
-            detail = hits[0][1] if len(hits) == 1 else SUMMARIES[kind]
-            found.append("%s at %s: %s" % (kind, step_labels([step for step, _ in hits]), detail))
+    by_kind = {}
+    for step in steps:
+        for kind in warnings_for(step):
+            by_kind.setdefault(kind, []).append(step)
+    found = [message(kind, hits, len(steps) > 1) for kind, hits in by_kind.items()]
     if len(steps) > 1 and steps[0]["rate"] is None and best == len(steps) - 1 and not client_saturated(steps[best]):
-        found.append("peak not reached: the best step was the last, so try more connections")
+        found.append("Requests/sec was still rising at the last step, so try more connections.")
     return found
 
 
-def kinds(step):
-    return ", ".join("%s × %s" % (fmt_int(e["count"]), e["error"]) for e in step["error_kinds"][:3])
-
-
-def fmt_int(n):
-    return "{:,}".format(n)
+def scaled(value, units, base):
+    for unit in units[:-1]:
+        if abs(value) < base:
+            return "%.2f%s" % (value, unit)
+        value /= base
+    return "%.2f%s" % (value, units[-1])
 
 
 def fmt_time(seconds):
     if seconds is None:
         return "-"
-    ms = seconds * 1000
-    if ms < 10:
-        return "%.2fms" % ms
-    if ms < 100:
-        return "%.1fms" % ms
-    if ms < 1000:
-        return "%.0fms" % ms
-    return "%.2fs" % seconds
+    return scaled(seconds * 1e6, ("us", "ms", "s"), 1000) if seconds < 1 else "%.2fs" % seconds
 
 
-def fmt_rate(bytes_per_s):
-    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
-        if bytes_per_s >= scale:
-            return "%.3g %s/s" % (bytes_per_s / scale, unit)
-    return "%.0f B/s" % bytes_per_s
+def fmt_metric(n):
+    return scaled(n, ("", "k", "M", "G"), 1000)
 
 
-def percentiles(summary, names):
-    if summary is None:
-        return "-"
-    return "  ".join("%s %s" % (name, fmt_time(summary[name])) for name in names)
+def fmt_bytes(n):
+    return scaled(n, ("B", "KB", "MB", "GB", "TB"), 1024)
 
 
-def step_label(step):
-    if step["rate"] is not None:
-        return "%s req/s" % fmt_int(step["rate"])
-    return "%s connections" % fmt_int(step["connections"])
+def stats_row(label, values):
+    return "    %-10s" % label + "".join("%10s" % v for v in values[:-1]) + "%12s" % values[-1]
 
 
-def table(steps, best):
-    rate_mode = steps[0]["rate"] is not None
-    head = ["rate", "achieved"] if rate_mode else ["connections", "req/s"]
-    head += ["±/s", "p50", "p99", "p99.9", "max", "errors"]
-    rows = [head]
-    for step in steps:
-        latency = step["latency"] or {}
-        rps = "-" if step["over_capacity"] else fmt_int(round(step["rps"]))
-        first = [fmt_int(step["rate"]), rps] if rate_mode else [fmt_int(step["connections"]), rps]
-        rows.append(
-            first
-            + ["-" if step["over_capacity"] else "%.0f%%" % (100 * step["rps_variation"])]
-            + [fmt_time(latency.get(name)) for name in ("p50", "p99", "p99.9", "max")]
-            + [fmt_int(step["errors"])]
-        )
-    widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
-    lines = []
-    for n, row in enumerate(rows):
-        line = "  " + "  ".join(cell.rjust(width) for cell, width in zip(row, widths))
-        if n - 1 == best:
-            line += "  ← best"
-        elif n and steps[n - 1]["over_capacity"]:
-            line += "  over capacity"
-        lines.append(line)
-    return lines
-
-
-def details(step):
-    lines = []
+def single(step):
     latency = step["latency"]
-    lines.append("  latency      " + percentiles(latency, ("p50", "p90", "p99", "p99.9", "max")))
-    lines.append("    first byte " + percentiles(step["first_byte"], ("p50", "p99")))
-    lines.append("    download   " + percentiles(step["download"], ("p50", "p99")))
-    if step["connect"]:
-        lines.append("    connect    " + percentiles(step["connect"], ("p50", "p99")))
-    if step["tls"]:
-        lines.append("    TLS        " + percentiles(step["tls"], ("p50", "p99")))
-    errors = "%s errors" % fmt_int(step["errors"])
-    if step["error_kinds"]:
-        errors += " (%s)" % kinds(step)
-    lines.append("  requests     %s in %gs, %s" % (fmt_int(step["requests"]), step["duration"], errors))
+    lines = [
+        "  Thread Stats" + "".join("%10s" % h for h in ("Avg", "Stdev", "p90", "p99", "Max")) + "%12s" % "+/- Stdev"
+    ]
+    if latency:
+        lines.append(
+            stats_row(
+                "Latency",
+                [fmt_time(latency[k]) for k in ("mean", "stdev", "p90", "p99", "max")]
+                + ["%.2f%%" % (100 * latency["within_stdev"])],
+            )
+        )
+    t = step["thread_rps"]
     lines.append(
-        "  transfer     received %s, sent %s" % (fmt_rate(step["received_per_s"]), fmt_rate(step["sent_per_s"]))
-    )
-    versions = ", ".join(sorted(step["http_versions"])) or "-"
-    lines.append(
-        "  connections  %s opened, %s open at the end, %s, %s TLS handshakes"
-        % (
-            fmt_int(step["connections_opened"]),
-            fmt_int(step["connections_open"]),
-            versions,
-            fmt_int(step["tls_handshakes"]),
+        stats_row(
+            "Req/Sec",
+            [
+                fmt_metric(t["mean"]),
+                fmt_metric(t["stdev"]),
+                "",
+                "",
+                fmt_metric(t["max"]),
+                "%.2f%%" % (100 * t["within_stdev"]),
+            ],
         )
     )
-    per_request = step["cpu_per_request"]
     lines.append(
-        "  client       %.1f of %d cores, %s CPU per request"
-        % (step["cpu_cores"], step["cores_allowed"], "-" if per_request is None else "%.0fµs" % (per_request * 1e6))
+        "  %d requests in %.2fs, %s read"
+        % (step["requests"], step["duration"], fmt_bytes(step["received_per_s"] * step["duration"]))
     )
-    lag = "               client lag p99 %s, connection wait p99 %s" % (
-        fmt_time(step["client_lag"] and step["client_lag"]["p99"]),
-        fmt_time(step["queue_time"] and step["queue_time"]["p99"]),
-    )
-    if step["send_lag"]:
-        lag += ", send lag p99 %s" % fmt_time(step["send_lag"]["p99"])
-    lines.append(lag)
+    if step["errors"]:
+        lines.append("  Errors: %d (%s)" % (step["errors"], error_kinds(step)))
+    lines.append("Requests/sec: %10.2f" % step["rps"])
+    lines.append("Transfer/sec: %10s" % fmt_bytes(step["received_per_s"]))
     return lines
 
 
-def header(args):
-    v = _httpperf.libcurl_version_num
-    lines = [
-        "httpperf %s (libcurl %d.%d.%d), %d threads, %s"
-        % (httpperf.__version__, v >> 16, (v >> 8) & 255, v & 255, args.threads, args.url)
-    ]
-    timing = "%gs per step after %gs warm-up" % (args.duration, args.warmup)
-    if args.rate:
-        lines.append("fixed rate, up to %s connections, %s" % (fmt_int(args.connections[0]), timing))
+def error_kinds(step):
+    return ", ".join("%s %d" % (e["error"], e["count"]) for e in step["error_kinds"][:3])
+
+
+ROW = "  %12s%14s%10s%10s%10s%10s%8s"
+
+
+def row_header(rate_mode):
+    return ROW % ("Rate" if rate_mode else "Connections", "Requests/sec", "Avg", "p90", "p99", "Max", "Errors")
+
+
+def row(step):
+    latency = step["latency"] or {}
+    first = step["rate"] if step["rate"] is not None else step["connections"]
+    rps = "-" if step["over_capacity"] else "%.2f" % step["rps"]
+    return ROW % (
+        (first, rps) + tuple(fmt_time(latency.get(k)) for k in ("mean", "p90", "p99", "max")) + (step["errors"],)
+    )
+
+
+def header(args, count):
+    if count == 1:
+        lines = ["Running %gs test @ %s" % (args.duration, args.url)]
     else:
-        lines.append("flat out, %s" % timing)
+        lines = ["Running %d steps of %gs @ %s" % (count, args.duration, args.url)]
+    if args.rate:
+        rate = " at %d requests/sec" % args.rate[0] if count == 1 else ""
+        lines.append("  %d threads and up to %d connections%s" % (args.threads, args.connections[0], rate))
+    elif count == 1:
+        lines.append("  %d threads and %d connections" % (args.threads, args.connections[0]))
+    else:
+        lines.append("  %d threads" % args.threads)
+    if count > 1:
+        lines.append(row_header(bool(args.rate)))
     return lines
 
 
-def report(args, steps, out):
+def ending(steps):
     best = best_step(steps)
-    lines = header(args) + [""]
-    if len(steps) > 1:
-        lines += table(steps, best) + [""]
-        if best is not None and steps[best]["rate"] is not None:
-            lines.append("best: %s, the highest rate that kept up" % step_label(steps[best]))
-        elif best is not None:
-            lines.append("best: %s, %s req/s" % (step_label(steps[best]), fmt_int(round(steps[best]["rps"]))))
-    shown = best if best is not None else len(steps) - 1
-    if len(steps) == 1 or best is not None:
-        lines += details(steps[shown])
+    lines = []
+    if len(steps) > 1 and best is not None:
+        step = steps[best]
+        lines.append("")
+        if step["rate"] is not None:
+            lines.append("Best: %s, the highest rate that kept up" % step_labels([step]))
+        else:
+            lines.append("Best: %s, %.2f requests/sec" % (step_labels([step]), step["rps"]))
     found = notes(steps, best)
     if found:
         lines.append("")
-        lines += ["warning: " + note for note in found]
-    out.write("\n".join(lines) + "\n")
+        lines += ["Warning: " + note for note in found]
+    return lines
+
+
+def show(lines):
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
 
 
 def duration(text):
@@ -685,6 +662,12 @@ def parser():
     p.add_argument("--timeout", type=duration, metavar="T", default=2.0, help="request timeout (default 2s)")
     p.add_argument("-s", "--script", metavar="FILE", help="Python file defining async def request(session, url)")
     p.add_argument("--json", action="store_true", help="print the results as JSON")
+    v = _httpperf.libcurl_version_num
+    p.add_argument(
+        "--version",
+        action="version",
+        version="httpperf %s (libcurl %d.%d.%d)" % (httpperf.__version__, v >> 16, (v >> 8) & 255, v & 255),
+    )
     return p
 
 
@@ -769,9 +752,14 @@ def main(argv=None):
             print("httpperf: the first request failed: %s" % error[1], file=sys.stderr)
             return 2
         cores_allowed = cores()
-        for connections, rate in plans(args):
+        planned = list(plans(args))
+        if not args.json:
+            show(header(args, len(planned)))
+        for connections, rate in planned:
             plan = Plan(connections, rate, args.threads, args.duration, args.warmup)
             steps.append(run_step(workers, plan, cores_allowed))
+            if not args.json:
+                show(single(steps[-1]) if len(planned) == 1 else [row(steps[-1])])
             if steps[-1]["over_capacity"]:
                 break
     except KeyboardInterrupt:
@@ -784,7 +772,7 @@ def main(argv=None):
             json.dump({"steps": steps, "best": best_step(steps)}, sys.stdout, indent=2)
             sys.stdout.write("\n")
         else:
-            report(args, steps, sys.stdout)
+            show(ending(steps))
     if interrupted:
         return 130
     return 1 if any(step["errors"] or step["over_capacity"] for step in steps) else 0
