@@ -60,6 +60,22 @@ asyncio.run(main())
 
 Sessions are cheap: create one per virtual user or journey. They share a default `Engine` (the curl thread, the shared connection pool and the TLS cache) unless you pass your own.
 
+## Command line
+
+`python -m httpperf` is a load generator in the spirit of wrk and wrk2. Find the most a server can handle by trying more requests in flight:
+
+```
+python -m httpperf -c 10,50,200,1000 http://localhost:8080/
+```
+
+Then measure latency at fixed rates below that peak:
+
+```
+python -m httpperf --rate 20000,40000,60000 http://localhost:8080/
+```
+
+Each step reports requests per second, latency percentiles, errors and transfer rates, and warns when the client rather than the server was the limit. A short Python script can define the request to make. See [docs/cli.md](docs/cli.md) for all the options.
+
 ## API
 
 ### `Session(*, engine=None, ...)`
