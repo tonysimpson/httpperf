@@ -112,19 +112,17 @@ async def request(session, url):
 import random
 import sys
 
-import httpperf
-
 ids = open(sys.argv[1]).read().split()
 
 
 async def request(session, url):
-    r = await session.get(url + "/items/" + random.choice(ids), body_to=httpperf.DISCARD)
+    r = await session.get(url + "/items/" + random.choice(ids), discard_body=True)
     if r.headers.get("x-cache") != "hit":
         raise ValueError("cache miss")
     return r
 ```
 
-Without a script, the request is the method, headers and body from the command line, with the response body discarded (`body_to=httpperf.DISCARD`).
+Without a script, the request is the method, headers and body from the command line, with the response body discarded (`discard_body=True`).
 
 Python work in the script adds to httpperf's work per request. A slow script limits the result, and the report will say so (see [Warnings](#warnings)).
 

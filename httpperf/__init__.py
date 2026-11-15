@@ -378,22 +378,6 @@ class Headers(collections.abc.Mapping):
 _UNSET = object()
 
 
-class _Discard:
-    def __repr__(self):
-        return "httpperf.DISCARD"
-
-
-DISCARD = _Discard()
-
-
-def _body_to_options(body_to):
-    if body_to is None:
-        return {}
-    if body_to is DISCARD:
-        return {"discard_body": True}
-    return {"body_to": body_to}
-
-
 class Response:
     __slots__ = (
         "_req",
@@ -560,7 +544,7 @@ class Response:
 
     def _kept_body(self):
         if self.body is None:
-            raise ValueError("the body was sent to body_to, not kept")
+            raise ValueError("the body was discarded")
         return self.body
 
     @property
@@ -724,14 +708,13 @@ class Session:
         verify=None,
         timeout=None,
         connect_timeout=None,
-        body_to=None,
+        discard_body=False,
     ):
         options = self._options
-        body_options = _body_to_options(body_to)
-        if cert is not None or verify is not None or timeout is not None or connect_timeout is not None or body_options:
-            options = dict(options, **body_options)
-            if body_options:
-                options["follow_redirects"] = allow_redirects
+        if cert is not None or verify is not None or timeout is not None or connect_timeout is not None or discard_body:
+            options = dict(options)
+            if discard_body:
+                options["discard_body"] = True
             if cert is not None:
                 options["cert"] = cert
             if verify is not None:

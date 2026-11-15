@@ -715,7 +715,7 @@ def default_request(args):
         body = body.encode()
 
     async def request(session, url):
-        return await session.request(method, url, headers_list=headers, data=body, body_to=httpperf.DISCARD)
+        return await session.request(method, url, headers_list=headers, data=body, discard_body=True)
 
     return request
 

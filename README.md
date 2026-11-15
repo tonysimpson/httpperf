@@ -162,30 +162,20 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
-| `body_to` | Where the response body goes instead of memory: a file path, or `httpperf.DISCARD` to drop it. See [Large responses](#large-responses). |
+| `discard_body` | `True` drops the response body as it arrives, for when only the status, headers or timings matter. See [Discarding the body](#discarding-the-body). |
 
 Failed transfers raise `httpperf.RequestError` with curl's detailed error message, such as `Failed to connect to 127.0.0.1 port 8080 after 0 ms: Couldn't connect to server`. Its `code` is curl's error code. Timeouts raise `httpperf.Timeout`, a subclass, so they can be counted separately.
 
-### Large responses
+### Discarding the body
 
-By default the whole response body is kept in memory. To write a large body to disk instead, pass a path as `body_to`:
-
-```python
-r = await session.get(url, body_to="big.iso")
-r.raise_for_status()
-```
-
-The path is a `str`, `bytes` or `pathlib.Path`. The file is created, or emptied if it exists, when the request is sent, so a bad path raises `OSError` straight away, and the file exists afterwards even if the body was empty. For a temporary file, use a path in a `tempfile.TemporaryDirectory()`, or the `name` of a `tempfile.NamedTemporaryFile()`, which then reads back the body:
+By default the whole response body is kept in memory. `discard_body=True` drops it on the curl thread as it arrives, which saves memory and CPU when only the status, headers or timings matter:
 
 ```python
-with tempfile.NamedTemporaryFile() as f:
-    await session.get(url, body_to=f.name)
-    process(f)
+r = await session.get(url, discard_body=True)
+r.status_code, r.download_size, r.total_time
 ```
 
-`body_to=httpperf.DISCARD` drops the body as it arrives, for when only the status, headers or timings matter.
-
-Either way `r.body` is `None`, and `r.text` and `r.json()` raise `ValueError`. `r.download_size` gives the body's size. When a redirect is followed, each redirect response keeps its own small body in `history` and only the final body goes to `body_to`. The writes happen on the engine's curl thread, so a slow disk holds up the engine's other requests. A failed write raises `RequestError`, and the file keeps what had arrived.
+`r.body` is then `None`, and `r.text` and `r.json()` raise `ValueError`. `r.download_size` gives the body's size. When a redirect is followed, every response's body is dropped, including those in `history`.
 
 ### Response
 
@@ -201,7 +191,7 @@ Either way `r.body` is `None`, and `r.text` and `r.json()` raise `ValueError`. `
 | `history` | Earlier responses in a redirect chain. |
 | `http_version` | `"HTTP/1.0"`, `"HTTP/1.1"`, `"HTTP/2"` or `"HTTP/3"`. |
 | `headers` | Case-insensitive mapping of the response headers. Repeated headers are joined with `, `, as in requests. `headers_tuple` keeps repeats and order. Both skip interim responses such as `100 Continue`. `header` is the raw text of every header block, decoded as latin-1. |
-| `body` | Bytes, or `None` if the request used `body_to`. |
+| `body` | Bytes, or `None` if the request used `discard_body`. |
 | `text` | Body decoded with `encoding`. |
 | `encoding` | From the `Content-Type` charset, else latin-1 (`utf-8` for JSON). Can be set. |
 | `json()` | Body parsed with the session's `json_loads`, once. By default the standard library, always as UTF-8, as RFC 8259 requires. |
