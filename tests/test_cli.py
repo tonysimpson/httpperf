@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from httpperf.__main__ import Histogram, best_step, duration, main, notes
+from httpperf._cli import Histogram, best_step, duration, main, notes
 
 QUICK = ["-t", "1", "-w", "100ms", "-d", "300ms"]
 
@@ -82,8 +82,8 @@ def test_a_script_without_a_request_coroutine_is_refused(capsys, server, tmp_pat
     assert main(["-s", script(tmp_path, "x = 1\n"), server.url]) == 2
 
 
-def test_an_unreachable_server_exits_with_two(capsys):
-    assert main([*QUICK, "http://127.0.0.1:1/"]) == 2
+def test_an_unreachable_server_is_an_error(capsys):
+    assert main([*QUICK, "http://127.0.0.1:1/"]) == 1
 
 
 def test_requests_that_pile_up_are_over_capacity(capsys, server, tmp_path):
@@ -106,6 +106,9 @@ def test_the_report_names_the_best_step(capsys, server):
     assert "Best: " in capsys.readouterr().out
 
 
+LAGGING = {"client_lag": {"p50": 0.009, "p99": 0.009}}
+
+
 def step(connections=10, rate=None, rps=1000.0, **overrides):
     result = {
         "connections": connections,
@@ -119,14 +122,9 @@ def step(connections=10, rate=None, rps=1000.0, **overrides):
         "latency": {"p50": 0.01, "p99": 0.01},
         "client_lag": {"p50": 0.0, "p99": 0.0},
         "send_lag": None,
-        "cpu_cores": 1.0,
-        "cores_allowed": 4,
-        "busiest_thread": 0.5,
         "connections_closed_measuring": 0,
         "connections_used": connections,
         "http_versions": {"HTTP/1.1": 1},
-        "threads": 2,
-        "gil": True,
     }
     result.update(overrides)
     return result
@@ -145,7 +143,7 @@ def test_the_best_rate_is_the_highest_that_kept_up():
 
 
 def test_a_warning_on_several_steps_is_one_line():
-    steps = [step(10, busiest_thread=1.0), step(50, busiest_thread=1.0)]
+    steps = [step(10, **LAGGING), step(50, **LAGGING)]
     assert notes(steps, 1) == [
         "httpperf was the limit at 10 and 50 connections, not the server, "
         "so the server can do at least 1000 requests/sec."
@@ -163,11 +161,6 @@ def test_time_waiting_on_python_means_httpperf_was_the_limit():
     assert notes([lagging], None)[0].startswith("httpperf was the limit")
 
 
-def test_more_than_two_threads_with_the_gil_is_called_out():
-    found = notes([step(busiest_thread=1.0, threads=4)], None)
-    assert "More than 2 threads don't help on Python with the GIL, so try -t 2." in found
-
-
 def test_idle_connections_are_called_out_when_httpperf_was_the_limit():
-    found = notes([step(10000, busiest_thread=1.0, connections_used=461)], None)
+    found = notes([step(10000, connections_used=461, **LAGGING)], None)
     assert "Only 461 of 10000 connections were in use, because httpperf was the limit." in found

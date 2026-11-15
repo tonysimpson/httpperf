@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 [project.scripts]
-httpperf = "httpperf.__main__:main"
+httpperf = "httpperf._cli:main"
 
 [project.urls]
 Source = "https://github.com/tonysimpson/httpperf"
