@@ -127,18 +127,18 @@ class Record:
 
 
 class Plan:
-    def __init__(self, connections, rate, threads, duration, warmup):
+    def __init__(self, connections, rate, workers, duration, warmup):
         self.connections = connections
         self.rate = rate
-        self.threads = threads
+        self.workers = workers
         self.duration = duration
         self.t_start = time.monotonic()
         self.t_meas = self.t_start + warmup
         self.t_end = self.t_meas + duration
 
 
-def share(total, threads, index):
-    return total // threads + (1 if index < total % threads else 0)
+def share(total, workers, index):
+    return total // workers + (1 if index < total % workers else 0)
 
 
 async def sleep_until(t):
@@ -186,7 +186,7 @@ class Worker:
         self.rec = None
         self.loop = uvloop.new_event_loop() if uvloop else asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        cap = share(args.connections[0], args.threads, index) if args.rate else 0
+        cap = share(args.connections[0], args.workers, index) if args.rate else 0
         self.engine = httpperf.Engine(max_total_connections=cap)
         self.session = httpperf.Session(engine=self.engine, http_version=HTTP_VERSIONS[args.http], timeout=args.timeout)
         self.session.set_response_callback(self.on_response)
@@ -258,7 +258,7 @@ class Worker:
                 await self.scheduled(plan, rec)
             else:
                 await asyncio.gather(
-                    *(self.lane(plan, rec) for _ in range(share(plan.connections, plan.threads, self.index)))
+                    *(self.lane(plan, rec) for _ in range(share(plan.connections, plan.workers, self.index)))
                 )
             await window
         finally:
@@ -296,9 +296,9 @@ class Worker:
 
     async def schedule(self, plan, rec, pending):
         loop = asyncio.get_running_loop()
-        interval = plan.threads / plan.rate
+        interval = plan.workers / plan.rate
         first = plan.t_start + self.index / plan.rate
-        limit = max(1.0, plan.rate / plan.threads)
+        limit = max(1.0, plan.rate / plan.workers)
         i = 0
         while True:
             now = time.monotonic()
@@ -515,7 +515,7 @@ def stats_row(label, values):
 def single(step):
     latency = step["latency"]
     lines = [
-        "  Thread Stats" + "".join("%10s" % h for h in ("Avg", "Stdev", "p90", "p99", "Max")) + "%12s" % "+/- Stdev"
+        "  Worker Stats" + "".join("%10s" % h for h in ("Avg", "Stdev", "p90", "p99", "Max")) + "%12s" % "+/- Stdev"
     ]
     if latency:
         lines.append(
@@ -577,11 +577,11 @@ def header(args, count):
         lines = ["Running %d steps of %gs @ %s" % (count, args.duration, args.url)]
     if args.rate:
         rate = " at %d requests/sec" % args.rate[0] if count == 1 else ""
-        lines.append("  %d threads and up to %d connections%s" % (args.threads, args.connections[0], rate))
+        lines.append("  %d workers and up to %d connections%s" % (args.workers, args.connections[0], rate))
     elif count == 1:
-        lines.append("  %d threads and %d connections" % (args.threads, args.connections[0]))
+        lines.append("  %d workers and %d connections" % (args.workers, args.connections[0]))
     else:
-        lines.append("  %d threads" % args.threads)
+        lines.append("  %d workers" % args.workers)
     if count > 1:
         lines.append(row_header(bool(args.rate)))
     return lines
@@ -652,7 +652,14 @@ def parser():
     p.add_argument(
         "-r", "--rate", type=counts, metavar="N[,N...]", help="requests per second in total, sent on a fixed schedule"
     )
-    p.add_argument("-t", "--threads", type=int, metavar="N", default=2, help="client threads (default 2)")
+    p.add_argument(
+        "-t",
+        "--workers",
+        type=int,
+        metavar="N",
+        default=2,
+        help="worker processes, or threads on free-threaded Python (default 2)",
+    )
     p.add_argument(
         "-d", "--duration", type=duration, metavar="T", default=10.0, help="measured time per step (default 10s)"
     )
@@ -681,8 +688,8 @@ def parse(argv):
         at = argv.index("--")
         argv, extra = argv[:at], argv[at + 1 :]
     args = parser().parse_args(argv)
-    if args.threads < 1:
-        raise Usage("--threads must be at least 1")
+    if args.workers < 1:
+        raise Usage("--workers must be at least 1")
     if args.connections is None:
         args.connections = [100] if args.rate else [10]
     if args.rate and len(args.connections) > 1:
@@ -736,7 +743,7 @@ def on_every_worker(pool, n, fn, *args):
 
 
 def make_pool(args, request):
-    n = args.threads
+    n = args.workers
     if free_threaded():
         stop = threading.Event()
         initargs = (args, request, threading.Barrier(n, timeout=60), stop, False)
@@ -767,10 +774,10 @@ def main(argv=None):
     steps = []
     interrupted = False
     try:
-        on_every_worker(pool, args.threads, ready)
+        on_every_worker(pool, args.workers, ready)
         for connections, rate in planned:
-            plan = Plan(connections, rate, args.threads, args.duration, args.warmup)
-            steps.append(summarise(plan, on_every_worker(pool, args.threads, run_step, plan)))
+            plan = Plan(connections, rate, args.workers, args.duration, args.warmup)
+            steps.append(summarise(plan, on_every_worker(pool, args.workers, run_step, plan)))
             if not args.json:
                 show(single(steps[-1]) if len(planned) == 1 else [row(steps[-1])])
             if steps[-1]["over_capacity"]:
@@ -780,7 +787,7 @@ def main(argv=None):
         stop.set()
     finally:
         try:
-            on_every_worker(pool, args.threads, close)
+            on_every_worker(pool, args.workers, close)
         finally:
             pool.shutdown(wait=True)
     if steps:

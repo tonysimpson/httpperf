@@ -35,7 +35,7 @@ python -m httpperf --rate 20000,40000,60000 http://localhost:8080/
 |---|---|---|
 | `-c`, `--connections N[,N...]` | 10 (flat out), 100 (fixed rate) | Flat out: requests in flight, and a list runs each in turn. Fixed rate: the most connections to open, one number. |
 | `-r`, `--rate N[,N...]` | | Requests per second, in total. Switches to fixed rate. A list runs each in turn. |
-| `-t`, `--threads N` | 2 | Workers, each with its own event loop and `Engine`. Connections and rate are split between them. On Python with the GIL each worker is a process; on free-threaded Python it is a thread. |
+| `-t`, `--workers N` | 2 | Workers, each with its own event loop and `Engine`. Connections and rate are split between them. On Python with the GIL each worker is a process; on free-threaded Python it is a thread. |
 | `-d`, `--duration T` | 10s | How long each step is measured for: `500ms`, `10s`, `2m`. |
 | `-w`, `--warmup T` | 1s | How long each step runs before measuring starts. |
 | `-H`, `--header "Name: value"` | | Add a header. Repeatable. |
@@ -136,8 +136,8 @@ A single step, against lwan serving a 13-byte response, with the client on 4 cor
 
 ```
 Running 10s test @ http://127.0.0.1:8080/hello
-  2 threads and 10 connections
-  Thread Stats       Avg     Stdev       p90       p99       Max   +/- Stdev
+  2 workers and 10 connections
+  Worker Stats       Avg     Stdev       p90       p99       Max   +/- Stdev
     Latency      48.41us   35.90us   48.50us   52.50us    6.40ms      99.88%
     Req/Sec      102.71k     2.01k                       105.48k      80.50%
   2054228 requests in 10.00s, 358.51MB read
@@ -159,7 +159,7 @@ Several steps print one row each as they finish:
 
 ```
 Running 4 steps of 10s @ http://127.0.0.1:8080/hello
-  2 threads
+  2 workers
    Connections  Requests/sec       Avg       p90       p99       Max  Errors
             10     204669.10   48.58us   48.50us   53.50us    4.12ms       0
             50     204802.40  243.86us  246.50us  279.00us    4.25ms       0
