@@ -24,7 +24,7 @@ Bytes are read off the wire as they arrive, whatever Python is doing. If Python 
 pip install httpperf
 ```
 
-Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 and HTTP/3.
+Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15 and free-threaded 3.14 (`python3.14t`), with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 and HTTP/3.
 
 Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs its development headers and a C compiler. That libcurl decides whether HTTP/3 is available: `curl -V` lists `HTTP3` under Features when it does.
 
@@ -101,6 +101,8 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 Each asyncio loop has its own default engine, so sessions without an engine work in any thread, and in each `asyncio.run()`, without setup. A loop's default engine lasts as long as the loop, and is closed once the loop has been closed and no session uses it.
 
 An engine binds to the asyncio loop running when it is first used, and so does a session. An engine serves one loop at a time, and using it from a second live loop raises `RuntimeError`. Once its loop is closed, as at the end of `asyncio.run()`, it binds to the next one and keeps its pool. So a session kept between `asyncio.run()` calls keeps its connections. To run loops in several threads at once with your own engines, give each thread its own `Engine`.
+
+On free-threaded Python (3.14t), httpperf runs without the GIL, so threads that each run their own loop and engine run their Python code in parallel. That is what helps when Python work on each response is the limit, as it usually is in a real load test. On 4 cores, with 20 µs of Python work per response, 4 threads went from 42k requests per second with the GIL to 111k without it; with 100 µs of work, from 9.6k to 34k. With little Python work per response the GIL costs little, since the curl threads never hold it.
 
 `engine.close()` stops the curl thread and closes the shared pool's connections, and later requests raise `RuntimeError`. Requests still in flight fail with `RequestError`, and a `ResourceWarning` says how many there were. `with` and `async with` call `close()` on exit. An engine that is no longer referenced is closed automatically. See [docs/connections.md](docs/connections.md) for how these fit together.
 

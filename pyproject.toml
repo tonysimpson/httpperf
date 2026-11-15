@@ -37,7 +37,6 @@ version = { attr = "httpperf.version.__version__" }
 
 [dependency-groups]
 dev = [
-    "aioquic",
     "clang-format==19.1.7",
     "hypercorn",
     "pytest",
@@ -45,15 +44,16 @@ dev = [
     "pytest-timeout",
     "ruff",
 ]
+http3 = ["aioquic"]
 
 [tool.cibuildwheel]
 build = "cp3*"
-skip = "cp3??t-*"
+skip = "cp313t-*"
 before-all = "sh {project}/tools/build-libcurl.sh"
 test-requires = ["pytest", "pytest-timeout", "pytest-httpbin"]
 test-command = [
     "python {project}/tools/wheel_smoke.py",
-    "pytest -p no:cacheprovider {project}/tests/test_httpbin.py {project}/tests/test_engine.py {project}/tests/test_response.py {project}/tests/test_cookie.py",
+    "pytest -p no:cacheprovider {project}/tests/test_httpbin.py {project}/tests/test_engine.py {project}/tests/test_response.py {project}/tests/test_cookie.py {project}/tests/test_threads.py",
 ]
 
 [tool.cibuildwheel.linux]

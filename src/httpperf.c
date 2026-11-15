@@ -51,6 +51,28 @@ static inline double monotonic_time(void) {
 
 /* Used to tell gcc about expected code branches, likely not necessary */
 
+#ifndef Py_BEGIN_CRITICAL_SECTION
+#define Py_BEGIN_CRITICAL_SECTION(op) {
+#define Py_END_CRITICAL_SECTION() }
+#endif
+
+#ifdef Py_GIL_DISABLED
+#define LIVE_LOCK(loop) PyMutex_Lock(&(loop)->live_lock)
+#define LIVE_UNLOCK(loop) PyMutex_Unlock(&(loop)->live_lock)
+#else
+#define LIVE_LOCK(loop)
+#define LIVE_UNLOCK(loop)
+#endif
+
+#define LOCKED(name, type)                              \
+    static PyObject *name(type *self, PyObject *args) { \
+        PyObject *result;                               \
+        Py_BEGIN_CRITICAL_SECTION(self);                \
+        result = name##_unlocked(self, args);           \
+        Py_END_CRITICAL_SECTION();                      \
+        return result;                                  \
+    }
+
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 
@@ -95,6 +117,9 @@ typedef struct {
     struct AcRequestData *unsent_head;
     struct AcRequestData *unsent_tail;
     struct AcRequestData *live_head;
+#ifdef Py_GIL_DISABLED
+    PyMutex live_lock;
+#endif
     bool running;
     bool closing;
     struct Share *limiter;
@@ -441,18 +466,22 @@ static void Response_dealloc(Response *self) {
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
-static PyObject *Response_get_header(Response *self, PyObject *args) {
+static PyObject *Response_get_header_unlocked(Response *self, PyObject *args) {
     DEBUG_PRINT("");
     return buffer_to_bytes(&self->header, &self->header_bytes);
 }
 
-static PyObject *Response_get_body(Response *self, PyObject *args) {
+LOCKED(Response_get_header, Response)
+
+static PyObject *Response_get_body_unlocked(Response *self, PyObject *args) {
     DEBUG_PRINT("");
     if (self->body_diverted) {
         Py_RETURN_NONE;
     }
     return buffer_to_bytes(&self->body, &self->body_bytes);
 }
+
+LOCKED(Response_get_body, Response)
 
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
     long value;
@@ -1492,9 +1521,13 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
     if (futures == NULL) {
         return NULL;
     }
-    while (self->live_head != NULL) {
-        AcRequestData *rd = self->live_head;
-        self->live_head = rd->live_next;
+    LIVE_LOCK(self);
+    AcRequestData *live = self->live_head;
+    self->live_head = NULL;
+    LIVE_UNLOCK(self);
+    while (live != NULL) {
+        AcRequestData *rd = live;
+        live = rd->live_next;
         PyList_Append(futures, rd->future);
         Py_DECREF(rd->future);
         if (rd->waiting) {
@@ -1560,6 +1593,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
     int status;
     while ((status = pipe_read(((EventLoop *)self)->req_out_read, &rd, sizeof(rd))) == 1) {
         REQUEST_TRACE_PRINT("Eventloop_get_completed", rd);
+        LIVE_LOCK((EventLoop *)self);
         if (rd->live_prev != NULL) {
             rd->live_prev->live_next = rd->live_next;
         } else {
@@ -1568,6 +1602,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         if (rd->live_next != NULL) {
             rd->live_next->live_prev = rd->live_prev;
         }
+        LIVE_UNLOCK((EventLoop *)self);
         DEBUG_PRINT("read AcRequestData; address=%p", rd);
         if (rd->body_fd >= 0) {
             close(rd->body_fd);
@@ -1821,7 +1856,7 @@ static int parse_timeout(PyObject *value, const char *name, long *ms) {
     return 0;
 }
 
-static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
+static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObject *kwds) {
     char *method;
     char *url;
     PyObject *future;
@@ -2026,11 +2061,13 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         share_decref(rd->share);
         goto error_cleanup;
     }
+    LIVE_LOCK(self->loop);
     rd->live_next = self->loop->live_head;
     if (rd->live_next != NULL) {
         rd->live_next->live_prev = rd;
     }
     self->loop->live_head = rd;
+    LIVE_UNLOCK(self->loop);
     DEBUG_PRINT("scheduling request");
     return PyLong_FromVoidPtr(rd);
 
@@ -2059,7 +2096,15 @@ error_cleanup:
     return NULL;
 }
 
-static PyObject *Session_stats(Session *self, PyObject *args) {
+static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
+    PyObject *result;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    result = Session_request_unlocked(self, args, kwds);
+    Py_END_CRITICAL_SECTION();
+    return result;
+}
+
+static PyObject *Session_stats_unlocked(Session *self, PyObject *args) {
     if (!self->own_pool) {
         Py_INCREF(Py_None);
         return stats_dict(&self->stats, Py_None);
@@ -2068,10 +2113,14 @@ static PyObject *Session_stats(Session *self, PyObject *args) {
     return stats_dict(&self->stats, PyLong_FromLong(open));
 }
 
-static PyObject *Session_limiter_state(Session *self, PyObject *args) {
+LOCKED(Session_stats, Session)
+
+static PyObject *Session_limiter_state_unlocked(Session *self, PyObject *args) {
     bool limited = self->shared != NULL && (self->shared->max_host_connections || self->shared->max_connections);
     return limiter_state(limited ? self->shared : NULL);
 }
+
+LOCKED(Session_limiter_state, Session)
 
 static PyObject *Session_cancel(Session *self, PyObject *handle) {
     AcRequestData *rd = PyLong_AsVoidPtr(handle);
@@ -2091,7 +2140,7 @@ static PyObject *Session_cancel(Session *self, PyObject *handle) {
     Py_RETURN_NONE;
 }
 
-static PyObject *Session_close(Session *self, PyObject *args) {
+static PyObject *Session_close_unlocked(Session *self, PyObject *args) {
     if (self->shared != NULL) {
         queue_cleanup(self->loop, NULL, self->shared);
         self->shared = NULL;
@@ -2099,7 +2148,9 @@ static PyObject *Session_close(Session *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-static PyObject *Session_attach(Session *self, PyObject *args) {
+LOCKED(Session_close, Session)
+
+static PyObject *Session_attach_unlocked(Session *self, PyObject *args) {
     EventLoop *loop;
     if (!PyArg_ParseTuple(args, "O!", &EventLoopType, &loop)) {
         return NULL;
@@ -2115,9 +2166,13 @@ static PyObject *Session_attach(Session *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-static PyObject *Session_get_cookielist(Session *self, PyObject *args) { return session_cookielist(self); }
+LOCKED(Session_attach, Session)
 
-static PyObject *Session_apply_cookielist(Session *self, PyObject *args) {
+static PyObject *Session_get_cookielist_unlocked(Session *self, PyObject *args) { return session_cookielist(self); }
+
+LOCKED(Session_get_cookielist, Session)
+
+static PyObject *Session_apply_cookielist_unlocked(Session *self, PyObject *args) {
     PyObject *lines;
     if (!PyArg_ParseTuple(args, "O!", &PyTuple_Type, &lines)) {
         return NULL;
@@ -2147,6 +2202,8 @@ static PyObject *Session_apply_cookielist(Session *self, PyObject *args) {
     curl_easy_cleanup(curl);
     Py_RETURN_NONE;
 }
+
+LOCKED(Session_apply_cookielist, Session)
 
 static PyMethodDef Session_methods[] = {
     {"request", (PyCFunction)Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"},
@@ -2346,6 +2403,12 @@ PyMODINIT_FUNC PyInit__httpperf(void) {
         return NULL;
 
     m = PyModule_Create(&_httpperf_module);
+#ifdef Py_GIL_DISABLED
+    if (m != NULL && PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED) < 0) {
+        Py_DECREF(m);
+        return NULL;
+    }
+#endif
 
     if (m != NULL) {
         curl_global_init(CURL_GLOBAL_ALL); // init curl library

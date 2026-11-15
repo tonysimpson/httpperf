@@ -884,6 +884,7 @@ class Engine:
         self._json_dumps = json_dumps
         self._json_loads = json_loads
         self._loop = _no_loop
+        self._lock = threading.Lock()
         self._ae_loop = _httpperf.EventLoop(max_host_connections, max_total_connections, max_idle_connections)
         self._closed = False
         self._thread = threading.Thread(target=self._ae_loop.main, name="httpperf-engine", daemon=True)
@@ -893,13 +894,16 @@ class Engine:
         return self._ae_loop.stats()
 
     def _bind(self, loop):
-        if self._closed:
-            raise RuntimeError("engine is closed")
-        current = self._loop()
-        if current is not None and not current.is_closed():
-            raise RuntimeError("engine is in use by another event loop")
-        self._loop = weakref.ref(loop)
-        loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("engine is closed")
+            current = self._loop()
+            if current is loop:
+                return
+            if current is not None and not current.is_closed():
+                raise RuntimeError("engine is in use by another event loop")
+            self._loop = weakref.ref(loop)
+            loop.add_reader(self._ae_loop.get_out_fd(), self._complete)
 
     def _complete(self):
         for error, response, future in self._ae_loop.get_completed():
@@ -914,11 +918,14 @@ class Engine:
     def close(self):
         if self._closed:
             return
-        self._closed = True
-        loop = self._loop()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            loop = self._loop()
+            self._loop = _no_loop
         if loop is not None and not loop.is_closed():
             loop.remove_reader(self._ae_loop.get_out_fd())
-        self._loop = _no_loop
         if self._thread is None or not self._thread.is_alive():
             return
         self._ae_loop.stop()

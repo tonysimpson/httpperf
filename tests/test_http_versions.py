@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import os
 import socket
 import sys
@@ -68,9 +69,9 @@ def libcurl_has_http3():
     return True
 
 
-HTTP3 = sys.version_info >= (3, 9) and libcurl_has_http3()
+HTTP3 = sys.version_info >= (3, 9) and importlib.util.find_spec("aioquic") is not None and libcurl_has_http3()
 needs_http3 = pytest.mark.skipif(
-    not HTTP3, reason="needs libcurl with HTTP/3, and Python 3.9+ (hypercorn's HTTP/3 server hangs on 3.8)"
+    not HTTP3, reason="needs libcurl with HTTP/3, aioquic, and Python 3.9+ (hypercorn's HTTP/3 server hangs on 3.8)"
 )
 ALL_VERSIONS = [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2", "HTTP/1.1"]
 MULTIPLEXED = [pytest.param("HTTP/3", marks=needs_http3), "HTTP/2"]
