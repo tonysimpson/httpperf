@@ -398,26 +398,31 @@ def best_step(steps):
     candidates = [i for i, step in enumerate(steps) if kept_up(step) and few_errors(step)]
     if not candidates:
         return None
-    if steps[0]["rate"] is None:
-        return max(candidates, key=lambda i: steps[i]["rps"])
-    return max(candidates, key=lambda i: steps[i]["rate"])
+    if steps[0]["rate"] is not None:
+        return max(candidates, key=lambda i: steps[i]["rate"])
+    top = max(steps[i]["rps"] for i in candidates)
+    return min((i for i in candidates if steps[i]["rps"] >= 0.97 * top), key=lambda i: steps[i]["connections"])
+
+
+SATURATED = ", so the result describes the client, not the server"
+SUMMARIES = {
+    "client saturated": "the results describe the client, not the server",
+    "errors": "more than 1% of requests failed",
+    "unsteady": "req/s varied more than 10% from second to second",
+    "connection churn": "connections were closed while measuring",
+    "behind schedule": "the client couldn't keep to the schedule",
+}
 
 
 def client_saturated(step):
     latency = step["latency"]
     lag = step["client_lag"]
     if step["cpu_cores"] > 0.9 * step["cores_allowed"]:
-        return "client saturated: used %.1f of %d cores, so the result describes the client, not the server" % (
-            step["cpu_cores"],
-            step["cores_allowed"],
-        )
+        return "used %.1f of %d cores%s" % (step["cpu_cores"], step["cores_allowed"], SATURATED)
     if step["busiest_thread"] > 0.9:
-        return (
-            "client saturated: a client thread was %.0f%% busy, so the result describes the client, not the server"
-            % (100 * step["busiest_thread"])
-        )
+        return "a client thread was %.0f%% busy%s" % (100 * step["busiest_thread"], SATURATED)
     if latency and lag and lag["p99"] > 0.25 * latency["p99"]:
-        return "client saturated: client lag p99 %s is over a quarter of latency p99 %s" % (
+        return "client lag p99 %s is over a quarter of latency p99 %s" % (
             fmt_time(lag["p99"]),
             fmt_time(latency["p99"]),
         )
@@ -428,26 +433,57 @@ def warnings_for(step):
     found = []
     saturated = client_saturated(step)
     if saturated:
-        found.append(saturated)
+        found.append(("client saturated", saturated))
     if not few_errors(step):
         found.append(
-            "errors: %s of %s requests failed (%s)" % (fmt_int(step["errors"]), fmt_int(step["requests"]), kinds(step))
+            (
+                "errors",
+                "%s of %s requests failed (%s)" % (fmt_int(step["errors"]), fmt_int(step["requests"]), kinds(step)),
+            )
         )
     if step["rps_variation"] > 0.1:
-        found.append("unsteady: req/s varied %.0f%% from second to second" % (100 * step["rps_variation"]))
+        found.append(("unsteady", "req/s varied %.0f%% from second to second" % (100 * step["rps_variation"])))
     if step["connections_closed_measuring"]:
         found.append(
-            "connection churn: %s connections closed while measuring, so latency includes opening new ones"
-            % fmt_int(step["connections_closed_measuring"])
+            (
+                "connection churn",
+                "%s connections closed while measuring, so latency includes opening new ones"
+                % fmt_int(step["connections_closed_measuring"]),
+            )
         )
     if step["over_capacity"]:
-        found.append("over capacity: requests piled up, so the step stopped early")
+        found.append(("over capacity", "requests piled up, so the step stopped early"))
     elif step["rate"] is not None and step["rps"] < 0.99 * step["rate"]:
-        found.append("behind schedule: achieved %s of %s req/s" % (fmt_int(round(step["rps"])), fmt_int(step["rate"])))
+        found.append(
+            ("behind schedule", "achieved %s of %s req/s" % (fmt_int(round(step["rps"])), fmt_int(step["rate"])))
+        )
     elif step["send_lag"] and step["send_lag"]["p99"] > 0.002:
         found.append(
-            "behind schedule: send lag p99 %s, so the client sent requests late" % fmt_time(step["send_lag"]["p99"])
+            ("behind schedule", "send lag p99 %s, so requests went out late" % fmt_time(step["send_lag"]["p99"]))
         )
+    return found
+
+
+def step_labels(steps):
+    values = [fmt_int(step["rate"] if step["rate"] is not None else step["connections"]) for step in steps]
+    joined = values[0] if len(values) == 1 else "%s and %s" % (", ".join(values[:-1]), values[-1])
+    return joined + (" req/s" if steps[0]["rate"] is not None else " connections")
+
+
+def notes(steps, best):
+    if len(steps) == 1:
+        found = ["%s: %s" % warning for warning in warnings_for(steps[0])]
+    else:
+        by_kind = {}
+        for step in steps:
+            for kind, detail in warnings_for(step):
+                by_kind.setdefault(kind, []).append((step, detail))
+        found = []
+        for kind, hits in by_kind.items():
+            detail = hits[0][1] if len(hits) == 1 else SUMMARIES[kind]
+            found.append("%s at %s: %s" % (kind, step_labels([step for step, _ in hits]), detail))
+    if len(steps) > 1 and steps[0]["rate"] is None and best == len(steps) - 1 and not client_saturated(steps[best]):
+        found.append("peak not reached: the best step was the last, so try more connections")
     return found
 
 
@@ -586,15 +622,10 @@ def report(args, steps, out):
     shown = best if best is not None else len(steps) - 1
     if len(steps) == 1 or best is not None:
         lines += details(steps[shown])
-    notes = []
-    for step in steps:
-        for warning in warnings_for(step):
-            notes.append(("%s: %s" % (step_label(step), warning)) if len(steps) > 1 else warning)
-    if len(steps) > 1 and steps[0]["rate"] is None and best == len(steps) - 1 and not client_saturated(steps[best]):
-        notes.append("peak not reached: the best step was the last, so try more connections")
-    if notes:
+    found = notes(steps, best)
+    if found:
         lines.append("")
-        lines += ["warning: " + note for note in notes]
+        lines += ["warning: " + note for note in found]
     out.write("\n".join(lines) + "\n")
 
 

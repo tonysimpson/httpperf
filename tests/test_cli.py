@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-from httpperf.__main__ import Histogram, duration, main
+from httpperf.__main__ import Histogram, best_step, duration, main, notes
 
 QUICK = ["-t", "1", "-w", "100ms", "-d", "300ms"]
 
@@ -99,3 +99,50 @@ def test_a_connection_list_with_a_rate_is_refused(capsys, server):
 def test_the_report_names_the_best_step(capsys, server):
     main([*QUICK, "-c", "1,2", server.url])
     assert "best: " in capsys.readouterr().out
+
+
+def step(connections=10, rate=None, rps=1000.0, **overrides):
+    result = {
+        "connections": connections,
+        "rate": rate,
+        "rps": rps,
+        "requests": int(rps),
+        "errors": 0,
+        "error_kinds": [],
+        "rps_variation": 0.0,
+        "over_capacity": False,
+        "latency": {"p99": 0.01},
+        "client_lag": {"p99": 0.0},
+        "send_lag": None,
+        "cpu_cores": 1.0,
+        "cores_allowed": 4,
+        "busiest_thread": 0.5,
+        "connections_closed_measuring": 0,
+    }
+    result.update(overrides)
+    return result
+
+
+def test_the_best_step_is_the_fewest_connections_near_the_most_req_s():
+    assert best_step([step(10, rps=500), step(50, rps=990), step(200, rps=1000)]) == 1
+
+
+def test_a_step_with_many_errors_cannot_be_best():
+    assert best_step([step(10, rps=900), step(50, rps=1000, errors=100)]) == 0
+
+
+def test_the_best_rate_is_the_highest_that_kept_up():
+    assert best_step([step(rate=1000, rps=1000), step(rate=2000, rps=2000), step(rate=4000, rps=3000)]) == 1
+
+
+def test_a_warning_on_several_steps_is_one_line():
+    steps = [step(10, busiest_thread=1.0), step(50, busiest_thread=1.0)]
+    assert notes(steps, 1) == [
+        "client saturated at 10 and 50 connections: the results describe the client, not the server"
+    ]
+
+
+def test_a_best_last_step_suggests_more_connections():
+    assert notes([step(10, rps=500), step(50)], 1) == [
+        "peak not reached: the best step was the last, so try more connections"
+    ]

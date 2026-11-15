@@ -136,29 +136,26 @@ httpperf 1.0rc4 (libcurl 8.14.1), 2 threads, http://localhost:8080/hello
 flat out, 10s per step after 1s warm-up
 
   connections    req/s  ±/s     p50     p99   p99.9     max  errors
-           10  169,406   1%  0.06ms  0.07ms  0.13ms  6.75ms       0
-           50  207,192   1%  0.30ms  0.35ms  0.93ms  5.39ms       0
-          200  210,121   0%  0.97ms  1.30ms  2.90ms  5.98ms       0
-        1,000  211,613   1%  4.72ms  6.29ms  10.1ms  14.8ms       0  ← best
+           10  167,149   1%  0.06ms  0.08ms  0.40ms  8.98ms       0
+           50  205,246   1%  0.30ms  0.37ms  0.96ms  42.1ms       0  ← best
+          200  209,366   0%  0.96ms  1.35ms  2.17ms  5.05ms       0
+        1,000  210,353   0%  4.75ms  5.78ms  8.29ms  12.7ms       0
 
-best: 1,000 connections, 211,613 req/s
-  latency      p50 4.72ms  p90 4.91ms  p99 6.29ms  p99.9 10.1ms  max 14.8ms
-    first byte p50 0.02ms  p99 0.02ms
+best: 50 connections, 205,246 req/s
+  latency      p50 0.30ms  p90 0.32ms  p99 0.37ms  p99.9 0.96ms  max 42.1ms
+    first byte p50 0.02ms  p99 0.03ms
     download   p50 0.00ms  p99 0.00ms
-    connect    p50 0.14ms  p99 0.17ms
-  requests     2,116,127 in 10s, 0 errors
-  transfer     received 38.7 MB/s, sent 21.2 MB/s
-  connections  2 opened, 55 open at the end, HTTP/1.1, 0 TLS handshakes
-  client       3.0 of 4 cores, 14µs CPU per request
-               client lag p99 6.26ms, connection wait p99 0.00ms
+    connect    p50 0.09ms  p99 40.5ms
+  requests     2,052,462 in 10s, 0 errors
+  transfer     received 37.6 MB/s, sent 20.5 MB/s
+  connections  29 opened, 39 open at the end, HTTP/1.1, 0 TLS handshakes
+  client       3.0 of 4 cores, 15µs CPU per request
+               client lag p99 0.35ms, connection wait p99 0.00ms
 
-warning: 10 connections: client saturated: client lag p99 0.05ms is over a quarter of latency p99 0.07ms
-warning: 50 connections: client saturated: a client thread was 99% busy, so the result describes the client, not the server
-warning: 200 connections: client saturated: a client thread was 100% busy, so the result describes the client, not the server
-warning: 1,000 connections: client saturated: a client thread was 100% busy, so the result describes the client, not the server
+warning: client saturated at 10, 50, 200 and 1,000 connections: the results describe the client, not the server
 ```
 
-Here the client was the limit at every step, and the warnings say so: lwan can serve far more than 211k req/s.
+Here the client was the limit at every step, and the warning says so: lwan can serve far more than 210k req/s.
 
 A step with one value for `-c` or `--rate` prints only the second part.
 
@@ -173,13 +170,17 @@ A step with one value for `-c` or `--rate` prints only the second part.
 | connections | Connections opened during the step, warm-up included, open at the end, HTTP versions used, TLS handshakes. |
 | client | CPU used by the httpperf process, as cores and per request. `client_lag` p99: how long requests waited on Python, before they were sent and after they finished. `queue_time` p99: how long requests waited for a free connection. Send lag p99 (fixed rate): how late requests were sent. |
 
-For fixed rate, the step table has columns for the target rate and the achieved rate, and `best` is the highest rate that kept up.
+The best flat-out step is the one with the fewest connections that came within 3% of the highest req/s: the point where more concurrency stops buying throughput and only adds latency. Above, 1,000 connections managed 2% more than 50, at 16 times the latency.
+
+For fixed rate, the step table has columns for the target rate and the achieved rate, and the best step is the highest rate that kept up.
+
+Neither counts a step with more than 1% errors.
 
 `--json` prints `{"steps": [...], "best": index}`, with every number above for each step, unrounded, in seconds and bytes, and percentiles from p50 to p99.99.
 
 ## Warnings
 
-Printed under the report when they apply:
+Printed under the report when they apply. A warning that applies to several steps is printed once, naming the steps.
 
 - **Client saturated**: the process used more than 90% of the cores it was allowed, one of its threads (an event loop or a curl thread) was more than 90% busy, or `client_lag` p99 was more than a quarter of latency p99. The result describes the client, not the server. Add `--threads` if there are spare cores, simplify the script, or run the client on another machine.
 - **Errors**: more than 1% of requests failed. The most common kinds are listed.
