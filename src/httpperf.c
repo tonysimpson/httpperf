@@ -322,8 +322,8 @@ static PyObject *buffer_to_bytes(Buffer *b, PyObject **cache) {
 
 #define STREAM_BUFFER (1024 * 1024)
 
-enum { MSG_DONE, MSG_HEADERS, MSG_WAKE };
-enum { MSG_CANCEL = 1, MSG_RESUME = 2 };
+enum { MSG_DONE, MSG_HEADERS, MSG_WAKE, MSG_UPLOAD_WAKE };
+enum { MSG_CANCEL = 1, MSG_RESUME = 2, MSG_RESUME_UPLOAD = 3 };
 
 typedef struct Stream {
     pthread_mutex_t lock;
@@ -366,6 +366,57 @@ static void stream_decref(Stream *s) {
     free(s);
 }
 
+typedef struct Upload {
+    pthread_mutex_t lock;
+    atomic_int refs;
+    char *ring;
+    size_t head;
+    size_t len;
+    bool eof;
+    bool done;
+    bool paused;
+    bool want_wake;
+    PyObject *waiter;
+    struct AcRequestData *rd;
+    EventLoop *loop;
+    double paused_since;
+    double paused_time;
+} Upload;
+
+static Upload *upload_new(EventLoop *loop) {
+    Upload *u = calloc(1, sizeof(Upload));
+    if (u == NULL) {
+        return NULL;
+    }
+    u->ring = malloc(STREAM_BUFFER);
+    if (u->ring == NULL) {
+        free(u);
+        return NULL;
+    }
+    pthread_mutex_init(&u->lock, NULL);
+    atomic_init(&u->refs, 1);
+    u->loop = loop;
+    return u;
+}
+
+static void upload_incref(Upload *u) { atomic_fetch_add(&u->refs, 1); }
+
+static void upload_decref(Upload *u) {
+    if (atomic_fetch_sub(&u->refs, 1) != 1) {
+        return;
+    }
+    free(u->ring);
+    pthread_mutex_destroy(&u->lock);
+    free(u);
+}
+
+static void paused_until_now(double *since, double *total) {
+    if (*since > 0) {
+        *total += monotonic_time() - *since;
+        *since = 0;
+    }
+}
+
 typedef struct AcRequestData {
     char *method;
     char *url;
@@ -394,6 +445,8 @@ typedef struct AcRequestData {
     Buffer body;
     bool discard_body;
     Stream *stream;
+    Upload *upload;
+    curl_off_t upload_size;
     bool headers_sent;
     bool delivered;
     HostSlot *slot;
@@ -492,6 +545,7 @@ typedef struct {
     Buffer body;
     bool body_discarded;
     Stream *stream;
+    Upload *upload;
     PyObject *header_bytes;
     PyObject *body_bytes;
     Session *session;
@@ -524,6 +578,9 @@ static void Response_dealloc(Response *self) {
     free(self->body.data);
     Py_XDECREF(self->header_bytes);
     Py_XDECREF(self->body_bytes);
+    if (self->upload != NULL) {
+        upload_decref(self->upload);
+    }
     if (self->stream != NULL) {
         Stream *s = self->stream;
         stream_cancel(s, self->session->loop);
@@ -638,7 +695,115 @@ static PyObject *Response_get_paused_time(Response *self, PyObject *args) {
     if (!response_final(self)) {
         return NULL;
     }
-    return PyFloat_FromDouble(self->stream ? self->stream->paused_time : 0.0);
+    double paused = self->stream ? self->stream->paused_time : 0.0;
+    if (self->upload != NULL) {
+        pthread_mutex_lock(&self->upload->lock);
+        paused += self->upload->paused_time;
+        pthread_mutex_unlock(&self->upload->lock);
+    }
+    return PyFloat_FromDouble(paused);
+}
+
+static void upload_capsule_free(PyObject *capsule) {
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    pthread_mutex_lock(&u->lock);
+    PyObject *waiter = u->waiter;
+    u->waiter = NULL;
+    pthread_mutex_unlock(&u->lock);
+    Py_XDECREF(waiter);
+    upload_decref(u);
+}
+
+static void upload_send_resume(Upload *u) {
+    upload_incref(u);
+    uintptr_t message = (uintptr_t)u | MSG_RESUME_UPLOAD;
+    if (!pipe_write(u->loop->req_in_write, &message, sizeof(message))) {
+        upload_decref(u);
+        perror("httpperf: failed to resume an upload");
+    }
+}
+
+static PyObject *module_upload_push(PyObject *self, PyObject *args) {
+    PyObject *capsule;
+    Py_buffer data;
+    if (!PyArg_ParseTuple(args, "Oy*", &capsule, &data)) {
+        return NULL;
+    }
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    if (u == NULL) {
+        PyBuffer_Release(&data);
+        return NULL;
+    }
+    pthread_mutex_lock(&u->lock);
+    if (u->done) {
+        pthread_mutex_unlock(&u->lock);
+        PyBuffer_Release(&data);
+        Py_RETURN_NONE;
+    }
+    size_t n = (size_t)data.len < STREAM_BUFFER - u->len ? (size_t)data.len : STREAM_BUFFER - u->len;
+    size_t tail = (u->head + u->len) % STREAM_BUFFER;
+    size_t first = STREAM_BUFFER - tail < n ? STREAM_BUFFER - tail : n;
+    memcpy(u->ring + tail, data.buf, first);
+    memcpy(u->ring, (char *)data.buf + first, n - first);
+    u->len += n;
+    bool resume = u->paused && n > 0;
+    if (resume) {
+        u->paused = false;
+    }
+    pthread_mutex_unlock(&u->lock);
+    PyBuffer_Release(&data);
+    if (resume) {
+        upload_send_resume(u);
+    }
+    return PyLong_FromSize_t(n);
+}
+
+static PyObject *module_upload_finish(PyObject *self, PyObject *capsule) {
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    if (u == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&u->lock);
+    u->eof = true;
+    bool resume = u->paused;
+    u->paused = false;
+    pthread_mutex_unlock(&u->lock);
+    if (resume) {
+        upload_send_resume(u);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *module_upload_wait(PyObject *self, PyObject *args) {
+    PyObject *capsule, *waiter;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &waiter)) {
+        return NULL;
+    }
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    if (u == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&u->lock);
+    bool wait = !u->done && u->len > STREAM_BUFFER / 2;
+    PyObject *old = NULL;
+    if (wait) {
+        old = u->waiter;
+        Py_INCREF(waiter);
+        u->waiter = waiter;
+        u->want_wake = true;
+    }
+    pthread_mutex_unlock(&u->lock);
+    Py_XDECREF(old);
+    return PyBool_FromLong(wait);
+}
+
+static PyObject *upload_finished(Upload *u) {
+    pthread_mutex_lock(&u->lock);
+    u->done = true;
+    PyObject *waiter = u->waiter;
+    u->waiter = NULL;
+    pthread_mutex_unlock(&u->lock);
+    return waiter;
 }
 
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
@@ -1088,19 +1253,18 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
     share_decref(share);
 }
 
-static void stream_paused_until_now(Stream *s) {
-    if (s->paused_since > 0) {
-        s->paused_time += monotonic_time() - s->paused_since;
-        s->paused_since = 0;
-    }
-}
-
 static void release_request(EventLoop *loop, AcRequestData *rd) {
     if (rd->stream != NULL) {
         pthread_mutex_lock(&rd->stream->lock);
-        stream_paused_until_now(rd->stream);
+        paused_until_now(&rd->stream->paused_since, &rd->stream->paused_time);
         rd->stream->rd = NULL;
         pthread_mutex_unlock(&rd->stream->lock);
+    }
+    if (rd->upload != NULL) {
+        pthread_mutex_lock(&rd->upload->lock);
+        paused_until_now(&rd->upload->paused_since, &rd->upload->paused_time);
+        rd->upload->rd = NULL;
+        pthread_mutex_unlock(&rd->upload->lock);
     }
     stats_finish(rd);
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, NULL);
@@ -1332,13 +1496,53 @@ static int close_socket(void *clientp, curl_socket_t item) {
 static void stream_resume(EventLoop *loop, Stream *s) {
     pthread_mutex_lock(&s->lock);
     AcRequestData *rd = s->rd;
-    stream_paused_until_now(s);
+    paused_until_now(&s->paused_since, &s->paused_time);
     pthread_mutex_unlock(&s->lock);
     if (rd != NULL) {
         curl_easy_pause(rd->curl, CURLPAUSE_CONT);
         response_complete(loop);
     }
     stream_decref(s);
+}
+
+static void upload_resume(EventLoop *loop, Upload *u) {
+    pthread_mutex_lock(&u->lock);
+    AcRequestData *rd = u->rd;
+    paused_until_now(&u->paused_since, &u->paused_time);
+    pthread_mutex_unlock(&u->lock);
+    if (rd != NULL) {
+        curl_easy_pause(rd->curl, CURLPAUSE_CONT);
+        response_complete(loop);
+    }
+    upload_decref(u);
+}
+
+static size_t upload_read(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    AcRequestData *rd = (AcRequestData *)userdata;
+    Upload *u = rd->upload;
+    pthread_mutex_lock(&u->lock);
+    size_t n = size * nmemb < u->len ? size * nmemb : u->len;
+    size_t first = STREAM_BUFFER - u->head < n ? STREAM_BUFFER - u->head : n;
+    memcpy(ptr, u->ring + u->head, first);
+    memcpy(ptr + first, u->ring, n - first);
+    u->head = (u->head + n) % STREAM_BUFFER;
+    u->len -= n;
+    bool pause = n == 0 && !u->eof;
+    if (pause) {
+        u->paused = true;
+        if (u->paused_since == 0) {
+            u->paused_since = monotonic_time();
+        }
+    }
+    bool wake = u->want_wake && u->len <= STREAM_BUFFER / 2;
+    if (wake) {
+        u->want_wake = false;
+    }
+    pthread_mutex_unlock(&u->lock);
+    if (wake) {
+        send_message(rd->session->loop, rd, MSG_UPLOAD_WAKE);
+    }
+    return pause ? CURL_READFUNC_PAUSE : n;
 }
 
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
@@ -1354,6 +1558,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     }
     if (kind == MSG_RESUME) {
         stream_resume(loop, (Stream *)((uintptr_t)rd & ~(uintptr_t)3));
+        return;
+    }
+    if (kind == MSG_RESUME_UPLOAD) {
+        upload_resume(loop, (Upload *)((uintptr_t)rd & ~(uintptr_t)3));
         return;
     }
     REQUEST_TRACE_PRINT("start_request", rd);
@@ -1402,6 +1610,11 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->req_data_buf != NULL) {
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)rd->req_data_len);
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDS, (char *)rd->req_data_buf);
+    } else if (rd->upload != NULL) {
+        curl_easy_setopt(rd->curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE_LARGE, rd->upload_size);
+        curl_easy_setopt(rd->curl, CURLOPT_READFUNCTION, upload_read);
+        curl_easy_setopt(rd->curl, CURLOPT_READDATA, rd);
     }
     if (rd->verify) {
         if (rd->ca_file != NULL) {
@@ -1790,6 +2003,14 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
         if (rd->stream != NULL) {
             stream_decref(rd->stream);
         }
+        if (rd->upload != NULL) {
+            PyObject *waiter = upload_finished(rd->upload);
+            if (waiter != NULL) {
+                PyList_Append(futures, waiter);
+                Py_DECREF(waiter);
+            }
+            upload_decref(rd->upload);
+        }
         free(rd);
     }
     self->unsent_len = 0;
@@ -1854,6 +2075,10 @@ static Response *response_from(AcRequestData *rd) {
     rd->body = (Buffer){0};
     response->body_discarded = rd->discard_body;
     response->stream = NULL;
+    response->upload = rd->upload;
+    if (rd->upload != NULL) {
+        upload_incref(rd->upload);
+    }
     response->header_bytes = NULL;
     response->body_bytes = NULL;
     response->curl = rd->curl;
@@ -1897,6 +2122,16 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             PyObject *waiter = rd->stream->waiter;
             rd->stream->waiter = NULL;
             pthread_mutex_unlock(&rd->stream->lock);
+            if (waiter != NULL) {
+                append_completed(list, NULL, NULL, waiter);
+            }
+            continue;
+        }
+        if (kind == MSG_UPLOAD_WAKE) {
+            pthread_mutex_lock(&rd->upload->lock);
+            PyObject *waiter = rd->upload->waiter;
+            rd->upload->waiter = NULL;
+            pthread_mutex_unlock(&rd->upload->lock);
             if (waiter != NULL) {
                 append_completed(list, NULL, NULL, waiter);
             }
@@ -1949,6 +2184,13 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         Py_XDECREF(rd->cookies);
         if (rd->stream != NULL) {
             stream_decref(rd->stream);
+        }
+        if (rd->upload != NULL) {
+            PyObject *waiter = upload_finished(rd->upload);
+            if (waiter != NULL) {
+                append_completed(list, NULL, NULL, waiter);
+            }
+            upload_decref(rd->upload);
         }
         free(rd);
     }
@@ -2174,13 +2416,16 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     PyObject *connect_timeout = Py_None;
     int discard_body = 0;
     int stream = 0;
+    long long upload_size = -2;
+    PyObject *capsule = NULL;
 
-    static char *kwlist[] = {"future", "method", "url",     "headers",         "auth",         "cookies", "data",
-                             "cert",   "verify", "timeout", "connect_timeout", "discard_body", "stream",  NULL};
+    static char *kwlist[] = {"future",          "method",       "url",    "headers",     "auth",
+                             "cookies",         "data",         "cert",   "verify",      "timeout",
+                             "connect_timeout", "discard_body", "stream", "upload_size", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOpp", kwlist, &future, &method, &url, &headers, &auth,
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOppL", kwlist, &future, &method, &url, &headers, &auth,
                                      &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout, &connect_timeout,
-                                     &discard_body, &stream)) {
+                                     &discard_body, &stream, &upload_size)) {
         return NULL;
     }
     long timeout_ms, connect_timeout_ms;
@@ -2210,6 +2455,18 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
         CHECK_ALLOC(rd->stream);
         rd->stream->rd = rd;
         rd->stream->owner = rd;
+    }
+    if (upload_size >= -1) {
+        rd->upload = upload_new(self->loop);
+        CHECK_ALLOC(rd->upload);
+        rd->upload->rd = rd;
+        rd->upload_size = upload_size;
+        upload_incref(rd->upload);
+        capsule = PyCapsule_New(rd->upload, "httpperf.upload", upload_capsule_free);
+        if (capsule == NULL) {
+            upload_decref(rd->upload);
+            goto error_cleanup;
+        }
     }
     rd->timeout_ms = timeout_ms;
     rd->connect_timeout_ms = connect_timeout_ms;
@@ -2360,6 +2617,9 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     self->loop->live_head = rd;
     LIVE_UNLOCK(self->loop);
     DEBUG_PRINT("scheduling request");
+    if (capsule != NULL) {
+        return Py_BuildValue("(NN)", PyLong_FromVoidPtr(rd), capsule);
+    }
     return PyLong_FromVoidPtr(rd);
 
 error_cleanup:
@@ -2382,6 +2642,10 @@ error_cleanup:
     free(rd->req_data_buf);
     if (rd->stream != NULL) {
         stream_decref(rd->stream);
+    }
+    Py_XDECREF(capsule);
+    if (rd->upload != NULL) {
+        upload_decref(rd->upload);
     }
     free(rd);
     return NULL;
@@ -2677,6 +2941,10 @@ static PyMethodDef module_methods[] = {
     {"_set_host_idle_seconds", module_set_host_idle_seconds, METH_O, "How long idle host records are kept, for tests"},
     {"default_ca_file", module_default_ca_file, METH_NOARGS, "libcurl's built-in CA bundle path, or None"},
     {"parse_headers", module_parse_headers, METH_O, "The (name, value) pairs of the final header block"},
+    {"upload_push", module_upload_push, METH_VARARGS,
+     "Copy what fits of the bytes into an upload; None once it's over"},
+    {"upload_finish", module_upload_finish, METH_O, "Mark the end of an upload's body"},
+    {"upload_wait", module_upload_wait, METH_VARARGS, "Resolve the future when an upload has room"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef _httpperf_module = {PyModuleDef_HEAD_INIT, MODULE_NAME, NULL, -1, module_methods};

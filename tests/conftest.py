@@ -61,6 +61,34 @@ class Server:
                 self.end_headers()
                 self.wfile.write(b"ok")
 
+            def do_POST(self):
+                if self.path.startswith("/redirect/"):
+                    self.read_body()
+                    self.send_response(int(self.path.split("/")[2]))
+                    self.send_header("Location", "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = self.read_body()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Chunked", str("Content-Length" not in self.headers))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_PUT = do_POST
+
+            def read_body(self):
+                if "Content-Length" in self.headers:
+                    return self.rfile.read(int(self.headers["Content-Length"]))
+                body = b""
+                while True:
+                    size = int(self.rfile.readline(), 16)
+                    body += self.rfile.read(size)
+                    self.rfile.readline()
+                    if size == 0:
+                        return body
+
             def log_message(self, *args):
                 pass
 

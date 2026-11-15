@@ -2,10 +2,12 @@ import asyncio
 import collections.abc
 import datetime
 import email.utils
+import functools
 import http
 import json as _json
 import os
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -666,6 +668,66 @@ class Response:
         return self._header
 
 
+UPLOAD_CHUNK = 65536
+
+
+def _upload_source(data):
+    if data is None or isinstance(data, (str, bytes, bytearray, memoryview)):
+        return None
+    return data
+
+
+def _upload_size(source):
+    try:
+        st = os.fstat(source.fileno())
+        return st.st_size - source.tell() if stat.S_ISREG(st.st_mode) else -1
+    except (AttributeError, OSError, ValueError):
+        return -1
+
+
+def _upload_start(source):
+    try:
+        return source.tell() if source.seekable() else None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+async def _upload_chunks(source):
+    if hasattr(source, "read"):
+        while True:
+            chunk = source.read(UPLOAD_CHUNK)
+            if not chunk:
+                return
+            yield chunk
+    elif hasattr(source, "__aiter__"):
+        async for chunk in source:
+            yield chunk
+    else:
+        for chunk in source:
+            yield chunk
+
+
+async def _feed(upload, source):
+    loop = asyncio.get_running_loop()
+    async for chunk in _upload_chunks(source):
+        view = memoryview(chunk.encode() if isinstance(chunk, str) else chunk).cast("B")
+        while view:
+            n = _httpperf.upload_push(upload, view)
+            if n is None:
+                return
+            view = view[n:]
+            if view:
+                waiter = loop.create_future()
+                if _httpperf.upload_wait(upload, waiter):
+                    await waiter
+    _httpperf.upload_finish(upload)
+
+
+def _fed(future, feed):
+    if not feed.cancelled() and feed.exception() is not None and not future.done():
+        future.cancel()
+
+
 def _error(code, message):
     return (Timeout if code == CURLE_OPERATION_TIMEDOUT else RequestError)(message, code)
 
@@ -870,6 +932,13 @@ class Session:
         start_time = time.time()
         start = time.monotonic()
         request = Request(method, url, header_tuple, cookie_tuple, auth, data)
+        source = _upload_source(data)
+        call_options = options
+        if source is not None:
+            upload_start = _upload_start(source)
+            call_options = dict(options, upload_size=_upload_size(source))
+            if not _has_header("expect", None, header_tuple):
+                header_tuple = (header_tuple or ()) + ("Expect:",)
 
         loop = asyncio.get_running_loop()
         engine = self._engine
@@ -887,10 +956,22 @@ class Session:
             headers=header_tuple,
             cookies=tuple(c.format() for c in cookie_tuple) if cookie_tuple else None,
             auth=auth,
-            data=data,
-            **options,
+            data=None if source is not None else data,
+            **call_options,
         )
-        resp = await future
+        feed = None
+        if source is not None:
+            future._handle, upload = future._handle
+            feed = loop.create_task(_feed(upload, source))
+            feed.add_done_callback(functools.partial(_fed, future))
+        try:
+            resp = await future
+        except BaseException:
+            if feed is not None:
+                if feed.done() and not feed.cancelled() and feed.exception() is not None:
+                    raise feed.exception() from None
+                feed.cancel()
+            raise
         stream = options.get("stream", False)
         response = Response(request, resp, start_time, start_time + time.monotonic() - start, self._json_loads, stream)
         if prev is not None:
@@ -918,6 +999,10 @@ class Session:
                     response,
                 )
             else:
+                if source is not None:
+                    if upload_start is None:
+                        raise RequestError("the body can't be sent again for the redirect")
+                    source.seek(upload_start)
                 redir_response = await self._request(
                     method,
                     response.redirect_url,

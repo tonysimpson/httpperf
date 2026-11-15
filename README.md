@@ -154,7 +154,7 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `cookies` | Dict of cookies to send with this request (added to the session jar). |
 | `cookie_list` | List of `Cookie` objects. |
 | `auth` | `(username, password)` for basic auth. |
-| `data` | Request body: `str` or `bytes` as is, with no `Content-Type` unless you set one, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. |
+| `data` | Request body: `str` or `bytes` as is, with no `Content-Type` unless you set one, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. A file, or another iterable of `bytes` (sync or async), is streamed: see [Large bodies](#large-bodies). |
 | `json` | Object to send as JSON, encoded with the session's `json_dumps`. Sets `Content-Type: application/json` unless you set it. |
 | `files` | Dict (or list of pairs) of files to send as `multipart/form-data`, with any `data` dict as extra fields. A value is an open file, or `(filename, content)` or `(filename, content, content_type)`, where content is `bytes`, `str` or a file. Files are read into memory. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
@@ -196,7 +196,20 @@ with open("big.iso", "wb") as f:
 - A transfer that fails part way, say because the connection drops, raises `RequestError` from `iter_content()` or `read()`.
 - Redirects are followed as usual, and each redirect's body is read into its `history` entry.
 
-Streaming is for benchmarking large transfers, such as how fast a server sends a big file, and for checking what arrives. Each chunk passes through Python, so it can't sustain high request rates. For those, use `discard_body=True` or keep the body in memory.
+Uploads stream the same way. Pass an open file, or any object with `read()`, as `data`, or an iterable or async iterable of `bytes`:
+
+```python
+with open("big.iso", "rb") as f:
+    r = await session.put(url, data=f)
+```
+
+- A regular file is sent with a `Content-Length`. Anything else is sent chunked (on HTTP/1.1).
+- httpperf reads ahead up to 1 MB. When the source falls behind, curl pauses that transfer until there is more to send; that time is in `r.paused_time` too.
+- An exception from the source, such as a failing `read()`, stops the transfer and is raised from the request.
+- No `Expect: 100-continue` is sent, unless you set the header yourself.
+- A 307 or 308 redirect sends the body again: a seekable file is rewound to where it started, and anything else raises `RequestError`.
+
+Streaming is for benchmarking large transfers, such as how fast a server sends or receives a big file, and for checking what arrives. Each chunk passes through Python, so it can't sustain high request rates. For those, use `discard_body=True` or keep the body in memory.
 
 ### Response
 
@@ -265,7 +278,7 @@ All in seconds.
 | `starttransfer_time` | First byte received. |
 | `total_time` | Transfer complete. |
 | `queue_time` | Time waiting in httpperf's queue for a connection, under the engine or session limits. 0 if the request did not wait. curl's timings start after it. |
-| `paused_time` | With `stream=True`, time the transfer was stopped waiting for Python to read the body. It is part of `total_time`. 0 otherwise. |
+| `paused_time` | Time the transfer was stopped waiting on Python: to read a streamed body, or to supply more of a streamed upload. It is part of `total_time`. 0 otherwise. |
 | `client_lag` | `end_time − start_time − total_time − queue_time`: time the request spent waiting on Python, before it was sent and after it finished. Measured with the monotonic clock, so clock changes don't affect it. |
 
 curl measures its timings on the curl thread, so a busy Python process does not inflate them. `client_lag` is how you see that Python is the bottleneck: if it grows, the client cannot keep up, and achieved request rates describe the client rather than the server. Report it alongside response times (p50, p99, max).
@@ -295,6 +308,7 @@ The counts are updated on the curl thread, so they can lag a moment behind: a ca
 
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `Engine.close()` is called never complete.
+- A streamed upload can fail if curl has to send it again on its own, for instance when a reused connection turns out to be closed. Bodies given as `bytes` are resent.
 - With a system libcurl older than 8.12, `tls="shared"` doesn't share TLS sessions across the engine: curl keeps them per curl handle, so a new connection only resumes if it happens to reuse the handle of an earlier request to that host. The wheels bundle a newer curl.
 
 ## Development
