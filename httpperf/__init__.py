@@ -569,19 +569,12 @@ class Response:
             return
         self._consumed = True
         try:
-            pending = b""
             async for data in self._chunks():
-                if chunk_size is None:
+                if chunk_size is None or len(data) <= chunk_size:
                     yield data
                     continue
-                pending += data
-                start = 0
-                while len(pending) - start >= chunk_size:
-                    yield pending[start : start + chunk_size]
-                    start += chunk_size
-                pending = pending[start:]
-            if pending:
-                yield pending
+                for i in range(0, len(data), chunk_size):
+                    yield data[i : i + chunk_size]
         finally:
             self._resp.stream_close()
 

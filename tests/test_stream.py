@@ -12,9 +12,9 @@ async def test_a_streamed_body_arrives_whole(s, server):
     assert b"".join([chunk async for chunk in r.iter_content()]) == BIG
 
 
-async def test_chunks_are_the_size_asked_for(s, server):
+async def test_chunks_are_no_bigger_than_asked_for(s, server):
     r = await s.get(server.url + "/big", stream=True)
-    assert {len(chunk) async for chunk in r.iter_content(1000)} == {1000, len(BIG) % 1000}
+    assert max([len(chunk) async for chunk in r.iter_content(1000)]) == 1000
 
 
 async def test_read_gives_the_body(s, server):

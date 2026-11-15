@@ -189,7 +189,7 @@ with open("big.iso", "wb") as f:
             f.write(chunk)
 ```
 
-- `iter_content(chunk_size)` gives `chunk_size` bytes at a time, the last chunk perhaps shorter. Without a size, chunks are whatever has arrived. `await r.read()` reads the whole body into `r.body`.
+- `iter_content(chunk_size)` gives what has arrived, in chunks of at most `chunk_size` bytes. It doesn't wait to fill a chunk, so chunks are often smaller. Without a size, each chunk is everything that has arrived since the last one. `await r.read()` reads the whole body into `r.body`.
 - `r.body`, `r.text` and `r.json()` raise `RuntimeError` until the body has been read, as do the timings and sizes, since they aren't known until the transfer ends.
 - httpperf buffers up to 1 MB of each response. When Python falls behind, it stops reading that connection until Python catches up, so the server is held up by TCP back-pressure. Other requests carry on, and the curl thread never waits. The time spent stopped is `r.paused_time`.
 - Closing the response, leaving `async with`, breaking out of `iter_content()` or dropping the response stops the transfer and closes its connection. Reading to the end leaves the connection open for reuse.
