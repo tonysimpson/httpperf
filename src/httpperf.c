@@ -1834,17 +1834,17 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     PyObject *verify = Py_False;
     PyObject *timeout = Py_None;
     PyObject *connect_timeout = Py_None;
-    int body_fd = -1;
+    PyObject *body_to = Py_None;
     int discard_body = 0;
     int follow_redirects = 0;
 
     static char *kwlist[] = {"future",          "method",  "url",          "headers",          "auth",
                              "cookies",         "data",    "cert",         "verify",           "timeout",
-                             "connect_timeout", "body_fd", "discard_body", "follow_redirects", NULL};
+                             "connect_timeout", "body_to", "discard_body", "follow_redirects", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOipp", kwlist, &future, &method, &url, &headers, &auth,
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOOpp", kwlist, &future, &method, &url, &headers, &auth,
                                      &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout, &connect_timeout,
-                                     &body_fd, &discard_body, &follow_redirects)) {
+                                     &body_to, &discard_body, &follow_redirects)) {
         return NULL;
     }
     long timeout_ms, connect_timeout_ms;
@@ -1872,13 +1872,6 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     rd->body_kept = -1;
     rd->discard_body = discard_body;
     rd->follow_redirects = follow_redirects;
-    if (body_fd >= 0) {
-        rd->body_fd = fcntl(body_fd, F_DUPFD_CLOEXEC, 0);
-        if (rd->body_fd < 0) {
-            PyErr_SetFromErrno(PyExc_OSError);
-            goto error_cleanup;
-        }
-    }
     rd->timeout_ms = timeout_ms;
     rd->connect_timeout_ms = connect_timeout_ms;
     bool has_content_type = false;
@@ -2006,6 +1999,18 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         memcpy(rd->req_data_buf, req_data_buf, req_data_len);
     }
     rd->req_data_len = req_data_len;
+    if (body_to != Py_None) {
+        PyObject *path = NULL;
+        if (!PyUnicode_FSConverter(body_to, &path)) {
+            goto error_cleanup;
+        }
+        rd->body_fd = open(PyBytes_AS_STRING(path), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        Py_DECREF(path);
+        if (rd->body_fd < 0) {
+            PyErr_SetFromErrnoWithFilenameObject(PyExc_OSError, body_to);
+            goto error_cleanup;
+        }
+    }
 
     Py_INCREF(self);
     rd->session = self;

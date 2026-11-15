@@ -1,5 +1,4 @@
 import asyncio
-import io
 import tempfile
 
 import pytest
@@ -24,66 +23,50 @@ def expected(url):
 
 
 @pytest.fixture
-def f(tmp_path):
-    with open(tmp_path / "body", "w+b") as f:
-        yield f
+def path(tmp_path):
+    return tmp_path / "body"
 
 
-def contents(f):
-    f.seek(0)
-    return f.read()
+@pytest.mark.parametrize("as_path", [str, lambda p: str(p).encode(), lambda p: p], ids=["str", "bytes", "Path"])
+async def test_the_body_is_written_to_the_path(s, url, expected, path, as_path):
+    await s.get(url, body_to=as_path(path))
+    assert path.read_bytes() == expected
 
 
-async def test_the_body_is_written_to_the_file(s, url, expected, f):
-    await s.get(url, body_to=f)
-    assert contents(f) == expected
+async def test_a_body_written_to_a_path_is_none(s, url, path):
+    assert (await s.get(url, body_to=path)).body is None
 
 
-async def test_a_body_written_to_a_file_is_none(s, url, f):
-    assert (await s.get(url, body_to=f)).body is None
+async def test_the_download_size_counts_a_body_written_to_a_path(s, url, path):
+    assert (await s.get(url, body_to=path)).download_size == SIZE
 
 
-async def test_the_download_size_counts_a_body_written_to_a_file(s, url, f):
-    assert (await s.get(url, body_to=f)).download_size == SIZE
+async def test_an_existing_file_is_replaced(s, url, expected, path):
+    path.write_bytes(b"x" * (SIZE * 2))
+    await s.get(url, body_to=path)
+    assert path.read_bytes() == expected
 
 
-async def test_the_file_position_is_after_the_body(s, url, f):
-    await s.get(url, body_to=f)
-    assert f.tell() == SIZE
+async def test_an_empty_body_leaves_an_empty_file(s, httpbin, path):
+    await s.get(httpbin.url + "/status/204", body_to=path)
+    assert path.read_bytes() == b""
 
 
-async def test_the_body_is_written_after_existing_content(s, url, expected, f):
-    f.write(b"before")
-    await s.get(url, body_to=f)
-    assert contents(f) == b"before" + expected
+async def test_a_named_temporary_file_sees_the_body(s, url, expected):
+    with tempfile.NamedTemporaryFile() as f:
+        await s.get(url, body_to=f.name)
+        assert f.read() == expected
 
 
-async def test_an_appended_body_follows_existing_content(s, url, expected, tmp_path):
-    (tmp_path / "body").write_bytes(b"before")
-    with open(tmp_path / "body", "ab") as f:
-        await s.get(url, body_to=f)
-    assert (tmp_path / "body").read_bytes() == b"before" + expected
+async def test_a_missing_directory_raises(s, url, tmp_path):
+    with pytest.raises(FileNotFoundError):
+        await s.get(url, body_to=tmp_path / "missing" / "body")
 
 
-async def test_the_file_can_be_closed_before_the_response_arrives(server, tmp_path):
-    async with httpperf.Session() as s:
-        with open(tmp_path / "body", "wb") as f:
-            request = asyncio.create_task(s.get(server.url + "/slow", body_to=f))
-            await asyncio.sleep(0.1)
-        server.release.set()
-        await request
-    assert (tmp_path / "body").read_bytes() == b"ok"
-
-
-@pytest.mark.parametrize(
-    "make_file",
-    [tempfile.TemporaryFile, tempfile.NamedTemporaryFile, tempfile.SpooledTemporaryFile],
-    ids=["TemporaryFile", "NamedTemporaryFile", "SpooledTemporaryFile"],
-)
-async def test_temporary_files(s, url, expected, make_file):
-    with make_file() as f:
-        await s.get(url, body_to=f)
-        assert contents(f) == expected
+async def test_an_open_file_is_refused(s, url, path):
+    with open(path, "wb") as f:
+        with pytest.raises(TypeError):
+            await s.get(url, body_to=f)
 
 
 async def test_a_discarded_body_is_none(s, url):
@@ -94,19 +77,19 @@ async def test_a_discarded_body_is_counted(s, url):
     assert (await s.get(url, body_to=httpperf.DISCARD)).download_size == SIZE
 
 
-async def test_a_followed_redirect_keeps_its_body(s, server, f):
-    r = await s.get(server.url + "/redirect", body_to=f)
+async def test_a_followed_redirect_keeps_its_body(s, server, path):
+    r = await s.get(server.url + "/redirect", body_to=path)
     assert r.history[0].body == b"moved"
 
 
-async def test_only_the_final_body_is_written(s, server, f):
-    await s.get(server.url + "/redirect", body_to=f)
-    assert contents(f) == b"ok"
+async def test_only_the_final_body_is_written(s, server, path):
+    await s.get(server.url + "/redirect", body_to=path)
+    assert path.read_bytes() == b"ok"
 
 
-async def test_an_unfollowed_redirect_writes_its_body(s, server, f):
-    await s.get(server.url + "/redirect", body_to=f, allow_redirects=False)
-    assert contents(f) == b"moved"
+async def test_an_unfollowed_redirect_writes_its_body(s, server, path):
+    await s.get(server.url + "/redirect", body_to=path, allow_redirects=False)
+    assert path.read_bytes() == b"moved"
 
 
 @pytest.mark.parametrize("read", [lambda r: r.text, lambda r: r.json()], ids=["text", "json"])
@@ -117,39 +100,5 @@ async def test_a_body_that_was_not_kept_cannot_be_read(s, url, read):
 
 
 async def test_a_failed_write_raises(s, url):
-    with open("/dev/full", "wb") as full:
-        with pytest.raises(httpperf.RequestError, match="No space left on device"):
-            await s.get(url, body_to=full)
-
-
-def text_file(tmp_path):
-    return open(tmp_path / "text", "w")
-
-
-def read_only_file(tmp_path):
-    (tmp_path / "read").write_bytes(b"")
-    return open(tmp_path / "read", "rb")
-
-
-def closed_file(tmp_path):
-    f = open(tmp_path / "closed", "wb")
-    f.close()
-    return f
-
-
-@pytest.mark.parametrize(
-    "make_file, error",
-    [
-        (text_file, TypeError),
-        (lambda tmp_path: tempfile.NamedTemporaryFile("w+"), TypeError),
-        (read_only_file, ValueError),
-        (closed_file, ValueError),
-        (lambda tmp_path: io.BytesIO(), TypeError),
-    ],
-    ids=["text", "text temporary", "read only", "closed", "BytesIO"],
-)
-async def test_unsuitable_files_are_refused(s, url, tmp_path, make_file, error):
-    f = make_file(tmp_path)
-    with pytest.raises(error):
-        await s.get(url, body_to=f)
-    f.close()
+    with pytest.raises(httpperf.RequestError, match="No space left on device"):
+        await s.get(url, body_to="/dev/full")

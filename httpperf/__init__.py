@@ -3,7 +3,6 @@ import collections.abc
 import datetime
 import email.utils
 import http
-import io
 import json as _json
 import os
 import ssl
@@ -392,32 +391,7 @@ def _body_to_options(body_to):
         return {}
     if body_to is DISCARD:
         return {"discard_body": True}
-    if isinstance(body_to, io.TextIOBase):
-        raise TypeError("body_to must be a file opened in binary mode")
-    if body_to.closed:
-        raise ValueError("body_to is closed")
-    try:
-        body_to.write(b"")
-    except TypeError:
-        raise TypeError("body_to must be a file opened in binary mode") from None
-    except io.UnsupportedOperation:
-        raise ValueError("body_to is not open for writing") from None
-    try:
-        fd = body_to.fileno()
-    except (AttributeError, io.UnsupportedOperation):
-        raise TypeError("body_to must be a file on disk; leave it out to keep the body in memory") from None
-    body_to.flush()
-    return {"body_fd": fd}
-
-
-def _sync_position(body_to):
-    if body_to is None or body_to is DISCARD or body_to.closed:
-        return
-    try:
-        position = os.lseek(body_to.fileno(), 0, os.SEEK_CUR)
-    except OSError:
-        return
-    body_to.seek(position)
+    return {"body_to": body_to}
 
 
 class Response:
@@ -792,20 +766,17 @@ class Session:
         if cookies:
             cookie_list = list(cookie_list or ()) + [session_cookie_for_url(url, k, v) for k, v in cookies.items()]
 
-        try:
-            return await self._request(
-                method,
-                url,
-                tuple(headers_list) if headers_list else None,
-                tuple(cookie_list) if cookie_list else None,
-                auth,
-                data,
-                options,
-                allow_redirects,
-                max_redirects,
-            )
-        finally:
-            _sync_position(body_to)
+        return await self._request(
+            method,
+            url,
+            tuple(headers_list) if headers_list else None,
+            tuple(cookie_list) if cookie_list else None,
+            auth,
+            data,
+            options,
+            allow_redirects,
+            max_redirects,
+        )
 
     def set_response_callback(self, callback):
         self._response_callback = callback
