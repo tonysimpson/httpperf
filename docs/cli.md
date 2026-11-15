@@ -181,7 +181,9 @@ Printed at the end when they apply. A warning that applies to several steps is p
 
 | Warning | When |
 |---|---|
-| httpperf was the limit, not the server, so the server can do at least N requests/sec. | The process used more than 90% of the cores it was allowed, or one of its threads (an event loop or a curl thread) was more than 90% busy. |
+| httpperf was the limit, not the server, so the server can do at least N requests/sec. | The process used more than 90% of the cores it was allowed, one of its threads (an event loop or a curl thread) was more than 90% busy, or requests spent more than half their time (p50) waiting on Python rather than with the server. The last catches the event loops sharing the GIL, and runs with few connections where httpperf's own work per request sets the pace. |
+| More than 2 threads don't help on Python with the GIL, so try -t 2. | httpperf was the limit, with more than 2 threads on Python with the GIL. |
+| Only N of M connections were in use, because httpperf was the limit. | Flat out over HTTP/1.1: httpperf was the limit and had fewer than 90% of `-c` connections open. |
 | N% of requests failed. | More than 1% of requests failed. |
 | Requests/sec varied by N% from second to second. | More than 10%. |
 | The server closed connections during the test, so some requests waited for new ones. | Connections were closed while measuring. |

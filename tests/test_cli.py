@@ -116,13 +116,17 @@ def step(connections=10, rate=None, rps=1000.0, **overrides):
         "error_kinds": [],
         "rps_variation": 0.0,
         "over_capacity": False,
-        "latency": {"p99": 0.01},
-        "client_lag": {"p99": 0.0},
+        "latency": {"p50": 0.01, "p99": 0.01},
+        "client_lag": {"p50": 0.0, "p99": 0.0},
         "send_lag": None,
         "cpu_cores": 1.0,
         "cores_allowed": 4,
         "busiest_thread": 0.5,
         "connections_closed_measuring": 0,
+        "connections_used": connections,
+        "http_versions": {"HTTP/1.1": 1},
+        "threads": 2,
+        "gil": True,
     }
     result.update(overrides)
     return result
@@ -152,3 +156,18 @@ def test_a_best_last_step_suggests_more_connections():
     assert notes([step(10, rps=500), step(50)], 1) == [
         "Requests/sec was still rising at the last step, so try more connections."
     ]
+
+
+def test_time_waiting_on_python_means_httpperf_was_the_limit():
+    lagging = step(latency={"p50": 0.01, "p99": 0.01}, client_lag={"p50": 0.006, "p99": 0.006})
+    assert notes([lagging], None)[0].startswith("httpperf was the limit")
+
+
+def test_more_than_two_threads_with_the_gil_is_called_out():
+    found = notes([step(busiest_thread=1.0, threads=4)], None)
+    assert "More than 2 threads don't help on Python with the GIL, so try -t 2." in found
+
+
+def test_idle_connections_are_called_out_when_httpperf_was_the_limit():
+    found = notes([step(10000, busiest_thread=1.0, connections_used=461)], None)
+    assert "Only 461 of 10000 connections were in use, because httpperf was the limit." in found

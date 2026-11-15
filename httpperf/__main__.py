@@ -343,6 +343,9 @@ def summarise(plan, recs, cpu, threads_cpu, cores_allowed):
         "connections_opened": diff("connections", 0, 3),
         "connections_closed_measuring": diff("connections", 1, 2) - diff("connections_open", 1, 2),
         "connections_open": sum(rec.stats[3]["connections_open"] for rec in recs),
+        "connections_used": max(sum(rec.stats[i]["connections_open"] for rec in recs) for i in (1, 2, 3)),
+        "threads": plan.threads,
+        "gil": getattr(sys, "_is_gil_enabled", lambda: True)(),
         "tls_handshakes": diff("tls_handshakes", 0, 3),
         "http_versions": {name: count for name, count in versions.items() if count},
         "cpu_cores": cpu / plan.duration,
@@ -423,7 +426,18 @@ def best_step(steps):
 
 
 def client_saturated(step):
-    return step["cpu_cores"] > 0.9 * step["cores_allowed"] or step["busiest_thread"] > 0.9
+    latency = step["latency"]
+    lag = step["client_lag"]
+    return (
+        step["cpu_cores"] > 0.9 * step["cores_allowed"]
+        or step["busiest_thread"] > 0.9
+        or bool(latency and lag and lag["p50"] > 0.5 * latency["p50"])
+    )
+
+
+def few_connections(step):
+    multiplexed = any(version in step["http_versions"] for version in ("HTTP/2", "HTTP/3"))
+    return step["rate"] is None and not multiplexed and step["connections_used"] < 0.9 * step["connections"]
 
 
 def behind_schedule(step):
@@ -436,6 +450,8 @@ def behind_schedule(step):
 def warnings_for(step):
     checks = (
         ("client", client_saturated(step)),
+        ("gil", step["gil"] and step["threads"] > 2 and client_saturated(step)),
+        ("few connections", client_saturated(step) and few_connections(step)),
         ("errors", not few_errors(step)),
         ("unsteady", step["rps_variation"] > 0.1),
         ("churn", step["connections_closed_measuring"] > 0),
@@ -451,6 +467,15 @@ def message(kind, steps, many):
     if kind == "client":
         most = max(s["rps"] for s in steps)
         return "httpperf was the limit%s, not the server, so the server can do at least %.0f requests/sec." % (at, most)
+    if kind == "gil":
+        return "More than 2 threads don't help on Python with the GIL, so try -t 2."
+    if kind == "few connections":
+        if many:
+            return "Not all the connections were in use%s, because httpperf was the limit." % at
+        return "Only %d of %d connections were in use, because httpperf was the limit." % (
+            step["connections_used"],
+            step["connections"],
+        )
     if kind == "errors":
         if many:
             return "More than 1%% of requests failed%s." % at
