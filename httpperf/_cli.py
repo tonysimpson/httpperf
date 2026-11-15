@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import multiprocessing
+import os
 import runpy
 import signal
 import sys
@@ -606,8 +607,11 @@ def ending(steps):
 
 def show(lines):
     if lines:
-        sys.stdout.write("\n".join(lines) + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 def duration(text):
