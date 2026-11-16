@@ -103,7 +103,7 @@ Proxies come from the environment, as curl reads them: `http_proxy` (not `HTTP_P
 
 Cookies always belong to the session, whatever the connection settings.
 
-### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, buffer_size=16384, json_dumps=..., json_loads=...)`
+### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, buffer_size=16384, host_stats=False, json_dumps=..., json_loads=...)`
 
 What sessions share: the curl thread, the shared connection pool, the TLS session cache and the limits. Most programs never create one. Create one to set limits, or to keep groups of sessions in separate pools, and pass it to `Session(engine=...)`.
 
@@ -113,6 +113,7 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 | `max_total_connections` | Cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
 | `buffer_size` | Bytes curl reads from a connection at a time, from 1024 to 10 MB. The default, curl's own, suits many small responses. For large downloads 256 KB is much faster (here 14 to 23 GB/s with `discard_body`, 10 to 15 GB/s streamed), but each transfer in flight has its own buffer, so it costs memory at high connection counts. |
+| `host_stats` | `True` keeps counts for each host, read with `engine.host_stats()`. See [Statistics](#statistics). |
 | `json_dumps`, `json_loads` | The JSON functions for the engine's sessions, unless a session sets its own. The defaults use the standard library: compact output, and bodies decoded as UTF-8. See [JSON](#json). |
 
 Each asyncio loop has its own default engine, so sessions without an engine work in any thread, and in each `asyncio.run()`, without setup. A loop's default engine lasts as long as the loop, and is closed once the loop has been closed and no session uses it.
@@ -321,6 +322,15 @@ curl measures its timings on the curl thread, so a busy Python process does not 
 | `connections_open` | Connections open now, idle or in use, including any still connecting. For the engine, every pool. For a session with `connections="session"`, its own pool, and 0 once it is closed. `None` for other sessions, whose connections belong to the engine. |
 
 The counts are updated on the curl thread, so they can lag a moment behind: a cancelled request is counted just after the cancel.
+
+`engine.host_stats()` gives the same counts for each host the engine has sent requests to, keyed by origin, such as `"https://api.example.com:443"`. Different spellings of one host, such as an upper-case scheme or a default port left out, share an entry. `connections_open` is `None` per host. Host stats are off by default; turn them on with `Engine(host_stats=True)`. They cost nothing measurable, but every host is kept until the engine goes, so a client sending requests to a very large number of hosts grows by a few hundred bytes for each.
+
+```python
+engine = httpperf.Engine(host_stats=True)
+...
+for origin, counts in engine.host_stats().items():
+    print(origin, counts["requests"], counts["errors"])
+```
 
 ## Known limitations
 

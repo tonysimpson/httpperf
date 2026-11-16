@@ -93,6 +93,17 @@ typedef struct {
     atomic_long queued;
 } Stats;
 
+typedef struct HostStats HostStats;
+typedef struct HostName HostName;
+
+typedef struct {
+    HostName **buckets;
+    size_t bucket_count;
+    size_t name_count;
+    HostStats *head;
+    pthread_mutex_t lock;
+} HostTable;
+
 typedef struct OpenCount {
     atomic_long open;
     atomic_long *engine;
@@ -125,6 +136,8 @@ typedef struct {
     bool running;
     bool closing;
     long buffer_size;
+    bool host_stats;
+    HostTable hosts;
     struct Share *limiter;
     CURL *free_handles[HANDLE_POOL_SIZE];
     int free_handle_count;
@@ -464,6 +477,7 @@ typedef struct AcRequestData {
     struct AcRequestData *live_next;
     double queued_at;
     double queue_time;
+    Stats *host;
     atomic_int state;
     bool waiting;
     bool finished;
@@ -471,9 +485,9 @@ typedef struct AcRequestData {
 } AcRequestData;
 
 static void stat_add(AcRequestData *rd, size_t offset, long n) {
-    Stats *both[] = {&rd->session->loop->stats, &rd->session->stats};
-    for (int i = 0; i < 2; i++) {
-        atomic_fetch_add_explicit((atomic_long *)((char *)both[i] + offset), n, memory_order_relaxed);
+    Stats *all[] = {&rd->session->loop->stats, &rd->session->stats, rd->host};
+    for (int i = 0; i < (rd->host != NULL ? 3 : 2); i++) {
+        atomic_fetch_add_explicit((atomic_long *)((char *)all[i] + offset), n, memory_order_relaxed);
     }
 }
 
@@ -1130,6 +1144,128 @@ static HostSlot *host_slot(Share *share, const char *url) {
     return h;
 }
 
+struct HostStats {
+    char *key;
+    Stats stats;
+    HostStats *next;
+};
+
+struct HostName {
+    char *name;
+    size_t len;
+    HostStats *host;
+    HostName *next;
+};
+
+static size_t name_hash(const char *name, size_t len) {
+    size_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h = (h ^ (unsigned char)name[i]) * 1099511628211ULL;
+    }
+    return h;
+}
+
+static HostStats *host_find(HostTable *t, const char *name, size_t len) {
+    if (t->bucket_count == 0) {
+        return NULL;
+    }
+    for (HostName *n = t->buckets[name_hash(name, len) & (t->bucket_count - 1)]; n != NULL; n = n->next) {
+        if (n->len == len && memcmp(n->name, name, len) == 0) {
+            return n->host;
+        }
+    }
+    return NULL;
+}
+
+static bool host_name_add(HostTable *t, const char *name, size_t len, HostStats *host) {
+    if (t->name_count >= t->bucket_count) {
+        size_t count = t->bucket_count ? t->bucket_count * 2 : 64;
+        HostName **buckets = calloc(count, sizeof(HostName *));
+        if (buckets == NULL) {
+            return false;
+        }
+        for (size_t i = 0; i < t->bucket_count; i++) {
+            HostName *n = t->buckets[i];
+            while (n != NULL) {
+                HostName *next = n->next;
+                size_t b = name_hash(n->name, n->len) & (count - 1);
+                n->next = buckets[b];
+                buckets[b] = n;
+                n = next;
+            }
+        }
+        free(t->buckets);
+        t->buckets = buckets;
+        t->bucket_count = count;
+    }
+    HostName *n = malloc(sizeof(HostName));
+    char *copy = malloc(len);
+    if (n == NULL || copy == NULL) {
+        free(n);
+        free(copy);
+        return false;
+    }
+    memcpy(copy, name, len);
+    *n = (HostName){copy, len, host, NULL};
+    size_t b = name_hash(name, len) & (t->bucket_count - 1);
+    n->next = t->buckets[b];
+    t->buckets[b] = n;
+    t->name_count++;
+    return true;
+}
+
+static Stats *host_stats_for(HostTable *t, const char *url) {
+    size_t len = url_prefix(url);
+    HostStats *host = len > 0 ? host_find(t, url, len) : NULL;
+    if (host != NULL) {
+        return &host->stats;
+    }
+    char *key = host_key(url);
+    if (key == NULL) {
+        return NULL;
+    }
+    host = host_find(t, key, strlen(key));
+    if (host == NULL) {
+        host = calloc(1, sizeof(HostStats));
+        if (host == NULL || !host_name_add(t, key, strlen(key), host)) {
+            free(host);
+            free(key);
+            return NULL;
+        }
+        host->key = key;
+        pthread_mutex_lock(&t->lock);
+        host->next = t->head;
+        t->head = host;
+        pthread_mutex_unlock(&t->lock);
+    } else {
+        free(key);
+    }
+    if (len > 0) {
+        host_name_add(t, url, len, host);
+    }
+    return &host->stats;
+}
+
+static void host_table_free(HostTable *t) {
+    for (size_t i = 0; i < t->bucket_count; i++) {
+        HostName *n = t->buckets[i];
+        while (n != NULL) {
+            HostName *next = n->next;
+            free(n->name);
+            free(n);
+            n = next;
+        }
+    }
+    free(t->buckets);
+    while (t->head != NULL) {
+        HostStats *next = t->head->next;
+        free(t->head->key);
+        free(t->head);
+        t->head = next;
+    }
+    pthread_mutex_destroy(&t->lock);
+}
+
 static bool slot_free(Share *share, HostSlot *h) {
     if (h->multiplexed && h->active > 0) {
         return true;
@@ -1574,6 +1710,9 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     }
     REQUEST_TRACE_PRINT("start_request", rd);
     DEBUG_PRINT("read AcRequestData");
+    if (loop->host_stats) {
+        rd->host = host_stats_for(&loop->hosts, rd->url);
+    }
     rd->curl = loop->free_handle_count ? loop->free_handles[--loop->free_handle_count] : curl_easy_init();
     curl_easy_setopt(rd->curl, CURLOPT_SHARE, rd->share->share);
     if (rd->session->fresh_connect) {
@@ -1833,10 +1972,11 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     long max_total_connections = 0;
     long max_idle_connections = 1000;
     long buffer_size = CURL_MAX_WRITE_SIZE;
-    static char *kwlist[] = {"max_host_connections", "max_total_connections", "max_idle_connections", "buffer_size",
-                             NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|llll", kwlist, &max_host_connections, &max_total_connections,
-                                     &max_idle_connections, &buffer_size)) {
+    int host_stats = 0;
+    static char *kwlist[] = {
+        "max_host_connections", "max_total_connections", "max_idle_connections", "buffer_size", "host_stats", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|llllp", kwlist, &max_host_connections, &max_total_connections,
+                                     &max_idle_connections, &buffer_size, &host_stats)) {
         return NULL;
     }
     if (buffer_size < 1024 || buffer_size > CURL_MAX_READ_SIZE) {
@@ -1857,6 +1997,8 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     }
     self->timer_id = NO_ACTIVE_TIMER_ID;
     self->buffer_size = buffer_size;
+    self->host_stats = host_stats;
+    pthread_mutex_init(&self->hosts.lock, NULL);
     self->req_in_read = self->req_in_write = -1;
     self->req_out_read = self->req_out_write = -1;
     self->stop_read = self->stop_write = -1;
@@ -1942,6 +2084,7 @@ static void EventLoop_dealloc(EventLoop *self) {
     close_fd(self->curl_easy_cleanup_read);
     close_fd(self->curl_easy_cleanup_write);
     free(self->unsent);
+    host_table_free(&self->hosts);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -2039,6 +2182,31 @@ static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { retu
 static PyObject *EventLoop_stats(EventLoop *self, PyObject *args) {
     return stats_dict(&self->stats,
                       PyLong_FromLong(atomic_load_explicit(&self->open_count.open, memory_order_relaxed)));
+}
+
+static PyObject *EventLoop_host_stats(EventLoop *self, PyObject *args) {
+    if (!self->host_stats) {
+        PyErr_SetString(PyExc_RuntimeError, "host stats are off: create the engine with host_stats=True");
+        return NULL;
+    }
+    PyObject *result = PyDict_New();
+    if (result == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&self->hosts.lock);
+    HostStats *head = self->hosts.head;
+    pthread_mutex_unlock(&self->hosts.lock);
+    for (HostStats *h = head; h != NULL; h = h->next) {
+        Py_INCREF(Py_None);
+        PyObject *stats = stats_dict(&h->stats, Py_None);
+        if (stats == NULL || PyDict_SetItemString(result, h->key, stats) == -1) {
+            Py_XDECREF(stats);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(stats);
+    }
+    return result;
 }
 
 static PyObject *EventLoop_stop(PyObject *self, PyObject *args) {
@@ -2224,6 +2392,7 @@ static PyMethodDef EventLoop_methods[] = {
     {"stop", EventLoop_stop, METH_NOARGS, "Stop the event loop"},
     {"_limiter_state", (PyCFunction)EventLoop_limiter_state, METH_NOARGS, "The limiter's counts, for tests"},
     {"stats", (PyCFunction)EventLoop_stats, METH_NOARGS, "The engine's request and connection counts"},
+    {"host_stats", (PyCFunction)EventLoop_host_stats, METH_NOARGS, "The engine's counts for each host"},
     {"get_out_fd", Eventloop_get_out_fd, METH_NOARGS, "Get the outbound file dscriptor"},
     {"get_completed", Eventloop_get_completed, METH_NOARGS, "Get the user_object, response and error"},
     {NULL, NULL, 0, NULL}};

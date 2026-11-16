@@ -1046,6 +1046,7 @@ class Engine:
         max_total_connections=0,
         max_idle_connections=1000,
         buffer_size=16384,
+        host_stats=False,
         json_dumps=_json_dumps,
         json_loads=_json_loads,
     ):
@@ -1054,7 +1055,7 @@ class Engine:
         self._loop = _no_loop
         self._lock = threading.Lock()
         self._ae_loop = _httpperf.EventLoop(
-            max_host_connections, max_total_connections, max_idle_connections, buffer_size
+            max_host_connections, max_total_connections, max_idle_connections, buffer_size, host_stats
         )
         self._closed = False
         self._thread = threading.Thread(target=self._ae_loop.main, name="httpperf-engine", daemon=True)
@@ -1062,6 +1063,9 @@ class Engine:
 
     def stats(self):
         return self._ae_loop.stats()
+
+    def host_stats(self):
+        return self._ae_loop.host_stats()
 
     def _bind(self, loop):
         with self._lock:
