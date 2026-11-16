@@ -164,6 +164,8 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
+
+Redirects follow the same rules as requests. A 303 turns any method but HEAD into a GET, and a 301 or 302 turns a POST into a GET; the body and its `Content-Type`, `Content-Length` and `Transfer-Encoding` headers are then dropped. Other redirects keep the method and body. Other headers are kept, except that `Authorization` and `auth` are dropped when the redirect leaves the origin: another scheme, host or port.
 | `discard_body` | `True` drops the response body as it arrives, for when only the status, headers or timings matter. See [Large bodies](#large-bodies). |
 | `stream` | `True` returns as soon as the headers arrive, and the body is read with `iter_content()` or `read()`. See [Large bodies](#large-bodies). |
 
@@ -211,7 +213,7 @@ with open("big.iso", "rb") as f:
 - httpperf reads ahead up to 1 MB. When the source falls behind, curl pauses that transfer until there is more to send; that time is in `r.paused_time` too.
 - An exception from the source, such as a failing `read()`, stops the transfer and is raised from the request.
 - A streamed upload is never sent twice. If a reused connection turns out to have been closed by the server, the request raises `RequestError`, and it's up to the caller to retry (see below). Bodies given as `bytes` are resent by curl, which it does for any request whose reused connection had closed.
-- A 307 or 308 redirect sends the body again: a seekable file is rewound to where it started, and anything else raises `RequestError`.
+- A redirect that keeps the body (see [Request arguments](#request-arguments)) sends it again: a seekable file is rewound to where it started, and anything else raises `RequestError`.
 
 To retry a streamed upload, open the source again for each attempt:
 

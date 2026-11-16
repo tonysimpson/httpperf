@@ -196,6 +196,21 @@ def _has_header(name, headers, headers_list):
     return bool(headers_list) and any(line.partition(":")[0].strip().lower() == name for line in headers_list)
 
 
+def _without_headers(header_tuple, names):
+    kept = tuple(line for line in header_tuple or () if line.partition(":")[0].strip().lower() not in names)
+    return kept or None
+
+
+def _origin(url):
+    parts = urlparse(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    return scheme, parts.hostname, port or {"http": 80, "https": 443}.get(scheme)
+
+
 def _form_quote(value):
     return value.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A").encode("utf-8")
 
@@ -990,11 +1005,15 @@ class Session:
                 raise RequestError("Max Redirects")
             if stream:
                 await response.read()
-            if response.status_code in {301, 302, 303}:
+            status = response.status_code
+            if _origin(response.redirect_url) != _origin(url) or _origin(url) is None:
+                header_tuple = _without_headers(header_tuple, ("authorization",))
+                auth = None
+            if (status == 303 and method.upper() != "HEAD") or (status in {301, 302} and method.upper() == "POST"):
                 redir_response = await self._request(
                     "GET",
                     response.redirect_url,
-                    header_tuple,
+                    _without_headers(header_tuple, ("content-type", "content-length", "transfer-encoding")),
                     None,
                     auth,
                     None,
