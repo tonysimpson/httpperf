@@ -338,7 +338,7 @@ Differences from websockets:
 - HTTP/1.1 only. curl doesn't do WebSockets over HTTP/2 or HTTP/3.
 - No sync client, no reconnecting `async for ws in connect(...)`, and no server.
 - Needs libcurl 8.16 or later with WebSocket support, which the wheels have. `httpperf._httpperf.websockets` is 1 when it's available; otherwise `connect()` raises `RuntimeError`.
-- curl masks outgoing data one byte at a time, so sending large messages is slow (about 0.3 GB/s for each connection); receiving is fast.
+- curl before 8.24 masks outgoing data one byte at a time, so sending large messages is slow (about 0.3 GB/s for each connection). The wheels bundle 8.23 with curl's fix applied (about 5 GB/s); against your own curl, you need 8.24 or later.
 
 ## Timings
 

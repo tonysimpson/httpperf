@@ -3,6 +3,7 @@ import base64
 import gc
 import hashlib
 import json
+import os
 import socket
 import ssl
 import subprocess
@@ -136,6 +137,14 @@ async def test_a_large_message_is_echoed(ws_url):
     async with websockets.connect(ws_url, max_size=None) as ws:
         await ws.send(b"x" * 3_000_000)
         assert await ws.recv() == b"x" * 3_000_000
+
+
+async def test_messages_of_awkward_sizes_are_echoed_intact(ws_url):
+    messages = [os.urandom(n) for n in (1, 7, 9, 1023, 1025, 65_537, 1_000_003)]
+    async with websockets.connect(ws_url, max_size=None) as ws:
+        for message in messages:
+            await ws.send(message)
+        assert [await ws.recv() for _ in messages] == messages
 
 
 async def test_fragments_arrive_as_one_message(ws_url):
