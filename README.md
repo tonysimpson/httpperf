@@ -300,6 +300,19 @@ async with websockets.connect("wss://example.com/stream", additional_headers={"A
 
 `connect()` can also be awaited: `ws = await websockets.connect(url)`, then `await ws.close()`.
 
+### WebSockets on a session
+
+By default each connection gets its own session on the event loop's default engine. Pass `session=` to open it on a session of your own instead. It then uses that session's engine, its cookies, its client certificate and `verify`, and its `connect_timeout`; the session's request timeout doesn't apply, so the connection can stay open. A common use is logging in over HTTP and then opening WebSockets with the cookies that set:
+
+```python
+async with httpperf.Session() as session:
+    await session.post("https://example.com/login", data={"user": "u", "password": "p"})
+    async with websockets.connect("wss://example.com/stream", session=session) as ws:
+        ...
+```
+
+A WebSocket holds its connection for as long as it's open, and that connection counts towards the engine's and session's connection limits. With `max_host_connections=10`, ten open WebSockets to a host leave no room for HTTP requests to it, which then wait. The handshake may reuse an idle HTTP/1.1 connection from the pool, but once upgraded the connection belongs to the WebSocket and is closed with it. In `stats()`, an open WebSocket shows as `running`; its request, connection and bytes are counted when it closes.
+
 | `connect()` argument | Meaning |
 |---|---|
 | `additional_headers` | Headers for the handshake: a dict or list of pairs. |
@@ -312,7 +325,7 @@ async with websockets.connect("wss://example.com/stream", additional_headers={"A
 | `close_timeout` | Seconds to wait for the server's close frame after `close()` (default 10). |
 | `max_size` | Largest message accepted, in bytes (default 1 MiB, `None` for no limit). A larger one closes the connection with 1009. |
 | `max_queue` | Messages kept waiting for `recv()` (default 16) before reading from the server pauses. |
-| `session` | An httpperf `Session` to use, sharing its engine. By default each connection has its own session. |
+| `session` | An httpperf `Session` to open the connection on: see [WebSockets on a session](#websockets-on-a-session). By default each connection has its own session. |
 | `compression`, `logger` | Accepted for compatibility and ignored: see below. |
 
 The connection has `send()`, `recv()`, `close(code=1000, reason="")`, `wait_closed()`, `ping()` (returns a waiter that gives the round-trip time when the pong arrives), `pong()`, and the attributes `latency`, `close_code`, `close_reason`, `subprotocol` and `response` (the handshake `Response`).
