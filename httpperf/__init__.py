@@ -13,7 +13,7 @@ import threading
 import time
 import warnings
 import weakref
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from httpperf import _httpperf
 from httpperf.version import __version__ as __version__
@@ -461,7 +461,12 @@ class Response:
     @property
     def redirect_url(self):
         if self._redirect_url is _UNSET:
-            self._redirect_url = self._resp.get_redirect_url()
+            if self._stream:
+                location = self.headers.get("location")
+                is_redirect = location is not None and 300 <= self.status_code < 400
+                self._redirect_url = urljoin(self.url, location) if is_redirect else None
+            else:
+                self._redirect_url = self._resp.get_redirect_url()
         return self._redirect_url
 
     @property
