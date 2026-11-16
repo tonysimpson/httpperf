@@ -1769,9 +1769,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         if (rd->ca_file != NULL) {
             curl_easy_setopt(rd->curl, CURLOPT_CAINFO, rd->ca_file);
         }
-        if (rd->ca_path != NULL) {
-            curl_easy_setopt(rd->curl, CURLOPT_CAPATH, rd->ca_path);
-        }
+        curl_easy_setopt(rd->curl, CURLOPT_CAPATH, rd->ca_path);
     } else {
         curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(rd->curl, CURLOPT_SSL_VERIFYHOST, 0L);

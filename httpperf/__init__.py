@@ -760,7 +760,7 @@ class Session:
         max_host_connections=0,
         max_connections=0,
         cert=None,
-        verify=False,
+        verify=True,
         timeout=None,
         connect_timeout=None,
         json_dumps=None,

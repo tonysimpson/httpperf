@@ -61,6 +61,15 @@ def test_an_error_status_is_an_error(capsys, httpbin):
     assert {e["error"] for e in steps[0]["error_kinds"]} == {"HTTP 503"}
 
 
+def test_an_unverified_certificate_is_an_error(capsys, httpbin_secure):
+    assert main([*QUICK, httpbin_secure.url + "/get"]) == 1
+
+
+def test_insecure_skips_the_certificate_check(capsys, httpbin_secure):
+    _, steps = run(capsys, "-k", httpbin_secure.url + "/get")
+    assert steps[0]["errors"] == 0
+
+
 def test_errors_set_the_exit_status(capsys, httpbin):
     assert run(capsys, httpbin.url + "/status/503")[0] == 1
 

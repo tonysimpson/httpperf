@@ -41,8 +41,8 @@ def tls_url():
 
 async def resumed(url, tls):
     async with httpperf.Engine() as engine:
-        await httpperf.Session(engine=engine, connections="session", tls=tls).get(url)
-        r = await httpperf.Session(engine=engine, connections="session", tls=tls).get(url)
+        await httpperf.Session(engine=engine, connections="session", tls=tls, verify=CA).get(url)
+        r = await httpperf.Session(engine=engine, connections="session", tls=tls, verify=CA).get(url)
     return r.text == "True"
 
 
@@ -109,14 +109,14 @@ async def who(session, url, **options):
 
 async def test_each_session_presents_its_own_certificate(mtls_url, client_certs):
     async with httpperf.Engine() as engine:
-        user1 = httpperf.Session(engine=engine, cert=client_certs["user1"])
-        user2 = httpperf.Session(engine=engine, cert=client_certs["user2"])
+        user1 = httpperf.Session(engine=engine, cert=client_certs["user1"], verify=CA)
+        user2 = httpperf.Session(engine=engine, cert=client_certs["user2"], verify=CA)
         names = [await who(s, mtls_url) for s in (user1, user2, user1, user2)]
     assert names == ["user1", "user2", "user1", "user2"]
 
 
 async def test_a_request_certificate_overrides_the_sessions(mtls_url, client_certs):
-    async with httpperf.Session(cert=client_certs["user1"]) as s:
+    async with httpperf.Session(cert=client_certs["user1"], verify=CA) as s:
         assert await who(s, mtls_url, cert=client_certs["user2"]) == "user2"
 
 
@@ -139,6 +139,12 @@ async def verified(url, session_verify, **options):
         except httpperf.RequestError:
             return False
     return True
+
+
+async def test_verify_is_the_default(tls_url):
+    async with httpperf.Session() as s:
+        with pytest.raises(httpperf.RequestError):
+            await s.get(tls_url)
 
 
 @pytest.mark.parametrize(
