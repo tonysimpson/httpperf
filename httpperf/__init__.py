@@ -4,6 +4,7 @@ import datetime
 import email.utils
 import functools
 import http
+import io
 import json as _json
 import os
 import ssl
@@ -211,6 +212,14 @@ def _origin(url):
     return scheme, parts.hostname, port or {"http": 80, "https": 443}.get(scheme)
 
 
+def _header_value(name, header_tuple):
+    for line in header_tuple or ():
+        key, _, value = line.partition(":")
+        if key.strip().lower() == name:
+            return value
+    return None
+
+
 def _form_quote(value):
     return value.replace('"', "%22").replace("\r", "%0D").replace("\n", "%0A").encode("utf-8")
 
@@ -225,10 +234,18 @@ def _as_bytes(value):
     return str(value).encode("utf-8")
 
 
+def _fields(fields):
+    for name, value in fields.items() if isinstance(fields, dict) else fields or ():
+        if isinstance(value, (list, tuple)):
+            value = [v for v in value if v is not None]
+        if value is not None:
+            yield name, value
+
+
 def _multipart(data, files):
     boundary = os.urandom(16).hex().encode()
     parts = []
-    for name, value in data.items() if isinstance(data, dict) else data or ():
+    for name, value in _fields(data):
         parts += [b"--", boundary, b'\r\nContent-Disposition: form-data; name="', _form_quote(name), b'"\r\n\r\n']
         parts += [_as_bytes(value), b"\r\n"]
     for name, value in files.items() if isinstance(files, dict) else files:
@@ -238,7 +255,8 @@ def _multipart(data, files):
             if len(value) > 2:
                 content_type = value[2]
         else:
-            filename, content = os.path.basename(getattr(value, "name", None) or name), value
+            filename = getattr(value, "name", None)
+            filename, content = os.path.basename(filename if isinstance(filename, str) else name), value
         parts += [b"--", boundary, b'\r\nContent-Disposition: form-data; name="', _form_quote(name)]
         parts += [b'"; filename="', _form_quote(filename), b'"\r\nContent-Type: ', content_type.encode("latin-1")]
         parts += [b"\r\n\r\n", _as_bytes(content), b"\r\n"]
@@ -697,12 +715,24 @@ def _upload_source(data):
     return data
 
 
-def _upload_size(source):
+def _upload_size(source, header_tuple):
+    length = _header_value("content-length", header_tuple)
+    if length is not None and length.strip().isdigit():
+        return int(length)
     try:
         st = os.fstat(source.fileno())
         return st.st_size - source.tell() if stat.S_ISREG(st.st_mode) else -1
     except (AttributeError, OSError, ValueError):
-        return -1
+        pass
+    try:
+        if isinstance(source, io.BufferedIOBase) and source.seekable():
+            start = source.tell()
+            end = source.seek(0, os.SEEK_END)
+            source.seek(start)
+            return end - start
+    except (OSError, ValueError):
+        pass
+    return -1
 
 
 def _upload_start(source):
@@ -897,7 +927,7 @@ class Session:
                 options["connect_timeout"] = connect_timeout
         if params:
             base, hash_, fragment = url.partition("#")
-            query = params if isinstance(params, str) else urlencode(params, doseq=True)
+            query = params if isinstance(params, str) else urlencode(list(_fields(params)), doseq=True)
             url = base + ("&" if "?" in base else "?") + query + hash_ + fragment
 
         content_type = None
@@ -909,14 +939,16 @@ class Session:
         elif files is not None:
             data, content_type = _multipart(data, files)
         elif isinstance(data, (dict, list, tuple)):
-            data = urlencode(data, doseq=True)
+            data = urlencode(list(_fields(data)), doseq=True)
             content_type = "application/x-www-form-urlencoded"
         if content_type is not None and not _has_header("content-type", headers, headers_list):
             headers_list = list(headers_list) if headers_list else []
             headers_list.append("Content-Type: " + content_type)
 
         if headers:
-            headers_list = list(headers_list or ()) + ["%s: %s" % i for i in headers.items()]
+            headers_list = list(headers_list or ()) + ["%s: %s" % i for i in headers.items() if i[1] is not None]
+        if data is None and method.upper() in {"POST", "PUT", "PATCH"}:
+            data = b""
 
         if cookies:
             cookie_list = list(cookie_list or ()) + [session_cookie_for_url(url, k, v) for k, v in cookies.items()]
@@ -956,7 +988,7 @@ class Session:
         call_options = options
         if source is not None:
             upload_start = _upload_start(source)
-            call_options = dict(options, upload_size=_upload_size(source))
+            call_options = dict(options, upload_size=_upload_size(source, header_tuple))
         if data is not None and not _has_header("expect", None, header_tuple):
             header_tuple = (header_tuple or ()) + ("Expect:",)
 

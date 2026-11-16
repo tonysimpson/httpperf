@@ -99,6 +99,67 @@ class Server:
         threading.Thread(target=self.httpd.serve_forever, args=(0.01,), daemon=True).start()
 
 
+class Wire:
+    def __init__(self):
+        self.requests = []
+        self.reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.url = "http://127.0.0.1:%d" % self.sock.getsockname()[1]
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+    def handle(self, conn):
+        data = b""
+        with conn:
+            while True:
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        return
+                    data += chunk
+                head, _, data = data.partition(b"\r\n\r\n")
+                lines = head.lower().split(b"\r\n")
+                length = next((int(line[15:]) for line in lines if line.startswith(b"content-length:")), 0)
+                end = b"0\r\n\r\n" if b"transfer-encoding: chunked" in lines else None
+                while (end is not None and end not in data) or (end is None and len(data) < length):
+                    data += conn.recv(65536)
+                size = data.index(end) + len(end) if end is not None else length
+                self.requests.append((head, data[:size]))
+                data = data[size:]
+                conn.sendall(self.reply)
+
+    def head(self):
+        return self.requests[-1][0].decode("latin-1")
+
+    def body(self):
+        body = self.requests[-1][1]
+        if "transfer-encoding: chunked" not in self.head().lower():
+            return body
+        decoded = b""
+        while True:
+            size, _, body = body.partition(b"\r\n")
+            if int(size, 16) == 0:
+                return decoded
+            decoded, body = decoded + body[: int(size, 16)], body[int(size, 16) + 2 :]
+
+    def target(self):
+        return self.head().split(" ")[1]
+
+
+@pytest.fixture
+def wire():
+    w = Wire()
+    yield w
+    w.sock.close()
+
+
 @pytest.fixture
 def make_server():
     servers = []

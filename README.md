@@ -150,13 +150,13 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 
 | Argument | Meaning |
 |---|---|
-| `params` | Query parameters: a dict or list of pairs (lists as values repeat the key), or a ready-made string. Added to any query already in the URL. |
-| `headers` | Dict of headers. |
+| `params` | Query parameters: a dict or list of pairs (lists as values repeat the key), or a ready-made string. Added to any query already in the URL. `None` values are left out. |
+| `headers` | Dict of headers. `None` values are left out. |
 | `headers_list` | List of `"Name: value"` strings, for repeated headers. |
 | `cookies` | Dict of cookies to send with this request (added to the session jar). |
 | `cookie_list` | List of `Cookie` objects. |
 | `auth` | `(username, password)` for basic auth. |
-| `data` | Request body: `str` or `bytes` as is, with no `Content-Type` unless you set one, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it. A file, or another iterable of `bytes` (sync or async), is streamed: see [Large bodies](#large-bodies). |
+| `data` | Request body: `str` or `bytes` as is, with no `Content-Type` unless you set one, or a dict or list of pairs, form-encoded with `Content-Type: application/x-www-form-urlencoded` unless you set it, leaving out `None` values. A POST, PUT or PATCH without a body sends `Content-Length: 0`. A file, or another iterable of `bytes` (sync or async), is streamed: see [Large bodies](#large-bodies). |
 | `json` | Object to send as JSON, encoded with the session's `json_dumps`. Sets `Content-Type: application/json` unless you set it. |
 | `files` | Dict (or list of pairs) of files to send as `multipart/form-data`, with any `data` dict as extra fields. A value is an open file, or `(filename, content)` or `(filename, content, content_type)`, where content is `bytes`, `str` or a file. Files are read into memory. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
@@ -209,7 +209,7 @@ with open("big.iso", "rb") as f:
     r = await session.put(url, data=f)
 ```
 
-- A regular file is sent with a `Content-Length`. Anything else is sent chunked (on HTTP/1.1).
+- A regular file or a `BytesIO` is sent with a `Content-Length`, as is anything when you set a `Content-Length` header. Anything else is sent chunked (on HTTP/1.1).
 - httpperf reads ahead up to 1 MB. When the source falls behind, curl pauses that transfer until there is more to send; that time is in `r.paused_time` too.
 - An exception from the source, such as a failing `read()`, stops the transfer and is raised from the request.
 - A streamed upload is never sent twice. If a reused connection turns out to have been closed by the server, the request raises `RequestError`, and it's up to the caller to retry (see below). Bodies given as `bytes` are resent by curl, which it does for any request whose reused connection had closed.
