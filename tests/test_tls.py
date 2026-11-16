@@ -235,3 +235,23 @@ async def test_verify_with_ssl_cert_dir(tls_url, monkeypatch, tmp_path):
     monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
     monkeypatch.setattr(httpperf, "_ca", httpperf._find_ca())
     assert await verified(tls_url, True)
+
+
+async def test_a_request_can_verify_against_ca_certificates_as_bytes(tls_url):
+    with open(CA, "rb") as f:
+        pem = f.read()
+    async with httpperf.Session() as s:
+        assert (await s.get(tls_url, verify=pem)).status_code == 200
+
+
+async def test_a_session_can_verify_against_ca_certificates_as_bytes(tls_url):
+    with open(CA, "rb") as f:
+        pem = f.read()
+    async with httpperf.Session(verify=pem) as s:
+        assert (await s.get(tls_url)).status_code == 200
+
+
+async def test_empty_ca_certificates_as_bytes_trust_nothing(tls_url):
+    async with httpperf.Session(verify=b"") as s:
+        with pytest.raises(httpperf.RequestError):
+            await s.get(tls_url)

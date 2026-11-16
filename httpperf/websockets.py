@@ -215,6 +215,8 @@ class ClientConnection:
         self._messages = asyncio.Queue(max_queue or 0)
         self._send_lock = asyncio.Lock()
         self._pings = {}
+        self._pongs = set()
+        self._linger = None
         self._rcvd = None
         self._sent = None
         self._closed = loop.create_future()
@@ -371,6 +373,10 @@ class ClientConnection:
                     if flags & FINAL:
                         await self._received_close(b"".join(parts))
                         parts = []
+                elif flags & PING and flags & FINAL:
+                    task = asyncio.get_running_loop().create_task(self._auto_pong(chunk))
+                    self._pongs.add(task)
+                    task.add_done_callback(self._pongs.discard)
                 elif flags & PONG and flags & FINAL:
                     self._received_pong(chunk)
             del buffer[:offset]
@@ -387,6 +393,14 @@ class ClientConnection:
                 await self._send_close(code, reason)
             except ConnectionClosed:
                 pass
+        if self._close_timeout is not None:
+            self._linger = asyncio.get_running_loop().call_later(self._close_timeout, self.response.close)
+
+    async def _auto_pong(self, data):
+        try:
+            await self._send_frame(PONG, data)
+        except ConnectionClosed:
+            pass
 
     def _received_pong(self, data):
         if data not in self._pings:
@@ -428,6 +442,8 @@ class ClientConnection:
             return
         self._closed.set_result(None)
         self.response.close()
+        if self._linger is not None:
+            self._linger.cancel()
         if self._keepalive is not None and self._keepalive is not asyncio.current_task():
             self._keepalive.cancel()
         error = _closed(self._rcvd, self._sent)

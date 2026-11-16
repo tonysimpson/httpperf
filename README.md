@@ -95,7 +95,7 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 | `cert` | `None` | `(certfile, keyfile)` paths for a client certificate, used by every request unless the request overrides it. |
 | `timeout` | `None` | Seconds allowed for each request, from the start of the transfer to the last byte (each redirect hop separately). `None` or 0 means no limit. Cancelling the task (or `asyncio.wait_for`) also stops the transfer and frees its connection slot; on HTTP/1.1 that closes the connection, on HTTP/2 and HTTP/3 it resets only that stream. |
 | `connect_timeout` | `None` | Seconds allowed to connect, TLS included. `None` means curl's default of 300 s. |
-| `verify` | `True` | Server certificate checking. `False`: none, for test servers with self-signed certificates. `True`: check against the system CAs, from the first of: `SSL_CERT_FILE` and `SSL_CERT_DIR`, if set and present; libcurl's own default bundle, if present; Python's default bundle (`ssl.get_default_verify_paths()`); the usual system locations. A path: check against that CA bundle. Requests can override it. |
+| `verify` | `True` | Server certificate checking. `False`: none, for test servers with self-signed certificates. `True`: check against the system CAs, from the first of: `SSL_CERT_FILE` and `SSL_CERT_DIR`, if set and present; libcurl's own default bundle, if present; Python's default bundle (`ssl.get_default_verify_paths()`); the usual system locations. A path: check against that CA bundle. Bytes: check against the PEM CA certificates they hold, for certificates kept in memory or a secret store. Requests can override it. |
 | `json_dumps` | `None` | Function that turns a `json=` argument into the request body (`str` or `bytes`). `None` means the engine's. |
 | `json_loads` | `None` | Function that turns the response body (`bytes`) into the result of `json()`. `None` means the engine's. |
 
@@ -160,7 +160,7 @@ Each engine has its own connections and limits. On 4 cores against a local serve
 | `json` | Object to send as JSON, encoded with the session's `json_dumps`. Sets `Content-Type: application/json` unless you set it. |
 | `files` | Dict (or list of pairs) of files to send as `multipart/form-data`, with any `data` dict as extra fields. A value is an open file, or `(filename, content)` or `(filename, content, content_type)`, where content is `bytes`, `str` or a file. Files are read into memory. |
 | `cert` | `(certfile, keyfile)`, overriding the session's certificate. |
-| `verify` | `True`, `False` or a CA bundle path, overriding the session's `verify`. |
+| `verify` | `True`, `False`, a CA bundle path or PEM CA certificates as bytes, overriding the session's `verify`. |
 | `timeout`, `connect_timeout` | Override the session's. `timeout=0` removes the session's limit for this request. |
 | `allow_redirects` | Follow redirects (default `True`; `False` for `head`). |
 | `max_redirects` | Default 5. Raises `RequestError("Max Redirects")` beyond it. |
@@ -319,10 +319,10 @@ A WebSocket holds its connection for as long as it's open, and that connection c
 | `subprotocols` | Subprotocols to offer; the one chosen is `ws.subprotocol`. |
 | `origin`, `user_agent_header` | `Origin` and `User-Agent` headers. |
 | `ssl` | An `ssl.SSLContext`. Its CA certificates and whether it checks certificates are used; anything else in it, such as a client certificate, isn't. |
-| `verify` | As for a session: `True`, `False` or a CA bundle path. The default checks certificates. |
+| `verify` | As for a session: `True`, `False`, a CA bundle path or PEM CA certificates as bytes. The default checks certificates. |
 | `open_timeout` | Seconds allowed for the connection and handshake (default 10). Raises `TimeoutError`. |
-| `ping_interval`, `ping_timeout` | Keepalive: a ping every 20 s, and the connection is closed with 1011 if its pong takes over 20 s. `None` turns either off. |
-| `close_timeout` | Seconds to wait for the server's close frame after `close()` (default 10). |
+| `ping_interval`, `ping_timeout` | Keepalive: a ping every 20 s, and the connection is closed with 1011 if its pong takes over 20 s. `None` turns either off. The server's pings are always answered. |
+| `close_timeout` | Seconds to wait for the closing handshake to finish (default 10): for the server's close frame after `close()`, and for the server to drop the connection after it closes. Then the connection is dropped. |
 | `max_size` | Largest message accepted, in bytes (default 1 MiB, `None` for no limit). A larger one closes the connection with 1009. |
 | `max_queue` | Messages kept waiting for `recv()` (default 16) before reading from the server pauses. |
 | `session` | An httpperf `Session` to open the connection on: see [WebSockets on a session](#websockets-on-a-session). By default each connection has its own session. |
@@ -330,7 +330,7 @@ A WebSocket holds its connection for as long as it's open, and that connection c
 
 The connection has `send()`, `recv()`, `close(code=1000, reason="")`, `wait_closed()`, `ping()` (returns a waiter that gives the round-trip time when the pong arrives), `pong()`, and the attributes `latency`, `close_code`, `close_reason`, `subprotocol` and `response` (the handshake `Response`).
 
-The exceptions have the same names and meanings as in websockets: `WebSocketException`, `ConnectionClosed` with `ConnectionClosedOK` (both sides closed with 1000, 1001 or no code) and `ConnectionClosedError` (anything else, including a dropped connection), `InvalidHandshake`, `InvalidStatus` (the server refused the upgrade; `response` is its response) and `InvalidURI`. A failure to connect raises `httpperf.RequestError`.
+The exceptions have the same names and meanings as in websockets: `WebSocketException`, `ConnectionClosed` with `ConnectionClosedOK` (both sides closed with 1000, 1001 or no code) and `ConnectionClosedError` (anything else, including a dropped connection), `InvalidHandshake`, `InvalidStatus` (the server refused the upgrade; `response` is its response) and `InvalidURI`. A failure to connect raises `httpperf.RequestError`. `ConnectionClosed` has `rcvd` and `sent`, the close frames received and sent (each a `Close` with `code` and `reason`, or `None`), and `code` and `reason` from the frame received (1006 and "" if none was).
 
 Differences from websockets:
 

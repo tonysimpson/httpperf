@@ -1856,6 +1856,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(rd->curl, CURLOPT_READFUNCTION, ws_read);
         curl_easy_setopt(rd->curl, CURLOPT_READDATA, rd);
+        curl_easy_setopt(rd->curl, CURLOPT_WS_OPTIONS, CURLWS_NOAUTOPONG);
 #endif
     } else if (rd->upload != NULL) {
         curl_easy_setopt(rd->curl, CURLOPT_POST, 1L);
