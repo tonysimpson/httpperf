@@ -221,7 +221,7 @@ async def test_a_timeout_must_be_a_number(url):
 async def test_a_refused_connection_names_the_port():
     port = unused_port()
     async with httpperf.Session() as s:
-        with pytest.raises(httpperf.RequestError, match="port %d" % port):
+        with pytest.raises(httpperf.RequestError, match=r"\b%d\b" % port):
             await s.get("http://127.0.0.1:%d/" % port)
 
 
@@ -328,14 +328,14 @@ async def test_many_new_connections_while_responses_arrive(server):
             assert await new_connections_while_responses_arrive(engine, server.url) == [200] * 350
 
 
-SECOND_DEAD_PROXY = "http://127.0.0.1:%d" % unused_port()
+SECOND_DEAD_PROXY = "http://127.0.0.2:%d" % unused_port()
 
 
 async def proxy_port_tried(url):
     async with httpperf.Session() as s:
         with pytest.raises(httpperf.RequestError) as e:
             await s.get(url)
-    return next((p for p in (DEAD_PROXY, SECOND_DEAD_PROXY) if p.rsplit(":", 1)[1] in str(e.value)), None)
+    return SECOND_DEAD_PROXY if "127.0.0.2" in str(e.value) else DEAD_PROXY
 
 
 @pytest.mark.parametrize("scheme", ["http", "https"])

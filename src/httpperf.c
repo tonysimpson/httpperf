@@ -1720,7 +1720,11 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_FORBID_REUSE, 1L);
     }
     curl_easy_setopt(rd->curl, CURLOPT_HTTP_VERSION, rd->session->http_version);
-    curl_easy_setopt(rd->curl, CURLOPT_MAXAGE_CONN, rd->session->idle_timeout);
+    if (rd->session->idle_timeout > 0) {
+        curl_easy_setopt(rd->curl, CURLOPT_MAXAGE_CONN, rd->session->idle_timeout);
+    } else {
+        curl_easy_setopt(rd->curl, CURLOPT_FORBID_REUSE, 1L);
+    }
     curl_easy_setopt(rd->curl, CURLOPT_MAXLIFETIME_CONN, rd->session->max_connection_age);
     if (rd->session->http_version != CURL_HTTP_VERSION_1_1 && strncasecmp(rd->url, "https:", 6) == 0) {
         curl_easy_setopt(rd->curl, CURLOPT_PIPEWAIT, 1L);

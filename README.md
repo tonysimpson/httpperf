@@ -88,7 +88,7 @@ All arguments are keyword-only. A session can be created anywhere, even outside 
 | `connections` | `"shared"` | `"shared"`: the engine's pool. `"session"`: the session's own pool. `"none"`: a new connection for every request. |
 | `tls` | `"shared"` | Where TLS session tickets are kept. `"shared"`: in the engine, so new connections resume their handshake. `"session"`: per session, so each session starts with a full handshake. |
 | `http_version` | `"HTTP/2"` | `"HTTP/2"`: HTTP/2 over TLS when the server offers it, with requests waiting to share one multiplexed connection. Plain http uses HTTP/1.1. `"HTTP/1.1"`: HTTP/1.1 only. `"HTTP/3"`: HTTP/3 over QUIC only, with no fallback, so requests fail if the server does not offer it. |
-| `idle_timeout` | `118` | Seconds a connection may sit idle and still be reused. |
+| `idle_timeout` | `118` | Seconds a connection may sit idle and still be reused. 0 means connections are never reused. |
 | `max_connection_age` | `0` | Seconds after which a connection is no longer reused, however busy it is. 0 means no limit. |
 | `max_host_connections` | `0` | Per-session cap on connections per host. Needs `connections="session"` or `"none"`. |
 | `max_connections` | `0` | Per-session cap on connections in use. Needs `connections="session"` or `"none"`. |
