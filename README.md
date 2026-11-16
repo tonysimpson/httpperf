@@ -284,6 +284,49 @@ Things to know:
 - To get real `dict`s and `list`s from simdjson, use `json_loads=lambda body: parser.parse(body, True)`.
 - Request bodies that never change can be encoded once and sent as `data=`, with `headers={"Content-Type": "application/json"}`.
 
+## WebSockets
+
+`httpperf.websockets` follows the asyncio API of the [websockets](https://websockets.readthedocs.io/) library, so most code only needs a different import:
+
+```python
+from httpperf import websockets
+
+async with websockets.connect("wss://example.com/stream", additional_headers={"Authorization": "Bearer x"}) as ws:
+    await ws.send("hello")  # str is sent as text, bytes as binary, an iterable as fragments
+    message = await ws.recv()
+    async for message in ws:  # ends when the server closes normally
+        ...
+```
+
+`connect()` can also be awaited: `ws = await websockets.connect(url)`, then `await ws.close()`.
+
+| `connect()` argument | Meaning |
+|---|---|
+| `additional_headers` | Headers for the handshake: a dict or list of pairs. |
+| `subprotocols` | Subprotocols to offer; the one chosen is `ws.subprotocol`. |
+| `origin`, `user_agent_header` | `Origin` and `User-Agent` headers. |
+| `ssl` | An `ssl.SSLContext`. Its CA certificates and whether it checks certificates are used; anything else in it, such as a client certificate, isn't. |
+| `verify` | As for a session: `True`, `False` or a CA bundle path. The default checks certificates. |
+| `open_timeout` | Seconds allowed for the connection and handshake (default 10). Raises `TimeoutError`. |
+| `ping_interval`, `ping_timeout` | Keepalive: a ping every 20 s, and the connection is closed with 1011 if its pong takes over 20 s. `None` turns either off. |
+| `close_timeout` | Seconds to wait for the server's close frame after `close()` (default 10). |
+| `max_size` | Largest message accepted, in bytes (default 1 MiB, `None` for no limit). A larger one closes the connection with 1009. |
+| `max_queue` | Messages kept waiting for `recv()` (default 16) before reading from the server pauses. |
+| `session` | An httpperf `Session` to use, sharing its engine. By default each connection has its own session. |
+| `compression`, `logger` | Accepted for compatibility and ignored: see below. |
+
+The connection has `send()`, `recv()`, `close(code=1000, reason="")`, `wait_closed()`, `ping()` (returns a waiter that gives the round-trip time when the pong arrives), `pong()`, and the attributes `latency`, `close_code`, `close_reason`, `subprotocol` and `response` (the handshake `Response`).
+
+The exceptions have the same names and meanings as in websockets: `WebSocketException`, `ConnectionClosed` with `ConnectionClosedOK` (both sides closed with 1000, 1001 or no code) and `ConnectionClosedError` (anything else, including a dropped connection), `InvalidHandshake`, `InvalidStatus` (the server refused the upgrade; `response` is its response) and `InvalidURI`. A failure to connect raises `httpperf.RequestError`.
+
+Differences from websockets:
+
+- No compression. curl doesn't support WebSocket extensions, so `permessage-deflate` isn't offered, whatever `compression` says. Servers that require it refuse the connection.
+- HTTP/1.1 only. curl doesn't do WebSockets over HTTP/2 or HTTP/3.
+- No sync client, no reconnecting `async for ws in connect(...)`, and no server.
+- Needs libcurl 8.16 or later with WebSocket support, which the wheels have. `httpperf._httpperf.websockets` is 1 when it's available; otherwise `connect()` raises `RuntimeError`.
+- curl masks outgoing data one byte at a time, so sending large messages is slow (about 0.3 GB/s for each connection); receiving is fast.
+
 ## Timings
 
 All in seconds.

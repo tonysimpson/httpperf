@@ -46,6 +46,7 @@ dev = [
     "pytest-httpbin",
     "pytest-timeout",
     "ruff",
+    "websockets",
 ]
 http3 = ["aioquic"]
 

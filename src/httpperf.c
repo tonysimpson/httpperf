@@ -343,6 +343,11 @@ static PyObject *buffer_to_bytes(Buffer *b, PyObject **cache) {
 
 #define STREAM_BUFFER (1024 * 1024)
 
+#if LIBCURL_VERSION_NUM >= 0x081000
+#define HAVE_WEBSOCKETS 1
+#endif
+#define WS_FINAL 0x80000000u
+
 enum { MSG_DONE, MSG_HEADERS, MSG_WAKE, MSG_UPLOAD_WAKE };
 enum { MSG_CANCEL = 1, MSG_RESUME = 2, MSG_RESUME_UPLOAD = 3 };
 
@@ -397,6 +402,7 @@ typedef struct Upload {
     bool done;
     bool paused;
     bool want_wake;
+    curl_off_t frame_left;
     PyObject *waiter;
     struct AcRequestData *rd;
     EventLoop *loop;
@@ -468,6 +474,9 @@ typedef struct AcRequestData {
     Stream *stream;
     Upload *upload;
     curl_off_t upload_size;
+    bool websocket;
+    char *ca_blob;
+    size_t ca_blob_len;
     bool headers_sent;
     bool delivered;
     HostSlot *slot;
@@ -1562,7 +1571,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     if (rd->stream != NULL && ((n == 2 && ptr[0] == '\r') || (n == 1 && ptr[0] == '\n'))) {
         long code = 0;
         curl_easy_getinfo(rd->curl, CURLINFO_RESPONSE_CODE, &code);
-        if (code >= 200) {
+        if (code >= 200 || (rd->websocket && code == 101)) {
             rd->headers_sent = true;
             send_message(rd->session->loop, rd, MSG_HEADERS);
         }
@@ -1570,7 +1579,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
     return n;
 }
 
-static size_t stream_write(AcRequestData *rd, char *ptr, size_t n) {
+static size_t stream_write(AcRequestData *rd, const void *prefix, size_t prefix_len, char *ptr, size_t n) {
     Stream *s = rd->stream;
     pthread_mutex_lock(&s->lock);
     if (s->buf.len >= STREAM_BUFFER) {
@@ -1581,7 +1590,8 @@ static size_t stream_write(AcRequestData *rd, char *ptr, size_t n) {
         pthread_mutex_unlock(&s->lock);
         return CURL_WRITEFUNC_PAUSE;
     }
-    bool ok = buffer_append(&s->buf, ptr, n, STREAM_BUFFER);
+    bool ok = (prefix_len == 0 || buffer_append(&s->buf, prefix, prefix_len, STREAM_BUFFER)) &&
+              buffer_append(&s->buf, ptr, n, STREAM_BUFFER);
     bool wake = s->want_wake;
     s->want_wake = false;
     pthread_mutex_unlock(&s->lock);
@@ -1599,8 +1609,16 @@ size_t body_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     if (rd->discard_body) {
         return n;
     }
+#ifdef HAVE_WEBSOCKETS
+    if (rd->websocket) {
+        const struct curl_ws_frame *meta = curl_ws_meta(rd->curl);
+        uint32_t head[2] = {meta == NULL ? 0 : (uint32_t)meta->flags | (meta->bytesleft == 0 ? WS_FINAL : 0),
+                            (uint32_t)n};
+        return stream_write(rd, head, sizeof(head), ptr, n);
+    }
+#endif
     if (rd->stream != NULL) {
-        return stream_write(rd, ptr, n);
+        return stream_write(rd, NULL, 0, ptr, n);
     }
     size_t initial = n;
     if (rd->body.cap == 0) {
@@ -1689,6 +1707,72 @@ static size_t upload_read(char *ptr, size_t size, size_t nmemb, void *userdata) 
     return pause ? CURL_READFUNC_PAUSE : n;
 }
 
+#ifdef HAVE_WEBSOCKETS
+static void ring_take(Upload *u, char *dst, size_t n) {
+    size_t first = STREAM_BUFFER - u->head < n ? STREAM_BUFFER - u->head : n;
+    memcpy(dst, u->ring + u->head, first);
+    memcpy(dst + first, u->ring, n - first);
+    u->head = (u->head + n) % STREAM_BUFFER;
+    u->len -= n;
+}
+
+static size_t ws_read(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    AcRequestData *rd = (AcRequestData *)userdata;
+    Upload *u = rd->upload;
+    size_t result;
+    pthread_mutex_lock(&u->lock);
+    if (u->frame_left == 0) {
+        if (u->len < 12) {
+            result = u->eof ? 0 : CURL_READFUNC_PAUSE;
+            goto done;
+        }
+        uint32_t flags;
+        uint64_t length;
+        ring_take(u, (char *)&flags, sizeof(flags));
+        ring_take(u, (char *)&length, sizeof(length));
+        if (curl_ws_start_frame(rd->curl, flags, (curl_off_t)length) != CURLE_OK) {
+            result = CURL_READFUNC_ABORT;
+            goto done;
+        }
+        u->frame_left = (curl_off_t)length;
+        if (length == 0) {
+            result = 0;
+            goto done;
+        }
+    }
+    size_t n = size * nmemb;
+    if ((curl_off_t)n > u->frame_left) {
+        n = (size_t)u->frame_left;
+    }
+    if (n > u->len) {
+        n = u->len;
+    }
+    if (n == 0) {
+        result = CURL_READFUNC_PAUSE;
+        goto done;
+    }
+    ring_take(u, ptr, n);
+    u->frame_left -= (curl_off_t)n;
+    result = n;
+done:
+    if (result == CURL_READFUNC_PAUSE) {
+        u->paused = true;
+        if (u->paused_since == 0) {
+            u->paused_since = monotonic_time();
+        }
+    }
+    bool wake = u->want_wake && u->len <= STREAM_BUFFER / 2;
+    if (wake) {
+        u->want_wake = false;
+    }
+    pthread_mutex_unlock(&u->lock);
+    if (wake) {
+        send_message(rd->session->loop, rd, MSG_UPLOAD_WAKE);
+    }
+    return result;
+}
+#endif
+
 void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     AcRequestData *rd;
     EventLoop *loop = (EventLoop *)clientData;
@@ -1740,12 +1824,16 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     curl_easy_setopt(rd->curl, CURLOPT_BUFFERSIZE, loop->buffer_size);
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
-    curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
+    if (!rd->websocket) {
+        curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
+    }
     if (strcmp(rd->method, "HEAD") == 0) {
         curl_easy_setopt(rd->curl, CURLOPT_NOBODY, 1L);
     }
     // curl_easy_setopt(rd->curl, CURLOPT_VERBOSE, 1L); //DEBUG
-    curl_easy_setopt(rd->curl, CURLOPT_ENCODING, "");
+    if (!rd->websocket) {
+        curl_easy_setopt(rd->curl, CURLOPT_ENCODING, "");
+    }
     if (rd->headers != NULL) {
         curl_easy_setopt(rd->curl, CURLOPT_HTTPHEADER, rd->headers);
     }
@@ -1763,6 +1851,12 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->req_data_buf != NULL) {
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)rd->req_data_len);
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDS, (char *)rd->req_data_buf);
+#ifdef HAVE_WEBSOCKETS
+    } else if (rd->websocket) {
+        curl_easy_setopt(rd->curl, CURLOPT_UPLOAD, 1L);
+        curl_easy_setopt(rd->curl, CURLOPT_READFUNCTION, ws_read);
+        curl_easy_setopt(rd->curl, CURLOPT_READDATA, rd);
+#endif
     } else if (rd->upload != NULL) {
         curl_easy_setopt(rd->curl, CURLOPT_POST, 1L);
         curl_easy_setopt(rd->curl, CURLOPT_POSTFIELDSIZE_LARGE, rd->upload_size);
@@ -1772,6 +1866,10 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     if (rd->verify) {
         if (rd->ca_file != NULL) {
             curl_easy_setopt(rd->curl, CURLOPT_CAINFO, rd->ca_file);
+        }
+        if (rd->ca_blob != NULL) {
+            struct curl_blob blob = {rd->ca_blob, rd->ca_blob_len, CURL_BLOB_COPY};
+            curl_easy_setopt(rd->curl, CURLOPT_CAINFO_BLOB, &blob);
         }
         curl_easy_setopt(rd->curl, CURLOPT_CAPATH, rd->ca_path);
     } else {
@@ -1823,6 +1921,8 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     rd->ca_file = NULL;
     free(rd->ca_path);
     rd->ca_path = NULL;
+    free(rd->ca_blob);
+    rd->ca_blob = NULL;
     free(rd->cookies_str);
     rd->cookies_str = NULL;
     if (rd->slot != NULL && !slot_free(rd->limiter, rd->slot)) {
@@ -2154,6 +2254,7 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
         free(rd->key_file);
         free(rd->ca_file);
         free(rd->ca_path);
+        free(rd->ca_blob);
         free(rd->cookies_str);
         Py_XDECREF(rd->cookies);
         free(rd->req_data_buf);
@@ -2605,15 +2706,26 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     int discard_body = 0;
     int stream = 0;
     long long upload_size = -2;
+    int websocket = 0;
     PyObject *capsule = NULL;
 
-    static char *kwlist[] = {"future",          "method",       "url",    "headers",     "auth",
-                             "cookies",         "data",         "cert",   "verify",      "timeout",
-                             "connect_timeout", "discard_body", "stream", "upload_size", NULL};
+    static char *kwlist[] = {
+        "future",  "method",          "url",          "headers", "auth",        "cookies",   "data", "cert", "verify",
+        "timeout", "connect_timeout", "discard_body", "stream",  "upload_size", "websocket", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOppL", kwlist, &future, &method, &url, &headers, &auth,
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OssOOOz#|OOOOppLp", kwlist, &future, &method, &url, &headers, &auth,
                                      &cookies, &req_data_buf, &req_data_len, &cert, &verify, &timeout, &connect_timeout,
-                                     &discard_body, &stream, &upload_size)) {
+                                     &discard_body, &stream, &upload_size, &websocket)) {
+        return NULL;
+    }
+#ifndef HAVE_WEBSOCKETS
+    if (websocket) {
+        PyErr_SetString(PyExc_RuntimeError, "WebSockets need libcurl 8.16 or later");
+        return NULL;
+    }
+#endif
+    if (websocket && (!stream || upload_size < -1)) {
+        PyErr_SetString(PyExc_ValueError, "a websocket needs stream and upload_size");
         return NULL;
     }
     long timeout_ms, connect_timeout_ms;
@@ -2638,6 +2750,7 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     }
     REQUEST_TRACE_PRINT("Session_request", rd);
     rd->discard_body = discard_body;
+    rd->websocket = websocket;
     if (stream) {
         rd->stream = stream_new();
         CHECK_ALLOC(rd->stream);
@@ -2681,7 +2794,7 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
             rd->headers = appended;
         }
     }
-    if ((req_data_buf != NULL || upload_size >= -1) && !has_content_type) {
+    if ((req_data_buf != NULL || upload_size >= -1) && !has_content_type && !websocket) {
         struct curl_slist *appended = curl_slist_append(rd->headers, "Content-Type:");
         CHECK_ALLOC(appended);
         rd->headers = appended;
@@ -2719,7 +2832,13 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
     }
     PyObject *ca_file = Py_None;
     PyObject *ca_path = Py_None;
-    if (PyUnicode_CheckExact(verify)) {
+    if (PyBytes_CheckExact(verify)) {
+        rd->ca_blob_len = (size_t)PyBytes_GET_SIZE(verify);
+        rd->ca_blob = malloc(rd->ca_blob_len + 1);
+        CHECK_ALLOC(rd->ca_blob);
+        memcpy(rd->ca_blob, PyBytes_AS_STRING(verify), rd->ca_blob_len);
+        verify = Py_True;
+    } else if (PyUnicode_CheckExact(verify)) {
         ca_file = verify;
     } else if (PyTuple_CheckExact(verify) && PyTuple_GET_SIZE(verify) == 2) {
         ca_file = PyTuple_GET_ITEM(verify, 0);
@@ -2821,6 +2940,7 @@ error_cleanup:
     free(rd->key_file);
     free(rd->ca_file);
     free(rd->ca_path);
+    free(rd->ca_blob);
     if (rd->cookies) {
         Py_DECREF(rd->cookies);
         free(rd->cookies_str);
@@ -3166,6 +3286,14 @@ PyMODINIT_FUNC PyInit__httpperf(void) {
         Py_INCREF(&ResponseType);
         PyModule_AddObject(m, "Response", (PyObject *)&ResponseType);
         PyModule_AddIntConstant(m, "libcurl_version_num", curl_version_info(CURLVERSION_NOW)->version_num);
+        int websockets = 0;
+#ifdef HAVE_WEBSOCKETS
+        curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+        for (const char *const *p = info->protocols; info->version_num >= 0x081000 && *p != NULL; p++) {
+            websockets |= strcmp(*p, "ws") == 0;
+        }
+#endif
+        PyModule_AddIntConstant(m, "websockets", websockets);
     }
 
     return m;

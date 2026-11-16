@@ -965,6 +965,18 @@ class Session:
             max_redirects,
         )
 
+    def _submit(self, loop, method, url, **kwargs):
+        engine = self._engine
+        if engine is None:
+            engine = self._engine = _default_engine(loop)
+            self._session.attach(engine._ae_loop)
+        if loop is not engine._loop():
+            engine._bind(loop)
+        future = _Future(loop=loop)
+        future._session = self._session
+        future._handle = self._session.request(future, method, url, **kwargs)
+        return future
+
     def set_response_callback(self, callback):
         self._response_callback = callback
 
@@ -993,16 +1005,8 @@ class Session:
             header_tuple = (header_tuple or ()) + ("Expect:",)
 
         loop = asyncio.get_running_loop()
-        engine = self._engine
-        if engine is None:
-            engine = self._engine = _default_engine(loop)
-            self._session.attach(engine._ae_loop)
-        if loop is not engine._loop():
-            engine._bind(loop)
-        future = _Future(loop=loop)
-        future._session = self._session
-        future._handle = self._session.request(
-            future,
+        future = self._submit(
+            loop,
             method,
             url,
             headers=header_tuple,
