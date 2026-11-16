@@ -368,6 +368,11 @@ typedef struct Stream {
     double paused_time;
     CURLcode result;
     char *error;
+    long response_code;
+    long http_version;
+    char *effective_url;
+    char *primary_ip;
+    char *redirect_url;
 } Stream;
 
 static Stream *stream_new(void) {
@@ -388,6 +393,9 @@ static void stream_decref(Stream *s) {
     free(s->buf.data);
     free(s->spare.data);
     free(s->error);
+    free(s->effective_url);
+    free(s->primary_ip);
+    free(s->redirect_url);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -837,9 +845,47 @@ static PyObject *upload_finished(Upload *u) {
     return waiter;
 }
 
+static bool info_from_stream(Response *self, CURLINFO info, void *value) {
+    Stream *s = self->stream;
+    if (s == NULL) {
+        return false;
+    }
+    pthread_mutex_lock(&s->lock);
+    bool complete = s->complete;
+    pthread_mutex_unlock(&s->lock);
+    if (complete) {
+        return false;
+    }
+    switch (info) {
+    case CURLINFO_RESPONSE_CODE:
+        *(long *)value = s->response_code;
+        return true;
+    case CURLINFO_HTTP_VERSION:
+        *(long *)value = s->http_version;
+        return true;
+    case CURLINFO_EFFECTIVE_URL:
+        *(char **)value = s->effective_url;
+        return true;
+    case CURLINFO_PRIMARY_IP:
+        *(char **)value = s->primary_ip;
+        return true;
+    case CURLINFO_REDIRECT_URL:
+        *(char **)value = s->redirect_url;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void response_getinfo(Response *self, CURLINFO info, void *value) {
+    if (!info_from_stream(self, info, value)) {
+        curl_easy_getinfo(self->curl, info, value);
+    }
+}
+
 PyObject *resp_get_info_long(Response *self, CURLINFO info) {
     long value;
-    curl_easy_getinfo(self->curl, info, &value);
+    response_getinfo(self, info, &value);
     return PyLong_FromLong(value);
 }
 
@@ -857,7 +903,7 @@ PyObject *resp_get_info_off_t(Response *self, CURLINFO info) {
 
 PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
     char *value = NULL;
-    curl_easy_getinfo(self->curl, info, &value);
+    response_getinfo(self, info, &value);
     if (value == NULL) {
         Py_RETURN_NONE;
     }
@@ -904,7 +950,7 @@ static PyObject *Response_get_queue_time(Response *self, PyObject *args) {
 
 static PyObject *Response_get_http_version(Response *self, PyObject *args) {
     long version = 0;
-    curl_easy_getinfo(self->curl, CURLINFO_HTTP_VERSION, &version);
+    response_getinfo(self, CURLINFO_HTTP_VERSION, &version);
     switch (version) {
     case CURL_HTTP_VERSION_1_0:
         return PyUnicode_FromString("HTTP/1.0");
@@ -1472,13 +1518,29 @@ static void send_message(EventLoop *loop, AcRequestData *rd, int kind) {
 
 static void send_request(EventLoop *loop, AcRequestData *rd) { send_message(loop, rd, MSG_DONE); }
 
+static char *getinfo_strdup(CURL *curl, CURLINFO info) {
+    char *value = NULL;
+    curl_easy_getinfo(curl, info, &value);
+    return value == NULL ? NULL : strdup(value);
+}
+
+static void send_headers(EventLoop *loop, AcRequestData *rd) {
+    Stream *s = rd->stream;
+    curl_easy_getinfo(rd->curl, CURLINFO_RESPONSE_CODE, &s->response_code);
+    curl_easy_getinfo(rd->curl, CURLINFO_HTTP_VERSION, &s->http_version);
+    s->effective_url = getinfo_strdup(rd->curl, CURLINFO_EFFECTIVE_URL);
+    s->primary_ip = getinfo_strdup(rd->curl, CURLINFO_PRIMARY_IP);
+    s->redirect_url = getinfo_strdup(rd->curl, CURLINFO_REDIRECT_URL);
+    rd->headers_sent = true;
+    send_message(loop, rd, MSG_HEADERS);
+}
+
 static void complete_request(EventLoop *loop, AcRequestData *rd) {
     release_request(loop, rd);
     int expected = REQUEST_RUNNING;
     if (atomic_compare_exchange_strong(&rd->state, &expected, REQUEST_SENT)) {
         if (rd->stream != NULL && !rd->headers_sent && rd->result == CURLE_OK) {
-            rd->headers_sent = true;
-            send_message(loop, rd, MSG_HEADERS);
+            send_headers(loop, rd);
         }
         send_request(loop, rd);
     } else {
@@ -1572,8 +1634,7 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
         long code = 0;
         curl_easy_getinfo(rd->curl, CURLINFO_RESPONSE_CODE, &code);
         if (code >= 200 || (rd->websocket && code == 101)) {
-            rd->headers_sent = true;
-            send_message(rd->session->loop, rd, MSG_HEADERS);
+            send_headers(rd->session->loop, rd);
         }
     }
     return n;
