@@ -429,9 +429,8 @@ class ClientConnection:
                 waiter = await self.ping()
                 if timeout is None:
                     continue
-                try:
-                    await asyncio.wait_for(asyncio.shield(waiter), timeout)
-                except asyncio.TimeoutError:
+                done, _ = await asyncio.wait([waiter], timeout=timeout)
+                if not done:
                     await self._fail(1011, "keepalive ping timeout")
                     return
         except ConnectionClosed:
@@ -446,6 +445,8 @@ class ClientConnection:
             self._linger.cancel()
         if self._keepalive is not None and self._keepalive is not asyncio.current_task():
             self._keepalive.cancel()
+        self._keepalive = None
+        self._reader = None
         error = _closed(self._rcvd, self._sent)
         for waiter, _ in self._pings.values():
             if not waiter.done():

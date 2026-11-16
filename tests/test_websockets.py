@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import gc
 import hashlib
 import json
 import socket
@@ -7,6 +8,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import weakref
 
 import pytest
 import pytest_httpbin.certs
@@ -376,6 +378,20 @@ async def test_closing_the_engine_closes_its_websockets(ws_url):
     engine.close()
     with pytest.raises(websockets.ConnectionClosedError):
         await asyncio.wait_for(ws.recv(), 5)
+
+
+@pytest.mark.parametrize("path", ["", "/close/1000"])
+async def test_a_finished_connection_is_freed_without_the_garbage_collector(ws_url, path):
+    gc.disable()
+    try:
+        ws = await websockets.connect(ws_url + path)
+        ref = weakref.ref(ws)
+        await ws.close()
+        await asyncio.sleep(0.05)
+        del ws
+        assert ref() is None
+    finally:
+        gc.enable()
 
 
 LEAK_SERVER = """
