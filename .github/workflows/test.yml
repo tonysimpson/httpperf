@@ -8,17 +8,50 @@ on:
     paths-ignore: ["README.md", "docs/**"]
 
 jobs:
-  test:
+  curl:
     runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_34_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/curl
+          key: curl-manylinux_2_34-${{ hashFiles('tools/build-libcurl.sh') }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: PREFIX=/opt/curl sh tools/build-libcurl.sh
+
+  test:
+    needs: curl
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_34_x86_64
     strategy:
       fail-fast: false
       matrix:
         python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.14t", "3.15", "3.15t"]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: /opt/curl
+          key: curl-manylinux_2_34-${{ hashFiles('tools/build-libcurl.sh') }}
+          fail-on-cache-miss: true
+      - uses: astral-sh/setup-uv@v6
+      - run: dnf install -y openssl
+      - run: /opt/curl/bin/curl --version
+      - run: make test PY_VERSION=${{ matrix.python }}
+        env:
+          CFLAGS: -I/opt/curl/include
+          LDFLAGS: -L/opt/curl/lib -Wl,-rpath,/opt/curl/lib
+      - run: .venv/bin/python -c "import httpperf._httpperf as m; assert m.websockets, 'no WebSockets'; print(hex(m.libcurl_version_num))"
+
+  system-curl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - run: make test PY_VERSION=${{ matrix.python }}
+      - run: make test PY_VERSION=3.13
 
   lint:
     runs-on: ubuntu-24.04

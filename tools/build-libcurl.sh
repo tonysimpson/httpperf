@@ -1,6 +1,8 @@
 #!/bin/sh
-# Builds nghttp2, nghttp3, ngtcp2 and libcurl into /usr/local inside the cibuildwheel containers.
+# Builds nghttp2, nghttp3, ngtcp2 and libcurl into $PREFIX (default /usr/local) inside the cibuildwheel containers.
 set -eux
+
+PREFIX=${PREFIX:-/usr/local}
 
 NGHTTP2_VERSION=1.70.0
 NGHTTP2_SHA256=e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2
@@ -29,22 +31,22 @@ echo "$CURL_SHA256  curl.tar.gz" | sha256sum -c -
 
 tar xf nghttp2.tar.xz
 (cd "nghttp2-$NGHTTP2_VERSION" &&
-    ./configure --prefix=/usr/local --enable-lib-only --disable-static &&
+    ./configure --prefix="$PREFIX" --enable-lib-only --disable-static &&
     make -j"$(nproc)" && make install)
 
 tar xf nghttp3.tar.xz
 (cd "nghttp3-$NGHTTP3_VERSION" &&
-    ./configure --prefix=/usr/local --enable-lib-only --disable-static &&
+    ./configure --prefix="$PREFIX" --enable-lib-only --disable-static &&
     make -j"$(nproc)" && make install)
 
 tar xf ngtcp2.tar.xz
 (cd "ngtcp2-$NGTCP2_VERSION" &&
-    ./configure --prefix=/usr/local --enable-lib-only --disable-static --with-openssl &&
+    ./configure --prefix="$PREFIX" --enable-lib-only --disable-static --with-openssl &&
     make -j"$(nproc)" && make install)
 
 tar xf curl.tar.gz
 (cd "curl-$CURL_VERSION" &&
-    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure --prefix=/usr/local --disable-static \
+    PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure --prefix="$PREFIX" --disable-static \
         --with-openssl --with-nghttp2 --with-ngtcp2 --with-nghttp3 --with-zlib \
         --without-libpsl --without-libidn2 --without-brotli --without-zstd \
         --without-ca-bundle --without-ca-path \
@@ -52,7 +54,7 @@ tar xf curl.tar.gz
     make -j"$(nproc)" && make install)
 
 if [ -d /etc/ld.so.conf.d ]; then
-    echo /usr/local/lib > /etc/ld.so.conf.d/usr-local.conf
+    echo "$PREFIX/lib" > /etc/ld.so.conf.d/httpperf-curl.conf
     ldconfig
 fi
-/usr/local/bin/curl --version
+"$PREFIX/bin/curl" --version
