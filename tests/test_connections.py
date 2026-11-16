@@ -326,3 +326,60 @@ async def test_many_new_connections_while_responses_arrive(server):
     for _ in range(4):
         async with httpperf.Engine() as engine:
             assert await new_connections_while_responses_arrive(engine, server.url) == [200] * 350
+
+
+SECOND_DEAD_PROXY = "http://127.0.0.1:%d" % unused_port()
+
+
+async def proxy_port_tried(url):
+    async with httpperf.Session() as s:
+        with pytest.raises(httpperf.RequestError) as e:
+            await s.get(url)
+    return next((p for p in (DEAD_PROXY, SECOND_DEAD_PROXY) if p.rsplit(":", 1)[1] in str(e.value)), None)
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+async def test_a_schemes_proxy_beats_all_proxy(proxy_environment, scheme):
+    proxy_environment.setenv(scheme + "_proxy", DEAD_PROXY)
+    proxy_environment.setenv("all_proxy", SECOND_DEAD_PROXY)
+    assert await proxy_port_tried(scheme + "://example.invalid/") == DEAD_PROXY
+
+
+@pytest.mark.parametrize("no_proxy", ["127.0.0.1", "*", "localhost,127.0.0.1", " 127.0.0.1 "])
+async def test_no_proxy_forms(url, proxy_environment, no_proxy):
+    proxy_environment.setenv("http_proxy", DEAD_PROXY)
+    proxy_environment.setenv("no_proxy", no_proxy)
+    assert not await went_through_dead_proxy(url)
+
+
+@pytest.mark.parametrize("no_proxy", ["example.invalid", ".invalid", "invalid"])
+async def test_no_proxy_matches_domains(proxy_environment, no_proxy):
+    proxy_environment.setenv("http_proxy", DEAD_PROXY)
+    proxy_environment.setenv("no_proxy", no_proxy)
+    async with httpperf.Session() as s:
+        with pytest.raises(httpperf.RequestError) as e:
+            await s.get("http://example.invalid/")
+    assert DEAD_PROXY.rsplit(":", 1)[1] not in str(e.value)
+
+
+async def test_a_proxied_request_uses_the_absolute_url(wire, proxy_environment):
+    proxy_environment.setenv("http_proxy", wire.url)
+    async with httpperf.Session() as s:
+        await s.get("http://example.invalid/x?a=1")
+    assert wire.head().startswith("GET http://example.invalid/x?a=1 HTTP/1.1\r\n")
+
+
+async def test_proxy_credentials_come_from_the_proxy_url(wire, proxy_environment):
+    proxy_environment.setenv("http_proxy", wire.url.replace("//", "//user:pw@"))
+    async with httpperf.Session() as s:
+        await s.get("http://example.invalid/")
+    assert "\r\nProxy-Authorization: Basic dXNlcjpwdw==" in wire.head()
+
+
+async def test_an_https_request_tunnels_through_the_proxy(wire, proxy_environment):
+    proxy_environment.setenv("https_proxy", wire.url)
+    wire.reply = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+    async with httpperf.Session() as s:
+        with pytest.raises(httpperf.RequestError):
+            await s.get("https://example.invalid/")
+    assert wire.head().startswith("CONNECT example.invalid:443 HTTP/1.1\r\n")

@@ -103,6 +103,7 @@ class Wire:
     def __init__(self):
         self.requests = []
         self.reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        self.close_after_reply = False
         self.sock = socket.create_server(("127.0.0.1", 0))
         self.url = "http://127.0.0.1:%d" % self.sock.getsockname()[1]
         threading.Thread(target=self.serve, daemon=True).start()
@@ -134,6 +135,8 @@ class Wire:
                 self.requests.append((head, data[:size]))
                 data = data[size:]
                 conn.sendall(self.reply)
+                if self.close_after_reply:
+                    return
 
     def head(self):
         return self.requests[-1][0].decode("latin-1")

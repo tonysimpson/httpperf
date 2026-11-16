@@ -85,3 +85,16 @@ async def test_a_102_before_the_response(wire, s):
     reply(wire, b"HTTP/1.1 102 Processing\n\nHTTP/1.1 200 OK\nContent-Length: 2\n", b"ok")
     r = await s.get(wire.url)
     assert (r.status_code, r.body) == (200, b"ok")
+
+
+async def test_a_204_with_a_content_length(wire, s):
+    reply(wire, b"HTTP/1.1 204 No Content\nContent-Length: 5\n", b"stray")
+    assert (await s.get(wire.url)).body == b""
+
+
+async def test_a_connection_the_server_closed_while_idle_is_not_used(wire, s):
+    reply(wire, b"HTTP/1.1 200 OK\nContent-Length: 2\nConnection: keep-alive\n", b"ok")
+    await s.get(wire.url)
+    wire.close_after_reply = True
+    await s.get(wire.url)
+    assert (await s.get(wire.url)).body == b"ok"
