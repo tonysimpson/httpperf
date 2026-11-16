@@ -9,6 +9,7 @@ import threading
 import warnings
 
 import pytest
+from helpers import BIG
 
 import httpperf
 
@@ -258,3 +259,14 @@ async def test_cancelled_requests_do_not_strand_others(server):
         server.release.set()
         responses = await asyncio.wait_for(asyncio.gather(*tasks[1::2]), 5)
     assert [r.status_code for r in responses] == [200] * 5
+
+
+@pytest.mark.parametrize("size", [1023, 10 * 1024 * 1024 + 1])
+def test_a_buffer_size_out_of_range_is_refused(size):
+    with pytest.raises(ValueError, match="buffer_size"):
+        httpperf.Engine(buffer_size=size)
+
+
+async def test_a_large_buffer_size_gets_the_whole_body(server):
+    async with httpperf.Engine(buffer_size=1024 * 1024) as engine:
+        assert (await httpperf.Session(engine=engine).get(server.url + "/big")).body == BIG

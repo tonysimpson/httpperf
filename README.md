@@ -103,7 +103,7 @@ Proxies come from the environment, as curl reads them: `http_proxy` (not `HTTP_P
 
 Cookies always belong to the session, whatever the connection settings.
 
-### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, json_dumps=..., json_loads=...)`
+### `Engine(*, max_host_connections=0, max_total_connections=0, max_idle_connections=1000, buffer_size=16384, json_dumps=..., json_loads=...)`
 
 What sessions share: the curl thread, the shared connection pool, the TLS session cache and the limits. Most programs never create one. Create one to set limits, or to keep groups of sessions in separate pools, and pass it to `Session(engine=...)`.
 
@@ -112,6 +112,7 @@ What sessions share: the curl thread, the shared connection pool, the TLS sessio
 | `max_host_connections` | Cap on connections per host for the engine's sessions that use the shared pool or no pool. 0 means no limit. httpperf queues requests above it and reports the wait as `queue_time`. |
 | `max_total_connections` | Cap on all connections for the same sessions. 0 means no limit. |
 | `max_idle_connections` | How many connections each pool keeps (the shared pool, and each session's own pool). Must be at least 1. |
+| `buffer_size` | Bytes curl reads from a connection at a time, from 1024 to 10 MB. The default, curl's own, suits many small responses. For large downloads 256 KB is much faster (here 14 to 23 GB/s with `discard_body`, 10 to 15 GB/s streamed), but each transfer in flight has its own buffer, so it costs memory at high connection counts. |
 | `json_dumps`, `json_loads` | The JSON functions for the engine's sessions, unless a session sets its own. The defaults use the standard library: compact output, and bodies decoded as UTF-8. See [JSON](#json). |
 
 Each asyncio loop has its own default engine, so sessions without an engine work in any thread, and in each `asyncio.run()`, without setup. A loop's default engine lasts as long as the loop, and is closed once the loop has been closed and no session uses it.

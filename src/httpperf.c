@@ -124,6 +124,7 @@ typedef struct {
 #endif
     bool running;
     bool closing;
+    long buffer_size;
     struct Share *limiter;
     CURL *free_handles[HANDLE_POOL_SIZE];
     int free_handle_count;
@@ -1593,6 +1594,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_NOPROXY, rd->session->no_proxy ? rd->session->no_proxy : "");
     }
     curl_easy_setopt(rd->curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(rd->curl, CURLOPT_BUFFERSIZE, loop->buffer_size);
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
@@ -1830,9 +1832,15 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     long max_host_connections = 0;
     long max_total_connections = 0;
     long max_idle_connections = 1000;
-    static char *kwlist[] = {"max_host_connections", "max_total_connections", "max_idle_connections", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|lll", kwlist, &max_host_connections, &max_total_connections,
-                                     &max_idle_connections)) {
+    long buffer_size = CURL_MAX_WRITE_SIZE;
+    static char *kwlist[] = {"max_host_connections", "max_total_connections", "max_idle_connections", "buffer_size",
+                             NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|llll", kwlist, &max_host_connections, &max_total_connections,
+                                     &max_idle_connections, &buffer_size)) {
+        return NULL;
+    }
+    if (buffer_size < 1024 || buffer_size > CURL_MAX_READ_SIZE) {
+        PyErr_Format(PyExc_ValueError, "buffer_size must be from 1024 to %d", CURL_MAX_READ_SIZE);
         return NULL;
     }
     if (max_host_connections < 0 || max_total_connections < 0) {
@@ -1848,6 +1856,7 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
         return NULL;
     }
     self->timer_id = NO_ACTIVE_TIMER_ID;
+    self->buffer_size = buffer_size;
     self->req_in_read = self->req_in_write = -1;
     self->req_out_read = self->req_out_write = -1;
     self->stop_read = self->stop_write = -1;
