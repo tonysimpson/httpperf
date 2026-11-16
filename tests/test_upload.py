@@ -103,6 +103,9 @@ async def test_a_303_redirect_after_an_upload_is_a_get(s, server, big_file):
     assert (await s.post(server.url + "/redirect/303", data=big_file)).body == b"ok"
 
 
+OK = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+
+
 class DroppingServer:
     def __init__(self):
         self.listener = socket.create_server(("127.0.0.1", 0))
@@ -110,22 +113,33 @@ class DroppingServer:
         threading.Thread(target=self.serve, daemon=True).start()
 
     def serve(self):
-        first, _ = self.listener.accept()
-        reader = first.makefile("rb")
+        handle = self.drop_the_second_request
+        while True:
+            connection, _ = self.listener.accept()
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
+            handle = self.answer
+
+    def drop_the_second_request(self, connection):
+        reader = connection.makefile("rb")
         self.read_head(reader)
-        first.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        connection.sendall(OK)
         self.read_head(reader)
-        first.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        reader.read(1000)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         reader.close()
-        first.close()
-        second, _ = self.listener.accept()
-        reader = second.makefile("rb")
-        reader.read(self.read_head(reader))
-        second.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        connection.close()
+
+    def answer(self, connection):
+        with connection, connection.makefile("rb") as reader:
+            while (length := self.read_head(reader)) is not None:
+                reader.read(length)
+                connection.sendall(OK)
 
     def read_head(self, reader):
         length = 0
-        while (line := reader.readline()) not in (b"\r\n", b""):
+        while (line := reader.readline()) != b"\r\n":
+            if not line:
+                return None
             if line.lower().startswith(b"content-length:"):
                 length = int(line.split(b":")[1])
         return length
