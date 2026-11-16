@@ -1592,6 +1592,7 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
         curl_easy_setopt(rd->curl, CURLOPT_PROXY, rd->session->http_proxy ? rd->session->http_proxy : "");
         curl_easy_setopt(rd->curl, CURLOPT_NOPROXY, rd->session->no_proxy ? rd->session->no_proxy : "");
     }
+    curl_easy_setopt(rd->curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(rd->curl, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(rd->curl, CURLOPT_URL, rd->url);
     curl_easy_setopt(rd->curl, CURLOPT_CUSTOMREQUEST, rd->method);
