@@ -1,0 +1,4 @@
+FROM quay.io/pypa/manylinux_2_34_x86_64
+RUN dnf install -y openssl
+COPY build-libcurl.sh /tmp/build-libcurl.sh
+RUN PREFIX=/opt/curl sh /tmp/build-libcurl.sh

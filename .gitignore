@@ -33,3 +33,5 @@ htmlcov/
 uftrace.data/
 *.zst
 massif.out*
+.ci-local/
+tools/ci-local/build-libcurl.sh

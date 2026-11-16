@@ -411,6 +411,8 @@ Each target first creates `.venv` with uv, if needed, and installs httpperf in e
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 
+`make ci-local` runs CI's test job with Podman: every Python version, in the manylinux_2_34 image against the curl the wheels bundle, four at a time, on a copy of the working tree. `PYTHONS="3.9 3.14t"` picks versions, `JOBS` sets how many run at once, and `PYTEST_ARGS` is passed to pytest. Logs go to `.ci-local/`. The first run builds curl into a local image (a few minutes); it's rebuilt only when `tools/build-libcurl.sh` changes.
+
 To release, set `__version__` in `httpperf/version.py` (for example `1.0rc1` or `1.0`), commit and push to main, then run `make release`. It tags `v<version>` and pushes the tag, and the release workflow builds the wheels and publishes them to PyPI.
 
 The tests run local servers: pytest-httpbin, small threaded `http.server` servers for connection counting and TLS, and hypercorn for HTTP/2 and HTTP/3 (skipped on Python 3.8, where hypercorn's HTTP/3 server hangs on shutdown). Client certificates are generated with `openssl`. The httpbin server is single-threaded, so keep concurrency in tests low.

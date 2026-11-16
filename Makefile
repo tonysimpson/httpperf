@@ -6,7 +6,7 @@ INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
 
-.PHONY: venv test lint lint-fix clean distclean release
+.PHONY: venv test ci-local lint lint-fix clean distclean release
 
 venv: $(INSTALLED)
 
@@ -21,6 +21,9 @@ $(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/ae/*.c src/ae/*.h) 
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest
+
+ci-local:
+	tools/ci-local/run.sh $(PYTHONS)
 
 lint: $(INSTALLED)
 	$(PYTHON) -m ruff check .
