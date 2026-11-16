@@ -208,7 +208,23 @@ with open("big.iso", "rb") as f:
 - A regular file is sent with a `Content-Length`. Anything else is sent chunked (on HTTP/1.1).
 - httpperf reads ahead up to 1 MB. When the source falls behind, curl pauses that transfer until there is more to send; that time is in `r.paused_time` too.
 - An exception from the source, such as a failing `read()`, stops the transfer and is raised from the request.
+- A streamed upload is never sent twice. If a reused connection turns out to have been closed by the server, the request raises `RequestError`, and it's up to the caller to retry (see below). Bodies given as `bytes` are resent by curl, which it does for any request whose reused connection had closed.
 - A 307 or 308 redirect sends the body again: a seekable file is rewound to where it started, and anything else raises `RequestError`.
+
+To retry a streamed upload, open the source again for each attempt:
+
+```python
+async def put_file(session, url, path, attempts=2):
+    for attempt in range(attempts):
+        with open(path, "rb") as f:
+            try:
+                return await session.put(url, data=f)
+            except httpperf.RequestError:
+                if attempt == attempts - 1:
+                    raise
+```
+
+`RequestError` includes `Timeout`; put an `except httpperf.Timeout: raise` first if a slow server shouldn't be retried. In a benchmark, count the failed attempts too: each one is a real error, even if the retry succeeded.
 
 Streaming is for benchmarking large transfers, such as how fast a server sends or receives a big file, and for checking what arrives. Each chunk passes through Python, so it can't sustain high request rates. For those, use `discard_body=True` or keep the body in memory.
 
@@ -309,7 +325,6 @@ The counts are updated on the curl thread, so they can lag a moment behind: a ca
 
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `Engine.close()` is called never complete.
-- A streamed upload can fail if curl has to send it again on its own, for instance when a reused connection turns out to be closed. Bodies given as `bytes` are resent.
 - With a system libcurl older than 8.12, `tls="shared"` doesn't share TLS sessions across the engine: curl keeps them per curl handle, so a new connection only resumes if it happens to reuse the handle of an earlier request to that host. The wheels bundle a newer curl.
 
 ## Development

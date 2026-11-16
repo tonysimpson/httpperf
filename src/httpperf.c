@@ -168,6 +168,7 @@ typedef struct Share {
 typedef struct {
     CURL *curl;
     Share *share;
+    bool reuse;
 } CleanupItem;
 
 static void share_lock(CURL *handle, curl_lock_data data, curl_lock_access access, void *userptr) {
@@ -254,8 +255,8 @@ static int pipe_read(int fd, void *buf, size_t len) {
     return -1;
 }
 
-static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
-    CleanupItem item = {curl, share};
+static void queue_cleanup_item(EventLoop *loop, CURL *curl, Share *share, bool reuse) {
+    CleanupItem item = {curl, share, reuse};
     if (loop == NULL || !pipe_write(loop->curl_easy_cleanup_write, &item, sizeof(item))) {
         if (curl != NULL) {
             curl_easy_cleanup(curl);
@@ -264,6 +265,12 @@ static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) {
             share_decref(share);
         }
     }
+}
+
+static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) { queue_cleanup_item(loop, curl, share, true); }
+
+static void queue_failed(EventLoop *loop, CURL *curl, CURLcode result) {
+    queue_cleanup_item(loop, curl, NULL, result == CURLE_OK);
 }
 
 typedef struct {
@@ -592,7 +599,7 @@ static void Response_dealloc(Response *self) {
         pthread_mutex_unlock(&s->lock);
         Py_XDECREF(waiter);
         if (owns_curl) {
-            queue_cleanup(self->session->loop, self->curl, NULL);
+            queue_failed(self->session->loop, self->curl, s->result);
         }
         stream_decref(s);
     } else {
@@ -1716,7 +1723,7 @@ void curl_easy_cleanup_in_eventloop(struct aeEventLoop *eventLoop, int fd, void 
     while (pipe_read(fd, &item, sizeof(item)) == 1) {
         DEBUG_PRINT("curl=%p", item.curl);
         if (item.curl != NULL) {
-            if (loop != NULL && loop->free_handle_count < HANDLE_POOL_SIZE) {
+            if (item.reuse && loop != NULL && loop->free_handle_count < HANDLE_POOL_SIZE) {
                 curl_easy_reset(item.curl);
                 loop->free_handles[loop->free_handle_count++] = item.curl;
             } else {
@@ -2100,7 +2107,7 @@ static PyObject *stream_finish(EventLoop *loop, AcRequestData *rd, CURLcode resu
     s->waiter = NULL;
     pthread_mutex_unlock(&s->lock);
     if (cleanup) {
-        queue_cleanup(loop, rd->curl, NULL);
+        queue_failed(loop, rd->curl, result);
     }
     return waiter;
 }
@@ -2174,7 +2181,7 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         } else if (rd->result == CURLE_OK) {
             append_completed(list, NULL, (PyObject *)response_from(rd), rd->future);
         } else {
-            queue_cleanup(rd->session->loop, rd->curl, NULL);
+            queue_failed(rd->session->loop, rd->curl, rd->result);
             Py_DECREF(rd->session);
             append_completed(list, Py_BuildValue("(is)", rd->result, error), NULL, rd->future);
         }
@@ -2493,7 +2500,7 @@ static PyObject *Session_request_unlocked(Session *self, PyObject *args, PyObjec
             rd->headers = appended;
         }
     }
-    if (req_data_buf != NULL && !has_content_type) {
+    if ((req_data_buf != NULL || upload_size >= -1) && !has_content_type) {
         struct curl_slist *appended = curl_slist_append(rd->headers, "Content-Type:");
         CHECK_ALLOC(appended);
         rd->headers = appended;

@@ -74,6 +74,7 @@ class Server:
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("X-Chunked", str("Content-Length" not in self.headers))
                 self.send_header("X-Expect", self.headers.get("Expect", ""))
+                self.send_header("X-Content-Type", self.headers.get("Content-Type", ""))
                 self.end_headers()
                 self.wfile.write(body)
 
