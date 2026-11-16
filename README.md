@@ -338,6 +338,7 @@ for origin, counts in engine.host_stats().items():
 
 - curl closes expired idle connections lazily, the next time the pool needs a connection, so the server sees the close late. See [docs/connections.md](docs/connections.md).
 - Requests in flight when `Engine.close()` is called never complete.
+- A gzip response body made of several gzip members fails with `RequestError`: curl decodes only the first member and treats the rest as an error. Servers rarely send them.
 - With a system libcurl older than 8.12, `tls="shared"` doesn't share TLS sessions across the engine: curl keeps them per curl handle, so a new connection only resumes if it happens to reuse the handle of an earlier request to that host. The wheels bundle a newer curl.
 
 ## Development
