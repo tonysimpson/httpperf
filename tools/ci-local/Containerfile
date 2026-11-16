@@ -1,4 +1,4 @@
 FROM quay.io/pypa/manylinux_2_34_x86_64
-RUN dnf install -y openssl
+RUN dnf install -y openssl gdb gcc-toolset-14-libasan-devel gcc-toolset-14-libtsan-devel
 COPY build-libcurl.sh /tmp/build-libcurl.sh
-RUN PREFIX=/opt/curl sh /tmp/build-libcurl.sh
+RUN PREFIX=/opt/curl sh /tmp/build-libcurl.sh && rm /etc/ld.so.conf.d/httpperf-curl.conf && ldconfig
