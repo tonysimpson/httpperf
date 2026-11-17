@@ -29,6 +29,7 @@ typedef struct conn {
     bool pinned;
     bool want_read;
     int64_t idle_since;
+    int64_t idle_timeout;
     int64_t connect_deadline;
     struct hx_req *req;
     struct conn *prev, *next;
@@ -42,6 +43,7 @@ struct hx_req {
     bool head;
     bool fresh;
     bool close_after;
+    int64_t idle_timeout;
     bool done;
     bool reused;
     bool headers_seen;
@@ -67,6 +69,8 @@ struct hx_client {
     uint64_t next_conn_id;
     size_t open;
     conn *conns;
+    conn **by_fd;
+    size_t by_fd_len;
     struct hx_req *reqs;
     queued *queue;
     size_t queue_len, queue_cap, queue_pos;
@@ -147,6 +151,7 @@ static void conn_close(conn *k) {
     k->state = CONN_CLOSED;
     c->open--;
     UNLINK(c->conns, k);
+    c->by_fd[k->fd] = NULL;
     if (k->req != NULL) {
         k->req->conn = NULL;
         k->req = NULL;
@@ -190,7 +195,8 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         } else {
             k->state = CONN_IDLE;
             k->idle_since = now(c);
-            schedule(c, c->cfg.idle_timeout_ns > 0 ? k->idle_since + c->cfg.idle_timeout_ns : 0);
+            k->idle_timeout = q->idle_timeout;
+            schedule(c, k->idle_timeout > 0 ? k->idle_since + k->idle_timeout : 0);
             watch(k, HX_READ);
         }
     }
@@ -287,6 +293,22 @@ static conn *conn_open(hx_client *c, struct hx_req *q, hx_error *error, int *sys
     k->rcap = c->cfg.read_size;
     memcpy(k->key, q->key, sizeof(k->key));
     hx_h1_init(&k->h1, false);
+    if ((size_t)fd >= c->by_fd_len) {
+        size_t len = (size_t)fd * 2 + 64;
+        conn **grown = realloc(c->by_fd, len * sizeof(conn *));
+        if (grown == NULL) {
+            *error = HX_ERR_NOMEM;
+            close(fd);
+            hx_h1_free(&k->h1);
+            free(k);
+            free(rbuf);
+            return NULL;
+        }
+        memset(grown + c->by_fd_len, 0, (len - c->by_fd_len) * sizeof(conn *));
+        c->by_fd = grown;
+        c->by_fd_len = len;
+    }
+    c->by_fd[fd] = k;
     LINK(c->conns, k);
     c->open++;
     if (rc < 0 && connect_errno != EINPROGRESS) {
@@ -326,7 +348,8 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     q->times[HX_T_START] = now(c);
     q->deadline = r->timeout_ns > 0 ? q->times[HX_T_START] + r->timeout_ns : 0;
     snprintf(q->host, sizeof(q->host), "%s", r->host);
-    snprintf(q->key, sizeof(q->key), "%s:%u", r->host, r->port);
+    q->idle_timeout = r->idle_timeout_ns > 0 ? r->idle_timeout_ns : c->cfg.idle_timeout_ns;
+    snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
     LINK(c->reqs, q);
     schedule(c, q->deadline);
     hx_h1_request h = {r->method,       r->target, r->authority, r->headers,
@@ -444,10 +467,7 @@ static void receive(conn *k) {
 }
 
 void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
-    conn *k = c->conns;
-    while (k != NULL && k->fd != s) {
-        k = k->next;
-    }
+    conn *k = s >= 0 && (size_t)s < c->by_fd_len ? c->by_fd[s] : NULL;
     if (k == NULL) {
         return;
     }
@@ -483,9 +503,9 @@ void hx_client_on_timer(hx_client *c) {
     }
     for (conn *k = c->conns, *after; k != NULL; k = after) {
         after = k->next;
-        int64_t deadline = k->state == CONN_IDLE && c->cfg.idle_timeout_ns > 0 ? k->idle_since + c->cfg.idle_timeout_ns
-                           : k->state == CONN_CONNECTING                       ? k->connect_deadline
-                                                                               : 0;
+        int64_t deadline = k->state == CONN_IDLE && k->idle_timeout > 0 ? k->idle_since + k->idle_timeout
+                           : k->state == CONN_CONNECTING                ? k->connect_deadline
+                                                                        : 0;
         if (deadline > 0 && deadline <= t) {
             if (k->state == CONN_CONNECTING) {
                 fail(k, HX_ERR_TIMEOUT, 0);
@@ -589,5 +609,6 @@ void hx_client_free(hx_client *c) {
     }
     free(c->queue);
     free(c->released);
+    free(c->by_fd);
     free(c);
 }

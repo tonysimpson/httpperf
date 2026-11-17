@@ -227,6 +227,32 @@ static void test_a_fresh_connection_is_not_reused(void) {
     finish_client(c);
 }
 
+static void test_another_pool_gets_its_own_connection(void) {
+    hx_client *c = client(0);
+    outcome a = {0}, b = {0};
+    hx_request r = get("/");
+    hx_request_start(c, &r, &a);
+    run(c, &a, 1, 2000);
+    r.pool = 7;
+    hx_request_start(c, &r, &b);
+    run(c, &b, 1, 2000);
+    CHECK(b.done == 1 && !b.last.reused && hx_client_open_connections(c) == 2);
+    finish_client(c);
+}
+
+static void test_a_requests_idle_timeout_applies_to_its_connection(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/");
+    r.idle_timeout_ns = 50 * 1000000;
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 2000);
+    outcome none = {0};
+    run(c, &none, 1, 200);
+    CHECK(hx_client_open_connections(c) == 0);
+    finish_client(c);
+}
+
 static void test_connection_close_from_the_server_closes_it(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -353,6 +379,8 @@ int main(void) {
     test_a_get_gives_status_body_and_done();
     test_the_next_request_reuses_the_connection();
     test_a_fresh_connection_is_not_reused();
+    test_another_pool_gets_its_own_connection();
+    test_a_requests_idle_timeout_applies_to_its_connection();
     test_connection_close_from_the_server_closes_it();
     test_an_idle_connection_the_server_closes_leaves_the_pool();
     test_an_idle_timeout_closes_the_connection();

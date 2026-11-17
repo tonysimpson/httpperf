@@ -34,6 +34,8 @@ typedef struct {
     size_t body_len;
     bool fresh_connection;
     bool close_after;
+    uint64_t pool;
+    int64_t idle_timeout_ns;
     int64_t timeout_ns;
     int64_t connect_timeout_ns;
 } hx_request;
