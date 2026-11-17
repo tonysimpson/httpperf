@@ -73,3 +73,14 @@ async def test_cookies_are_sent_to_a_url_with_credentials(httpbin, s):
 async def test_whitespace_around_a_url(httpbin, s, url):
     with pytest.raises((httpperf.RequestError, ValueError)):
         await s.get(url.format(httpbin.url))
+
+
+async def test_a_hostname_is_looked_up(server):
+    async with httpperf.Session() as s:
+        assert (await s.get(server.url.replace("127.0.0.1", "localhost") + "/")).status_code == 200
+
+
+async def test_an_unknown_hostname_is_a_request_error():
+    async with httpperf.Session() as s:
+        with pytest.raises(httpperf.RequestError, match="resolve"):
+            await s.get("http://nothing.invalid/")

@@ -299,14 +299,66 @@ static void test_a_refused_connection_is_a_connect_error(void) {
     finish_client(c);
 }
 
-static void test_a_hostname_is_a_dns_error_for_now(void) {
+static void test_localhost_is_looked_up(void) {
     hx_client *c = client(0);
     outcome o = {0};
     hx_request r = get("/");
-    r.host = "example.com";
+    r.host = "localhost";
     hx_request_start(c, &r, &o);
     run(c, &o, 1, 2000);
+    CHECK(o.done == 1 && o.last.error == HX_OK && o.status == 200);
+    finish_client(c);
+}
+
+static void test_an_unknown_name_is_a_dns_error(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/");
+    r.host = "nothing.invalid";
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 5000);
     CHECK(o.done == 1 && o.last.error == HX_ERR_DNS);
+    finish_client(c);
+}
+
+static void test_requests_waiting_on_one_lookup_all_complete(void) {
+    hx_client *c = client(0);
+    outcome o[3] = {0};
+    hx_request r = get("/");
+    r.host = "localhost";
+    for (int i = 0; i < 3; i++) {
+        hx_request_start(c, &r, &o[i]);
+    }
+    run(c, NULL, 3, 2000);
+    CHECK(o[0].status == 200 && o[1].status == 200 && o[2].status == 200);
+    finish_client(c);
+}
+
+static void test_a_cancel_during_a_lookup_gives_exactly_one_done(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/");
+    r.host = "localhost";
+    hx_req *q = hx_request_start(c, &r, &o);
+    hx_request_cancel(q);
+    run(c, &o, 2, 300);
+    CHECK(o.done == 1 && o.last.error == HX_ERR_CANCELLED);
+    finish_client(c);
+}
+
+static void test_a_lookup_is_cached(void) {
+    hx_client *c = client(0);
+    outcome first = {0}, second = {0};
+    hx_request r = get("/");
+    r.host = "localhost";
+    r.fresh_connection = true;
+    hx_request_start(c, &r, &first);
+    run(c, &first, 1, 2000);
+    hx_request_start(c, &r, &second);
+    hx_event e;
+    int count = hx_client_events(c, &e, 1);
+    run(c, &second, 1, 2000);
+    CHECK(count == 0 && second.status == 200 && second.last.times[HX_T_DNS] - second.last.times[HX_T_START] < 1000000);
     finish_client(c);
 }
 
@@ -385,7 +437,11 @@ int main(void) {
     test_an_idle_connection_the_server_closes_leaves_the_pool();
     test_an_idle_timeout_closes_the_connection();
     test_a_refused_connection_is_a_connect_error();
-    test_a_hostname_is_a_dns_error_for_now();
+    test_localhost_is_looked_up();
+    test_an_unknown_name_is_a_dns_error();
+    test_requests_waiting_on_one_lookup_all_complete();
+    test_a_cancel_during_a_lookup_gives_exactly_one_done();
+    test_a_lookup_is_cached();
     test_a_slow_response_times_out();
     test_a_cancel_gives_exactly_one_done();
     test_a_big_body_arrives_whole();

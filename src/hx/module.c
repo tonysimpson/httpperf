@@ -553,8 +553,7 @@ static PyObject *error_tuple(Request *r) {
     char message[512];
     switch (e->error) {
     case HX_ERR_DNS:
-        snprintf(message, sizeof(message), "Could not resolve host: %s (the hx backend only connects to IP addresses)",
-                 r->host);
+        snprintf(message, sizeof(message), "Could not resolve host: %s", r->host);
         break;
     case HX_ERR_CONNECT:
         snprintf(message, sizeof(message), "Failed to connect to %s port %u: %s", r->host, r->port,

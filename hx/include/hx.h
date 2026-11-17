@@ -20,6 +20,7 @@ typedef struct {
     size_t max_idle_per_host;
     int64_t idle_timeout_ns;
     size_t read_size;
+    int64_t dns_ttl_ns;
 } hx_config;
 
 typedef struct {

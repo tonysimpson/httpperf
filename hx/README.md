@@ -5,7 +5,8 @@ The start of an HTTP client library to replace libcurl in httpperf. It lives her
 So far:
 
 - `include/hx.h`, the public interface: a client driven by the caller's loop (socket readiness, one timer, a clock), requests started and cancelled, and events pulled with `hx_client_events`.
-- `src/client.c`, the connection layer: plain HTTP/1.1 over TCP to IP addresses (no DNS or TLS yet), a keep-alive pool that drops connections the server closes, idle, request and connect timeouts, cancel, and timestamps and byte counts in every `DONE`. Event data stays valid until the next `hx_client_events` call.
+- `src/client.c`, the connection layer: plain HTTP/1.1 over TCP (no TLS yet), trying each address a name resolves to in turn, a keep-alive pool that drops connections the server closes, idle, request and connect timeouts, cancel, and timestamps and byte counts in every `DONE`. Event data stays valid until the next `hx_client_events` call.
+- `src/dns.c`, name lookups: `getaddrinfo` on up to four worker threads, results handed back through a pipe the caller watches. The client shares one lookup between requests for the same host and port and keeps results for `dns_ttl_ns` (60 seconds by default).
 - `src/h1.c`, the sans-I/O HTTP/1.1 core, which writes requests and parses responses (with llhttp) into events.
 - Tests in `tests/`. `make hx-test` builds and runs them with ASan and UBSan.
 

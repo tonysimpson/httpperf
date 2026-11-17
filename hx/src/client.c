@@ -9,7 +9,10 @@
 #include <unistd.h>
 
 #include "../include/hx.h"
+#include "dns.h"
 #include "h1.h"
+
+#define MAX_ADDRS 8
 
 typedef enum { CONN_CONNECTING, CONN_BUSY, CONN_IDLE, CONN_CLOSED } conn_state;
 
@@ -32,9 +35,28 @@ typedef struct conn {
     int64_t idle_since;
     int64_t idle_timeout;
     int64_t connect_deadline;
+    struct sockaddr_storage addrs[MAX_ADDRS];
+    socklen_t addr_lens[MAX_ADDRS];
+    int addr_count;
+    int addr_next;
+    int connect_errno;
     struct hx_req *req;
     struct conn *prev, *next;
 } conn;
+
+typedef struct lookup {
+    uint64_t id;
+    char key[264];
+    struct hx_req *waiting;
+    struct lookup *next;
+} lookup;
+
+typedef struct cached {
+    char key[264];
+    struct addrinfo *addrs;
+    int64_t expires;
+    struct cached *next;
+} cached;
 
 struct hx_req {
     hx_client *client;
@@ -55,6 +77,9 @@ struct hx_req {
     char key[300];
     char host[256];
     uint16_t port;
+    int64_t connect_timeout;
+    lookup *lookup;
+    struct hx_req *dns_next;
     struct hx_req *prev, *next;
 };
 
@@ -78,6 +103,10 @@ struct hx_client {
     conn **released;
     size_t released_len, released_cap;
     int64_t timer;
+    hx_dns *dns;
+    uint64_t next_lookup_id;
+    lookup *lookups;
+    cached *cache;
 };
 
 #define LINK(head, item)           \
@@ -147,12 +176,14 @@ static void conn_close(conn *k) {
         return;
     }
     hx_client *c = k->client;
-    watch(k, 0);
-    close(k->fd);
+    if (k->fd >= 0) {
+        watch(k, 0);
+        close(k->fd);
+        c->by_fd[k->fd] = NULL;
+    }
     k->state = CONN_CLOSED;
     c->open--;
     UNLINK(c->conns, k);
-    c->by_fd[k->fd] = NULL;
     if (k->req != NULL) {
         k->req->conn = NULL;
         k->req = NULL;
@@ -169,6 +200,16 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
     hx_client *c = q->client;
     q->done = true;
     q->times[HX_T_DONE] = now(c);
+    if (q->lookup != NULL) {
+        struct hx_req **p = &q->lookup->waiting;
+        while (*p != NULL && *p != q) {
+            p = &(*p)->dns_next;
+        }
+        if (*p == q) {
+            *p = q->dns_next;
+        }
+        q->lookup = NULL;
+    }
     conn *k = q->conn;
     queued *e = enqueue(c, q, HX_EV_DONE);
     if (e != NULL) {
@@ -253,77 +294,193 @@ static void begin(conn *k, struct hx_req *q) {
     send_some(k);
 }
 
-static conn *conn_open(hx_client *c, struct hx_req *q, hx_error *error, int *sys_errno) {
-    struct addrinfo hints = {0}, *ai = NULL;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
-    char port[8];
-    snprintf(port, sizeof(port), "%u", q->port);
-    const char *host = strcmp(q->host, "localhost") == 0 ? "127.0.0.1" : q->host;
-    if (getaddrinfo(host, port, &hints, &ai) != 0) {
-        *error = HX_ERR_DNS;
-        return NULL;
-    }
-    q->times[HX_T_DNS] = now(c);
-    conn *k = calloc(1, sizeof(conn));
-    char *rbuf = malloc(c->cfg.read_size);
-    int fd = socket(ai->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (k == NULL || rbuf == NULL || fd < 0) {
-        *error = fd < 0 ? HX_ERR_CONNECT : HX_ERR_NOMEM;
-        *sys_errno = fd < 0 ? errno : 0;
-        if (fd >= 0) {
-            close(fd);
-        }
-        free(k);
-        free(rbuf);
-        freeaddrinfo(ai);
-        return NULL;
-    }
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    void *addr = ai->ai_family == AF_INET6 ? (void *)&((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr
-                                           : (void *)&((struct sockaddr_in *)ai->ai_addr)->sin_addr;
-    inet_ntop(ai->ai_family, addr, k->ip, sizeof(k->ip));
-    int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-    int connect_errno = errno;
-    freeaddrinfo(ai);
-    k->client = c;
-    k->fd = fd;
-    k->id = ++c->next_conn_id;
-    k->rbuf = rbuf;
-    k->rcap = c->cfg.read_size;
-    memcpy(k->key, q->key, sizeof(k->key));
-    hx_h1_init(&k->h1, false);
-    if ((size_t)fd >= c->by_fd_len) {
-        size_t len = (size_t)fd * 2 + 64;
+static bool track_fd(hx_client *c, conn *k) {
+    if ((size_t)k->fd >= c->by_fd_len) {
+        size_t len = (size_t)k->fd * 2 + 64;
         conn **grown = realloc(c->by_fd, len * sizeof(conn *));
         if (grown == NULL) {
-            *error = HX_ERR_NOMEM;
-            close(fd);
-            hx_h1_free(&k->h1);
-            free(k);
-            free(rbuf);
-            return NULL;
+            return false;
         }
         memset(grown + c->by_fd_len, 0, (len - c->by_fd_len) * sizeof(conn *));
         c->by_fd = grown;
         c->by_fd_len = len;
     }
-    c->by_fd[fd] = k;
-    LINK(c->conns, k);
-    c->open++;
-    if (rc < 0 && connect_errno != EINPROGRESS) {
-        *error = HX_ERR_CONNECT;
-        *sys_errno = connect_errno;
-        watch(k, 0);
-        conn_close(k);
+    c->by_fd[k->fd] = k;
+    return true;
+}
+
+static int connect_next(conn *k) {
+    hx_client *c = k->client;
+    while (k->addr_next < k->addr_count) {
+        int i = k->addr_next++;
+        struct sockaddr *sa = (struct sockaddr *)&k->addrs[i];
+        int fd = socket(sa->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            k->connect_errno = errno;
+            continue;
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        void *addr = sa->sa_family == AF_INET6 ? (void *)&((struct sockaddr_in6 *)sa)->sin6_addr
+                                               : (void *)&((struct sockaddr_in *)sa)->sin_addr;
+        inet_ntop(sa->sa_family, addr, k->ip, sizeof(k->ip));
+        if (connect(fd, sa, k->addr_lens[i]) < 0 && errno != EINPROGRESS) {
+            k->connect_errno = errno;
+            close(fd);
+            continue;
+        }
+        k->fd = fd;
+        k->watching = 0;
+        if (!track_fd(c, k)) {
+            close(fd);
+            k->fd = -1;
+            k->connect_errno = ENOMEM;
+            return -1;
+        }
+        watch(k, HX_WRITE);
+        return 0;
+    }
+    return -1;
+}
+
+static conn *conn_open(hx_client *c, struct hx_req *q, const struct addrinfo *ai, hx_error *error, int *sys_errno) {
+    conn *k = calloc(1, sizeof(conn));
+    char *rbuf = malloc(c->cfg.read_size);
+    if (k == NULL || rbuf == NULL) {
+        *error = HX_ERR_NOMEM;
+        free(k);
+        free(rbuf);
         return NULL;
     }
+    for (; ai != NULL && k->addr_count < MAX_ADDRS; ai = ai->ai_next) {
+        if (ai->ai_addrlen <= sizeof(struct sockaddr_storage)) {
+            memcpy(&k->addrs[k->addr_count], ai->ai_addr, ai->ai_addrlen);
+            k->addr_lens[k->addr_count++] = ai->ai_addrlen;
+        }
+    }
+    k->client = c;
+    k->fd = -1;
+    k->rbuf = rbuf;
+    k->rcap = c->cfg.read_size;
+    memcpy(k->key, q->key, sizeof(k->key));
+    hx_h1_init(&k->h1, false);
+    if (connect_next(k) == -1) {
+        *error = HX_ERR_CONNECT;
+        *sys_errno = k->connect_errno;
+        hx_h1_free(&k->h1);
+        free(k->rbuf);
+        free(k);
+        return NULL;
+    }
+    k->id = ++c->next_conn_id;
+    LINK(c->conns, k);
+    c->open++;
     k->state = CONN_CONNECTING;
     k->req = q;
     q->conn = k;
-    watch(k, HX_WRITE);
+    if (q->connect_timeout > 0) {
+        k->connect_deadline = q->times[HX_T_START] + q->connect_timeout;
+        schedule(c, k->connect_deadline);
+    }
     return k;
+}
+
+static void open_for(hx_client *c, struct hx_req *q, const struct addrinfo *ai) {
+    q->times[HX_T_DNS] = now(c);
+    hx_error error = HX_OK;
+    int sys_errno = 0;
+    if (conn_open(c, q, ai, &error, &sys_errno) == NULL) {
+        finish(q, error, sys_errno, false);
+    }
+}
+
+static void resolve(hx_client *c, struct hx_req *q) {
+    char key[264];
+    snprintf(key, sizeof(key), "%s:%u", q->host, q->port);
+    int64_t t = now(c);
+    for (cached **p = &c->cache; *p != NULL;) {
+        cached *e = *p;
+        if (e->expires <= t) {
+            *p = e->next;
+            freeaddrinfo(e->addrs);
+            free(e);
+            continue;
+        }
+        if (strcmp(e->key, key) == 0) {
+            open_for(c, q, e->addrs);
+            return;
+        }
+        p = &e->next;
+    }
+    lookup *l = c->lookups;
+    while (l != NULL && strcmp(l->key, key) != 0) {
+        l = l->next;
+    }
+    if (l == NULL) {
+        if (c->dns == NULL) {
+            c->dns = hx_dns_new();
+            if (c->dns == NULL) {
+                finish(q, HX_ERR_NOMEM, 0, false);
+                return;
+            }
+            c->io.watch(c->io.ctx, hx_dns_fd(c->dns), HX_READ);
+        }
+        l = calloc(1, sizeof(lookup));
+        if (l == NULL || hx_dns_lookup(c->dns, q->host, q->port, c->next_lookup_id + 1) == -1) {
+            free(l);
+            finish(q, HX_ERR_NOMEM, 0, false);
+            return;
+        }
+        l->id = ++c->next_lookup_id;
+        memcpy(l->key, key, sizeof(key));
+        l->next = c->lookups;
+        c->lookups = l;
+    }
+    q->lookup = l;
+    q->dns_next = l->waiting;
+    l->waiting = q;
+}
+
+static void resolved(hx_client *c) {
+    hx_dns_result results[16];
+    int count;
+    while ((count = hx_dns_results(c->dns, results, 16)) > 0) {
+        for (int i = 0; i < count; i++) {
+            lookup **p = &c->lookups;
+            while (*p != NULL && (*p)->id != results[i].id) {
+                p = &(*p)->next;
+            }
+            lookup *l = *p;
+            if (l == NULL) {
+                if (results[i].addrs != NULL) {
+                    freeaddrinfo(results[i].addrs);
+                }
+                continue;
+            }
+            *p = l->next;
+            cached *e = results[i].error == 0 ? calloc(1, sizeof(cached)) : NULL;
+            if (e != NULL) {
+                memcpy(e->key, l->key, sizeof(e->key));
+                e->addrs = results[i].addrs;
+                e->expires = now(c) + (c->cfg.dns_ttl_ns > 0 ? c->cfg.dns_ttl_ns : 60 * (int64_t)1000000000);
+                e->next = c->cache;
+                c->cache = e;
+            } else if (results[i].addrs != NULL) {
+                freeaddrinfo(results[i].addrs);
+            }
+            while (l->waiting != NULL) {
+                struct hx_req *q = l->waiting;
+                l->waiting = q->dns_next;
+                q->lookup = NULL;
+                if (e != NULL) {
+                    open_for(c, q, e->addrs);
+                } else {
+                    finish(q, HX_ERR_DNS, results[i].error, false);
+                }
+            }
+            free(l);
+        }
+    }
 }
 
 static conn *find_idle(hx_client *c, const char *key) {
@@ -367,16 +524,15 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
         begin(k, q);
         return q;
     }
-    hx_error error = HX_OK;
-    int sys_errno = 0;
-    k = conn_open(c, q, &error, &sys_errno);
-    if (k == NULL) {
-        finish(q, error, sys_errno, false);
-        return q;
-    }
-    if (r->connect_timeout_ns > 0) {
-        k->connect_deadline = q->times[HX_T_START] + r->connect_timeout_ns;
-        schedule(c, k->connect_deadline);
+    q->connect_timeout = r->connect_timeout_ns;
+    struct addrinfo hints = {.ai_socktype = SOCK_STREAM, .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV}, *ai = NULL;
+    char port[8];
+    snprintf(port, sizeof(port), "%u", q->port);
+    if (getaddrinfo(q->host, port, &hints, &ai) == 0) {
+        open_for(c, q, ai);
+        freeaddrinfo(ai);
+    } else {
+        resolve(c, q);
     }
     return q;
 }
@@ -397,7 +553,15 @@ static void connected(conn *k) {
     socklen_t len = sizeof(err);
     getsockopt(k->fd, SOL_SOCKET, SO_ERROR, &err, &len);
     if (err != 0) {
-        fail(k, HX_ERR_CONNECT, err);
+        hx_client *c = k->client;
+        k->connect_errno = err;
+        watch(k, 0);
+        c->by_fd[k->fd] = NULL;
+        close(k->fd);
+        k->fd = -1;
+        if (connect_next(k) == -1) {
+            fail(k, HX_ERR_CONNECT, k->connect_errno);
+        }
         return;
     }
     struct hx_req *q = k->req;
@@ -472,6 +636,10 @@ static void receive(conn *k) {
 }
 
 void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
+    if (c->dns != NULL && s == hx_dns_fd(c->dns)) {
+        resolved(c);
+        return;
+    }
     conn *k = s >= 0 && (size_t)s < c->by_fd_len ? c->by_fd[s] : NULL;
     if (k == NULL) {
         return;
@@ -588,6 +756,21 @@ hx_client *hx_client_new(const hx_config *cfg, hx_io io) {
 }
 
 void hx_client_free(hx_client *c) {
+    if (c->dns != NULL) {
+        c->io.watch(c->io.ctx, hx_dns_fd(c->dns), 0);
+        hx_dns_free(c->dns);
+    }
+    while (c->lookups != NULL) {
+        lookup *l = c->lookups;
+        c->lookups = l->next;
+        free(l);
+    }
+    while (c->cache != NULL) {
+        cached *e = c->cache;
+        c->cache = e->next;
+        freeaddrinfo(e->addrs);
+        free(e);
+    }
     while (c->reqs != NULL) {
         struct hx_req *q = c->reqs;
         UNLINK(c->reqs, q);

@@ -32,6 +32,7 @@ setup(
                 "src/ae/ae.c",
                 "src/ae/zmalloc.c",
                 "hx/src/client.c",
+                "hx/src/dns.c",
                 "hx/src/h1.c",
                 "hx/vendor/llhttp/llhttp.c",
                 "hx/vendor/llhttp/api.c",
