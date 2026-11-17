@@ -1,9 +1,11 @@
 #!/bin/sh
-# Builds nghttp2, nghttp3, ngtcp2 and libcurl into $PREFIX (default /usr/local) inside the cibuildwheel containers.
+# Builds AWS-LC, nghttp2, nghttp3, ngtcp2 and libcurl into $PREFIX (default /usr/local) inside the cibuildwheel containers.
 set -eux
 
 PREFIX=${PREFIX:-/usr/local}
 
+AWSLC_VERSION=5.12.0
+AWSLC_SHA256=52c7f98ffd296d267cc015ad4653d1ffae399db65b14421da4f5f7efc44becd2
 NGHTTP2_VERSION=1.70.0
 NGHTTP2_SHA256=e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2
 NGHTTP3_VERSION=1.19.0
@@ -14,12 +16,14 @@ CURL_VERSION=8.23.0
 CURL_SHA256=e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49
 
 if command -v apk >/dev/null; then
-    apk add --no-cache openssl-dev zlib-dev xz patch
+    apk add --no-cache zlib-dev xz patch
 else
-    dnf install -y openssl-devel zlib-devel xz patch
+    dnf install -y zlib-devel xz patch
 fi
 
 cd "$(mktemp -d)"
+curl -fsSLo aws-lc.tar.gz "https://github.com/aws/aws-lc/archive/refs/tags/v$AWSLC_VERSION.tar.gz"
+echo "$AWSLC_SHA256  aws-lc.tar.gz" | sha256sum -c -
 curl -fsSLo nghttp2.tar.xz "https://github.com/nghttp2/nghttp2/releases/download/v$NGHTTP2_VERSION/nghttp2-$NGHTTP2_VERSION.tar.xz"
 echo "$NGHTTP2_SHA256  nghttp2.tar.xz" | sha256sum -c -
 curl -fsSLo nghttp3.tar.xz "https://github.com/ngtcp2/nghttp3/releases/download/v$NGHTTP3_VERSION/nghttp3-$NGHTTP3_VERSION.tar.xz"
@@ -28,6 +32,14 @@ curl -fsSLo ngtcp2.tar.xz "https://github.com/ngtcp2/ngtcp2/releases/download/v$
 echo "$NGTCP2_SHA256  ngtcp2.tar.xz" | sha256sum -c -
 curl -fsSLo curl.tar.gz "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
 echo "$CURL_SHA256  curl.tar.gz" | sha256sum -c -
+
+tar xf aws-lc.tar.gz
+cmake -S "aws-lc-$AWSLC_VERSION" -B aws-lc-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+    -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF -DBUILD_TOOL=OFF \
+    -DDISABLE_GO=ON -DDISABLE_PERL=ON \
+    -DENABLE_PRE_SONAME_BUILD=OFF -DENABLE_SYMBOL_VERSIONING=ON -DSYMBOL_VERSION_NAMESPACE=HTTPPERF
+cmake --build aws-lc-build -j"$(nproc)"
+cmake --install aws-lc-build
 
 tar xf nghttp2.tar.xz
 (cd "nghttp2-$NGHTTP2_VERSION" &&
@@ -41,7 +53,9 @@ tar xf nghttp3.tar.xz
 
 tar xf ngtcp2.tar.xz
 (cd "ngtcp2-$NGTCP2_VERSION" &&
-    ./configure --prefix="$PREFIX" --enable-lib-only --disable-static --with-openssl &&
+    ./configure --prefix="$PREFIX" --enable-lib-only --disable-static --with-boringssl \
+        CFLAGS="${CFLAGS:--g -O2} -fPIC" CXXFLAGS="${CXXFLAGS:--g -O2} -fPIC" \
+        BORINGSSL_CFLAGS="-I$PREFIX/include" BORINGSSL_LIBS="-L$PREFIX/lib -lssl -lcrypto" &&
     make -j"$(nproc)" && make install)
 
 tar xf curl.tar.gz
@@ -149,7 +163,7 @@ PATCH
 )
 (cd "curl-$CURL_VERSION" &&
     PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure --prefix="$PREFIX" --disable-static \
-        --with-openssl --with-nghttp2 --with-ngtcp2 --with-nghttp3 --with-zlib \
+        --with-openssl="$PREFIX" --with-nghttp2 --with-ngtcp2 --with-nghttp3 --with-zlib \
         --without-libpsl --without-libidn2 --without-brotli --without-zstd \
         --without-ca-bundle --without-ca-path \
         --disable-ldap --disable-docs &&
