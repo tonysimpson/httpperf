@@ -16,7 +16,7 @@ import warnings
 import weakref
 from urllib.parse import urlencode, urljoin, urlparse
 
-from httpperf import _httpperf
+from httpperf._backend import ext as _httpperf
 from httpperf.version import __version__ as __version__
 
 _json_dumps = _json.JSONEncoder(separators=(",", ":"), check_circular=False).encode

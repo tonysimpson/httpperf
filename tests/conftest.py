@@ -10,6 +10,7 @@ import pytest
 from helpers import BIG
 
 import httpperf
+from httpperf import _backend
 
 
 class TestHTTPServer(http.server.ThreadingHTTPServer):
@@ -188,6 +189,15 @@ def s():
     session = httpperf.Session()
     yield session
     session.close()
+
+
+def pytest_collection_modifyitems(config, items):
+    if _backend.name == "curl":
+        return
+    skip = pytest.mark.skip(reason="not on the %s backend yet" % _backend.name)
+    for item in items:
+        if item.get_closest_marker("hx") is None:
+            item.add_marker(skip)
 
 
 @pytest.hookimpl(tryfirst=True)

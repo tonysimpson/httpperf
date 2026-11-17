@@ -74,3 +74,4 @@ select = ["E", "W", "F", "I", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 timeout = 30
+markers = ["hx: the test also runs on the hx backend"]

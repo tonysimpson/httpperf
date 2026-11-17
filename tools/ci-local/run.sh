@@ -22,6 +22,7 @@ if [ "${1:-}" = "--one" ]; then
                 --exclude="*.so" --exclude=__pycache__ -cf - . | tar -C /work -xf -
             cd /work
             make venv PY_VERSION=$PY_VERSION > /dev/null
+            HTTPPERF_BACKEND=hx .venv/bin/python -m pytest -q -p no:cacheprovider $PYTEST_ARGS > /tmp/hx.log || { cat /tmp/hx.log; exit 1; }
             .venv/bin/python -m pytest -p no:cacheprovider $PYTEST_ARGS
         ' > "$LOGS/$2.log" 2>&1; then
         echo "$2: $(tail -n 1 "$LOGS/$2.log" | tr -d '=')"

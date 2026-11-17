@@ -24,6 +24,11 @@ setup(
             sources=["src/httpperf.c", "src/ae/ae.c", "src/ae/zmalloc.c"],
             libraries=["curl"],
             extra_compile_args=compile_args,
-        )
+        ),
+        Extension(
+            "httpperf._httpperf_hx",
+            sources=["src/hx/module.c"],
+            extra_compile_args=compile_args,
+        ),
     ]
 )

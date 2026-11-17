@@ -47,7 +47,7 @@ async def resumed(url, tls):
 
 
 SHARED_TLS_CACHE = pytest.mark.skipif(
-    httpperf._httpperf.libcurl_version_num < 0x080C00,
+    getattr(httpperf._httpperf, "libcurl_version_num", 0) < 0x080C00,
     reason="before libcurl 8.12, TLS sessions are kept per curl handle, not per engine",
 )
 

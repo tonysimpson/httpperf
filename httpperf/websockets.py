@@ -6,7 +6,7 @@ import time
 from urllib.parse import urlparse
 
 import httpperf
-from httpperf import _httpperf
+from httpperf._backend import ext as _httpperf
 
 __all__ = [
     "ClientConnection",

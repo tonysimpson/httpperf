@@ -1,7 +1,7 @@
 PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
-C_SOURCES := src/httpperf.c
+C_SOURCES := src/httpperf.c src/hx/module.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
@@ -10,7 +10,7 @@ GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
 
 venv: $(INSTALLED)
 
-$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/ae/*.c src/ae/*.h) | $(UV)
+$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/hx/*.c src/ae/*.c src/ae/*.h) | $(UV)
 	test -x $(VENV)/bin/python || $(UV) venv -p $(PY_VERSION) $(VENV)
 	$(UV) pip install --python $(VENV)/bin/python $(GROUPS) --reinstall-package httpperf -e .
 	touch $@
@@ -21,6 +21,7 @@ $(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/ae/*.c src/ae/*.h) 
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest
+	HTTPPERF_BACKEND=hx $(PYTHON) -m pytest -q
 
 ci-local:
 	tools/ci-local/run.sh $(PYTHONS)

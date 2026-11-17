@@ -14,7 +14,8 @@ import time
 import traceback
 
 import httpperf
-from httpperf import _httpperf
+from httpperf import _backend
+from httpperf._backend import ext as _httpperf
 
 try:
     import uvloop
@@ -680,13 +681,15 @@ def parser():
     p.add_argument("--timeout", type=duration, metavar="T", default=2.0, help="request timeout (default 2s)")
     p.add_argument("-s", "--script", metavar="FILE", help="Python file defining async def request(session, url)")
     p.add_argument("--json", action="store_true", help="print the results as JSON")
-    v = _httpperf.libcurl_version_num
-    p.add_argument(
-        "--version",
-        action="version",
-        version="httpperf %s (libcurl %d.%d.%d)" % (httpperf.__version__, v >> 16, (v >> 8) & 255, v & 255),
-    )
+    p.add_argument("--version", action="version", version="httpperf %s (%s)" % (httpperf.__version__, _backend_name()))
     return p
+
+
+def _backend_name():
+    if _backend.name != "curl":
+        return _backend.name
+    v = _httpperf.libcurl_version_num
+    return "libcurl %d.%d.%d" % (v >> 16, (v >> 8) & 255, v & 255)
 
 
 def parse(argv):
