@@ -30,6 +30,7 @@ enum {
     E_ABORTED_BY_CALLBACK = 42,
     E_SEND_ERROR = 55,
     E_RECV_ERROR = 56,
+    E_BAD_CONTENT_ENCODING = 61,
 };
 
 typedef struct {
@@ -324,6 +325,7 @@ static void start(EventLoop *loop, Request *r) {
         .idle_timeout_ns = r->idle_timeout_ns,
         .timeout_ns = r->timeout_ns,
         .connect_timeout_ns = r->connect_timeout_ns,
+        .decode = true,
     };
     r->live_next = loop->live;
     if (loop->live != NULL) {
@@ -536,6 +538,9 @@ static int error_code(hx_error e) {
         return E_RECV_ERROR;
     case HX_ERR_PROTOCOL:
         return E_WEIRD_SERVER_REPLY;
+    case HX_ERR_DECODE:
+    case HX_ERR_UNKNOWN_ENCODING:
+        return E_BAD_CONTENT_ENCODING;
     case HX_ERR_TIMEOUT:
         return E_OPERATION_TIMEDOUT;
     case HX_ERR_CANCELLED:
@@ -572,6 +577,13 @@ static PyObject *error_tuple(Request *r) {
         break;
     case HX_ERR_PROTOCOL:
         snprintf(message, sizeof(message), "Invalid HTTP response from the server");
+        break;
+    case HX_ERR_DECODE:
+        snprintf(message, sizeof(message), "Error while processing content unencoding");
+        break;
+    case HX_ERR_UNKNOWN_ENCODING:
+        snprintf(message, sizeof(message),
+                 "Unrecognized content encoding type. hx understands deflate, gzip content encodings.");
         break;
     case HX_ERR_CANCELLED:
         snprintf(message, sizeof(message), "Request cancelled");
@@ -909,7 +921,7 @@ static bool names(const char *header, const char *name) {
     return strncasecmp(header, name, n) == 0 && (header[n] == ':' || header[n] == ';');
 }
 
-static int add_headers(Request *r, PyObject *headers, bool *has_accept) {
+static int add_headers(Request *r, PyObject *headers, bool *has_accept, bool *has_encoding) {
     if (headers == Py_None) {
         return 0;
     }
@@ -928,6 +940,9 @@ static int add_headers(Request *r, PyObject *headers, bool *has_accept) {
         }
         if (names(header, "accept")) {
             *has_accept = true;
+        }
+        if (names(header, "accept-encoding")) {
+            *has_encoding = true;
         }
         size_t len = strlen(header);
         const char *colon = strchr(header, ':');
@@ -1020,8 +1035,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     atomic_init(&r->refs, 1);
     char *user = NULL, *password = NULL;
     int code = parse_url(r, url, &user, &password);
-    bool has_accept = false;
-    if (code == -1 || add_headers(r, headers, &has_accept) == -1) {
+    bool has_accept = false, has_encoding = false;
+    if (code == -1 || add_headers(r, headers, &has_accept, &has_encoding) == -1) {
         free(user);
         free(password);
         request_free(r);
@@ -1048,6 +1063,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         password = strdup(p);
     }
     bool ok = code == 0 && (has_accept || add_header(r, strdup("Accept: */*")) == 0) &&
+              (has_encoding || add_header(r, strdup("Accept-Encoding: deflate, gzip")) == 0) &&
               (user == NULL || add_header(r, basic_auth(user, password != NULL ? password : "")) == 0);
     free(user);
     free(password);

@@ -46,6 +46,13 @@ static void *serve_one(void *arg) {
             usleep(20000);
             break;
         }
+        if (strstr(buf, " /gzip ") != NULL) {
+            static const char r[] = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n"
+                                    "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x07\x00\x86"
+                                    "\xa6\x10\x36\x05\x00\x00\x00";
+            send(fd, r, sizeof(r) - 1, MSG_NOSIGNAL);
+            continue;
+        }
         if (strstr(buf, " /big ") != NULL) {
             static char big[200000];
             int head = snprintf(big, sizeof(big), "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", sizeof(big) - 100);
@@ -396,6 +403,42 @@ static void test_a_big_body_arrives_whole(void) {
     finish_client(c);
 }
 
+static void test_a_gzip_body_is_decoded_when_asked(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/gzip");
+    r.decode = true;
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 2000);
+    CHECK(o.done == 1 && o.body_len == 5 && memcmp(o.body, "hello", 5) == 0);
+    finish_client(c);
+}
+
+static void test_a_gzip_body_is_left_alone_otherwise(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/gzip");
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 2000);
+    CHECK(o.done == 1 && o.body_len == 25);
+    finish_client(c);
+}
+
+static void test_the_connection_is_reused_after_a_decoded_body(void) {
+    hx_client *c = client(0);
+    outcome first = {0}, second = {0};
+    hx_request r = get("/gzip");
+    r.decode = true;
+    hx_request_start(c, &r, &first);
+    run(c, &first, 1, 2000);
+    hx_request plain = get("/");
+    plain.decode = true;
+    hx_request_start(c, &plain, &second);
+    run(c, &second, 1, 2000);
+    CHECK(second.last.reused && second.body_len == 2 && memcmp(second.body, "ok", 2) == 0);
+    finish_client(c);
+}
+
 static void test_times_are_in_order(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -445,6 +488,9 @@ int main(void) {
     test_a_slow_response_times_out();
     test_a_cancel_gives_exactly_one_done();
     test_a_big_body_arrives_whole();
+    test_a_gzip_body_is_decoded_when_asked();
+    test_a_gzip_body_is_left_alone_otherwise();
+    test_the_connection_is_reused_after_a_decoded_body();
     test_times_are_in_order();
     test_many_requests_at_once();
     printf(failures ? "%d failed\n" : "all passed\n", failures);

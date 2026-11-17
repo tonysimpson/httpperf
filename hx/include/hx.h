@@ -39,6 +39,7 @@ typedef struct {
     int64_t idle_timeout_ns;
     int64_t timeout_ns;
     int64_t connect_timeout_ns;
+    bool decode;
 } hx_request;
 
 typedef enum { HX_EV_HEADERS = 1, HX_EV_BODY, HX_EV_DONE } hx_event_type;
@@ -54,6 +55,8 @@ typedef enum {
     HX_ERR_CANCELLED,
     HX_ERR_INVALID,
     HX_ERR_NOMEM,
+    HX_ERR_DECODE,
+    HX_ERR_UNKNOWN_ENCODING,
 } hx_error;
 
 enum {

@@ -95,9 +95,6 @@ tests/test_limiter.py::test_the_total_limit_spans_hosts
 tests/test_limiter.py::test_waiting_requests_report_their_queue_time
 tests/test_redirects.py::test_a_location_with_another_scheme_is_an_error
 tests/test_redirects.py::test_cookies_set_by_a_redirect_are_sent_on_the_next_hop
-tests/test_responses.py::test_a_body_gzipped_twice
-tests/test_responses.py::test_deflate_with_and_without_a_zlib_header[-15]
-tests/test_responses.py::test_deflate_with_and_without_a_zlib_header[15]
 tests/test_stats.py::test_an_own_pool_session_counts_its_open_connections
 tests/test_stats.py::test_closing_a_session_closes_its_connections
 tests/test_stats.py::test_requests_over_the_host_limit_queue

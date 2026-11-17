@@ -5,10 +5,12 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <stdio.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "../include/hx.h"
+#include "decode.h"
 #include "dns.h"
 #include "h1.h"
 
@@ -40,6 +42,10 @@ typedef struct conn {
     int addr_count;
     int addr_next;
     int connect_errno;
+    hx_decoder decoder;
+    hx_buf decoded;
+    bool decoding;
+    bool undecodable;
     struct hx_req *req;
     struct conn *prev, *next;
 } conn;
@@ -64,6 +70,7 @@ struct hx_req {
     conn *conn;
     hx_buf request;
     bool head;
+    bool decode;
     bool fresh;
     bool close_after;
     int64_t idle_timeout;
@@ -165,6 +172,8 @@ static queued *enqueue(hx_client *c, struct hx_req *q, hx_event_type type) {
 }
 
 static void conn_free(conn *k) {
+    hx_decoder_free(&k->decoder);
+    hx_buf_free(&k->decoded);
     hx_h1_free(&k->h1);
     hx_buf_free(&k->out);
     free(k->rbuf);
@@ -281,6 +290,12 @@ static void send_some(conn *k) {
     watch(k, HX_READ);
 }
 
+static void end_decoding(conn *k) {
+    k->decoding = false;
+    k->undecodable = false;
+    hx_decoder_end(&k->decoder);
+}
+
 static void begin(conn *k, struct hx_req *q) {
     k->req = q;
     q->conn = k;
@@ -291,6 +306,9 @@ static void begin(conn *k, struct hx_req *q) {
     k->out = q->request;
     q->request = tmp;
     hx_h1_next(&k->h1, q->head);
+    if (k->decoding) {
+        end_decoding(k);
+    }
     send_some(k);
 }
 
@@ -500,6 +518,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     q->client = c;
     q->user = user;
     q->head = strcmp(r->method, "HEAD") == 0;
+    q->decode = r->decode;
     q->fresh = r->fresh_connection;
     q->close_after = r->close_after;
     q->port = r->port;
@@ -571,6 +590,58 @@ static void connected(conn *k) {
     begin(k, q);
 }
 
+static const char *find_header(const char *block, size_t len, const char *name, size_t *value_len) {
+    size_t n = strlen(name);
+    const char *end = block + len;
+    const char *line = memchr(block, '\n', len);
+    while (line != NULL && ++line < end) {
+        const char *eol = memchr(line, '\r', (size_t)(end - line));
+        if (eol == NULL || eol == line) {
+            return NULL;
+        }
+        if ((size_t)(eol - line) > n + 1 && line[n] == ':' && strncasecmp(line, name, n) == 0) {
+            const char *v = line + n + 1;
+            while (v < eol && (*v == ' ' || *v == '\t')) {
+                v++;
+            }
+            *value_len = (size_t)(eol - v);
+            return v;
+        }
+        line = memchr(eol, '\n', (size_t)(end - eol));
+    }
+    return NULL;
+}
+
+static void start_decoding(conn *k, const hx_h1_event *ev) {
+    size_t len = 0;
+    const char *value = find_header(ev->data, ev->len, "content-encoding", &len);
+    if (value == NULL || k->h1.status == 204 || k->h1.status == 304) {
+        return;
+    }
+    int rc = hx_decoder_start(&k->decoder, value, len);
+    k->decoding = rc != 0;
+    k->undecodable = rc == -1;
+}
+
+static int flush_decoded(conn *k, struct hx_req *q) {
+    if (k->decoded.len == 0) {
+        return 0;
+    }
+    queued *e = enqueue(k->client, q, HX_EV_BODY);
+    if (e == NULL) {
+        fail(k, HX_ERR_NOMEM, 0);
+        return -1;
+    }
+    e->ev.data = k->decoded.data;
+    e->ev.len = k->decoded.len;
+    e->ev.status = k->h1.status;
+    e->ev.version = k->h1.version;
+    e->pin = k;
+    k->queued++;
+    k->pinned = true;
+    return 0;
+}
+
 static void receive(conn *k) {
     hx_client *c = k->client;
     ssize_t n;
@@ -598,6 +669,7 @@ static void receive(conn *k) {
     if (q->times[HX_T_FIRST_BYTE] == 0) {
         q->times[HX_T_FIRST_BYTE] = now(c);
     }
+    k->decoded.len = 0;
     size_t at = 0;
     while (at < (size_t)n && !q->done) {
         hx_h1_event events[16];
@@ -611,9 +683,29 @@ static void receive(conn *k) {
         q->received += used;
         for (int i = 0; i < count; i++) {
             if (events[i].type == HX_H1_DONE) {
+                if (k->decoding) {
+                    if (flush_decoded(k, q) == -1) {
+                        return;
+                    }
+                    end_decoding(k);
+                }
                 bool reuse = k->h1.keep_alive && !q->close_after && at == (size_t)n;
                 finish(q, HX_OK, 0, !reuse);
                 break;
+            }
+            if (events[i].type == HX_H1_HEADERS && q->decode) {
+                start_decoding(k, &events[i]);
+            }
+            if (events[i].type == HX_H1_BODY && k->decoding) {
+                if (k->undecodable) {
+                    fail(k, HX_ERR_UNKNOWN_ENCODING, 0);
+                    return;
+                }
+                if (hx_decoder_feed(&k->decoder, events[i].data, events[i].len, &k->decoded) == -1) {
+                    fail(k, HX_ERR_DECODE, 0);
+                    return;
+                }
+                continue;
             }
             queued *e = enqueue(c, q, events[i].type == HX_H1_HEADERS ? HX_EV_HEADERS : HX_EV_BODY);
             if (e == NULL) {
@@ -632,6 +724,9 @@ static void receive(conn *k) {
             fail(k, HX_ERR_PROTOCOL, 0);
             return;
         }
+    }
+    if (k->decoding && !q->done) {
+        flush_decoded(k, q);
     }
 }
 

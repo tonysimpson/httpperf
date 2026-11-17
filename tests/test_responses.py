@@ -3,6 +3,8 @@ import zlib
 
 import pytest
 
+import httpperf
+
 
 def reply(wire, head, body=b""):
     wire.reply = head.replace(b"\n", b"\r\n") + b"\r\n" + body
@@ -98,3 +100,21 @@ async def test_a_connection_the_server_closed_while_idle_is_not_used(wire, s):
     wire.close_after_reply = True
     await s.get(wire.url)
     assert (await s.get(wire.url)).body == b"ok"
+
+
+async def test_a_body_with_an_unknown_content_encoding_is_a_request_error(wire, s):
+    reply(wire, b"HTTP/1.1 200 OK\nContent-Encoding: x-made-up\nContent-Length: 3\n", b"abc")
+    with pytest.raises(httpperf.RequestError, match="Unrecognized content encoding"):
+        await s.get(wire.url)
+
+
+async def test_a_corrupt_gzip_body_is_a_request_error(wire, s):
+    reply(wire, b"HTTP/1.1 200 OK\nContent-Encoding: gzip\nContent-Length: 8\n", b"not gzip")
+    with pytest.raises(httpperf.RequestError, match="unencoding"):
+        await s.get(wire.url)
+
+
+async def test_deflate_and_gzip_are_accepted(wire, s):
+    reply(wire, b"HTTP/1.1 200 OK\nContent-Length: 0\n")
+    await s.get(wire.url)
+    assert "\r\nAccept-Encoding: deflate, gzip" in wire.head()
