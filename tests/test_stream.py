@@ -72,6 +72,12 @@ async def test_a_body_cut_short_raises(s, server):
         await r.read()
 
 
+async def test_a_finished_stream_keeps_its_status_and_version(s, server):
+    r = await s.get(server.url, stream=True)
+    await r.read()
+    assert (r.status_code, r.http_version) == (200, "HTTP/1.1")
+
+
 async def test_redirects_are_followed_when_streaming(s, server):
     r = await s.get(server.url + "/redirect", stream=True)
     assert (r.history[0].body, await r.read()) == (b"moved", b"ok")

@@ -283,10 +283,6 @@ static void queue_cleanup_item(EventLoop *loop, CURL *curl, Share *share, bool r
 
 static void queue_cleanup(EventLoop *loop, CURL *curl, Share *share) { queue_cleanup_item(loop, curl, share, true); }
 
-static void queue_failed(EventLoop *loop, CURL *curl, CURLcode result) {
-    queue_cleanup_item(loop, curl, NULL, result == CURLE_OK);
-}
-
 typedef struct {
     PyObject_HEAD EventLoop *loop;
     Share *shared;
@@ -351,6 +347,71 @@ static PyObject *buffer_to_bytes(Buffer *b, PyObject **cache) {
 enum { MSG_DONE, MSG_HEADERS, MSG_WAKE, MSG_UPLOAD_WAKE };
 enum { MSG_CANCEL = 1, MSG_RESUME = 2, MSG_RESUME_UPLOAD = 3 };
 
+typedef struct {
+    long response_code;
+    long http_version;
+    double total_time;
+    double namelookup_time;
+    double connect_time;
+    double appconnect_time;
+    double pretransfer_time;
+    double starttransfer_time;
+    curl_off_t posttransfer_us;
+    curl_off_t size_upload;
+    curl_off_t size_download;
+    char *url;
+    char *effective_url;
+    char *primary_ip;
+    char *redirect_url;
+} TransferInfo;
+
+static void info_free(TransferInfo *info) {
+    free(info->url);
+    free(info->effective_url);
+    free(info->primary_ip);
+    free(info->redirect_url);
+    *info = (TransferInfo){0};
+}
+
+static char *strdup_or_null(const char *value) { return value == NULL ? NULL : strdup(value); }
+
+static char *getinfo_strdup(CURL *curl, CURLINFO info) {
+    char *value = NULL;
+    curl_easy_getinfo(curl, info, &value);
+    return strdup_or_null(value);
+}
+
+static void info_capture(CURL *curl, TransferInfo *info, bool final) {
+    info_free(info);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &info->response_code);
+    curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &info->http_version);
+    info->primary_ip = getinfo_strdup(curl, CURLINFO_PRIMARY_IP);
+    info->redirect_url = getinfo_strdup(curl, CURLINFO_REDIRECT_URL);
+    if (!final) {
+        return;
+    }
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &info->total_time);
+    curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &info->namelookup_time);
+    curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &info->connect_time);
+    curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &info->appconnect_time);
+    curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME, &info->pretransfer_time);
+    curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME, &info->starttransfer_time);
+#if LIBCURL_VERSION_NUM >= 0x080a00
+    curl_easy_getinfo(curl, CURLINFO_POSTTRANSFER_TIME_T, &info->posttransfer_us);
+#endif
+    curl_easy_getinfo(curl, CURLINFO_SIZE_UPLOAD_T, &info->size_upload);
+    curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &info->size_download);
+}
+
+static void info_copy_headers(TransferInfo *dst, const TransferInfo *src) {
+    info_free(dst);
+    dst->response_code = src->response_code;
+    dst->http_version = src->http_version;
+    dst->url = strdup_or_null(src->url);
+    dst->primary_ip = strdup_or_null(src->primary_ip);
+    dst->redirect_url = strdup_or_null(src->redirect_url);
+}
+
 typedef struct Stream {
     pthread_mutex_t lock;
     atomic_int refs;
@@ -359,8 +420,6 @@ typedef struct Stream {
     bool paused;
     bool want_wake;
     bool complete;
-    bool response_alive;
-    bool owns_curl;
     PyObject *waiter;
     struct AcRequestData *rd;
     struct AcRequestData *owner;
@@ -368,11 +427,7 @@ typedef struct Stream {
     double paused_time;
     CURLcode result;
     char *error;
-    long response_code;
-    long http_version;
-    char *effective_url;
-    char *primary_ip;
-    char *redirect_url;
+    TransferInfo info;
 } Stream;
 
 static Stream *stream_new(void) {
@@ -393,9 +448,7 @@ static void stream_decref(Stream *s) {
     free(s->buf.data);
     free(s->spare.data);
     free(s->error);
-    free(s->effective_url);
-    free(s->primary_ip);
-    free(s->redirect_url);
+    info_free(&s->info);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -476,6 +529,7 @@ typedef struct AcRequestData {
     Share *limiter;
     CURL *curl;
     CURLcode result;
+    TransferInfo info;
     Buffer header;
     Buffer body;
     bool discard_body;
@@ -588,7 +642,7 @@ typedef struct {
     PyObject *header_bytes;
     PyObject *body_bytes;
     Session *session;
-    CURL *curl;
+    TransferInfo info;
     double queue_time;
 } Response;
 
@@ -624,19 +678,13 @@ static void Response_dealloc(Response *self) {
         Stream *s = self->stream;
         stream_cancel(s, self->session->loop);
         pthread_mutex_lock(&s->lock);
-        s->response_alive = false;
         PyObject *waiter = s->waiter;
         s->waiter = NULL;
-        bool owns_curl = s->owns_curl;
         pthread_mutex_unlock(&s->lock);
         Py_XDECREF(waiter);
-        if (owns_curl) {
-            queue_failed(self->session->loop, self->curl, s->result);
-        }
         stream_decref(s);
-    } else {
-        queue_cleanup(self->session->loop, self->curl, NULL);
     }
+    info_free(&self->info);
     Py_XDECREF(self->session);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -845,112 +893,106 @@ static PyObject *upload_finished(Upload *u) {
     return waiter;
 }
 
-static bool info_from_stream(Response *self, CURLINFO info, void *value) {
-    Stream *s = self->stream;
-    if (s == NULL) {
-        return false;
+static TransferInfo *info_begin(Response *self) {
+    if (self->stream == NULL) {
+        return &self->info;
     }
-    pthread_mutex_lock(&s->lock);
-    bool complete = s->complete;
-    pthread_mutex_unlock(&s->lock);
-    if (complete) {
-        return false;
-    }
-    switch (info) {
-    case CURLINFO_RESPONSE_CODE:
-        *(long *)value = s->response_code;
-        return true;
-    case CURLINFO_HTTP_VERSION:
-        *(long *)value = s->http_version;
-        return true;
-    case CURLINFO_EFFECTIVE_URL:
-        *(char **)value = s->effective_url;
-        return true;
-    case CURLINFO_PRIMARY_IP:
-        *(char **)value = s->primary_ip;
-        return true;
-    case CURLINFO_REDIRECT_URL:
-        *(char **)value = s->redirect_url;
-        return true;
-    default:
-        return false;
+    pthread_mutex_lock(&self->stream->lock);
+    return &self->stream->info;
+}
+
+static void info_end(Response *self) {
+    if (self->stream != NULL) {
+        pthread_mutex_unlock(&self->stream->lock);
     }
 }
 
-static void response_getinfo(Response *self, CURLINFO info, void *value) {
-    if (!info_from_stream(self, info, value)) {
-        curl_easy_getinfo(self->curl, info, value);
-    }
-}
-
-PyObject *resp_get_info_long(Response *self, CURLINFO info) {
-    long value;
-    response_getinfo(self, info, &value);
-    return PyLong_FromLong(value);
-}
-
-PyObject *resp_get_info_double(Response *self, CURLINFO info) {
-    double value;
-    curl_easy_getinfo(self->curl, info, &value);
-    return PyFloat_FromDouble(value);
-}
-
-PyObject *resp_get_info_off_t(Response *self, CURLINFO info) {
-    curl_off_t value;
-    curl_easy_getinfo(self->curl, info, &value);
-    return PyLong_FromLongLong(value);
-}
-
-PyObject *resp_get_info_unicode(Response *self, CURLINFO info) {
-    char *value = NULL;
-    response_getinfo(self, info, &value);
+static PyObject *str_or_none(const char *value) {
     if (value == NULL) {
         Py_RETURN_NONE;
     }
     return PyUnicode_FromString(value);
 }
 
-#define RESPONSE_GETINFO(name, kind, info) \
-    static PyObject *Response_get_##name(Response *self, PyObject *args) { return resp_get_info_##kind(self, info); }
-
-#define RESPONSE_GETINFO_FINAL(name, kind, info)                               \
-    static PyObject *Response_get_##name(Response *self, PyObject *args) {     \
-        return response_final(self) ? resp_get_info_##kind(self, info) : NULL; \
+#define RESPONSE_INFO(name, field, convert)                                \
+    static PyObject *Response_get_##name(Response *self, PyObject *args) { \
+        TransferInfo *info = info_begin(self);                             \
+        PyObject *value = convert(info->field);                            \
+        info_end(self);                                                    \
+        return value;                                                      \
     }
 
-RESPONSE_GETINFO(effective_url, unicode, CURLINFO_EFFECTIVE_URL)
-RESPONSE_GETINFO(response_code, long, CURLINFO_RESPONSE_CODE)
-RESPONSE_GETINFO_FINAL(total_time, double, CURLINFO_TOTAL_TIME)
-RESPONSE_GETINFO_FINAL(namelookup_time, double, CURLINFO_NAMELOOKUP_TIME)
-RESPONSE_GETINFO_FINAL(connect_time, double, CURLINFO_CONNECT_TIME)
-RESPONSE_GETINFO_FINAL(appconnect_time, double, CURLINFO_APPCONNECT_TIME)
-RESPONSE_GETINFO_FINAL(pretransfer_time, double, CURLINFO_PRETRANSFER_TIME)
-RESPONSE_GETINFO_FINAL(starttransfer_time, double, CURLINFO_STARTTRANSFER_TIME)
-RESPONSE_GETINFO_FINAL(size_upload, off_t, CURLINFO_SIZE_UPLOAD_T)
-RESPONSE_GETINFO_FINAL(size_download, off_t, CURLINFO_SIZE_DOWNLOAD_T)
-RESPONSE_GETINFO(primary_ip, unicode, CURLINFO_PRIMARY_IP)
-RESPONSE_GETINFO(redirect_url, unicode, CURLINFO_REDIRECT_URL)
+#define RESPONSE_INFO_FINAL(name, field, convert)                          \
+    static PyObject *Response_get_##name(Response *self, PyObject *args) { \
+        if (!response_final(self)) {                                       \
+            return NULL;                                                   \
+        }                                                                  \
+        TransferInfo *info = info_begin(self);                             \
+        PyObject *value = convert(info->field);                            \
+        info_end(self);                                                    \
+        return value;                                                      \
+    }
 
+static PyObject *us_to_seconds(curl_off_t us) { return PyFloat_FromDouble(us / 1e6); }
+
+static char *url_without_credentials(const char *url) {
+    char *result = NULL;
+    CURLU *u = curl_url();
+    if (u != NULL && curl_url_set(u, CURLUPART_URL, url, CURLU_NON_SUPPORT_SCHEME) == CURLUE_OK &&
+        curl_url_set(u, CURLUPART_USER, NULL, 0) == CURLUE_OK &&
+        curl_url_set(u, CURLUPART_PASSWORD, NULL, 0) == CURLUE_OK) {
+        char *clean = NULL;
+        if (curl_url_get(u, CURLUPART_URL, &clean, CURLU_GET_EMPTY) == CURLUE_OK) {
+            result = strdup(clean);
+        }
+        curl_free(clean);
+    }
+    curl_url_cleanup(u);
+    return result != NULL ? result : strdup(url);
+}
+
+static PyObject *Response_get_effective_url_unlocked(Response *self, PyObject *args) {
+    TransferInfo *info = info_begin(self);
+    if (info->effective_url == NULL && info->url != NULL) {
+        info->effective_url = url_without_credentials(info->url);
+    }
+    PyObject *value = str_or_none(info->effective_url);
+    info_end(self);
+    return value;
+}
+
+LOCKED(Response_get_effective_url, Response)
+RESPONSE_INFO(response_code, response_code, PyLong_FromLong)
+RESPONSE_INFO_FINAL(total_time, total_time, PyFloat_FromDouble)
+RESPONSE_INFO_FINAL(namelookup_time, namelookup_time, PyFloat_FromDouble)
+RESPONSE_INFO_FINAL(connect_time, connect_time, PyFloat_FromDouble)
+RESPONSE_INFO_FINAL(appconnect_time, appconnect_time, PyFloat_FromDouble)
+RESPONSE_INFO_FINAL(pretransfer_time, pretransfer_time, PyFloat_FromDouble)
+RESPONSE_INFO_FINAL(starttransfer_time, starttransfer_time, PyFloat_FromDouble)
+RESPONSE_INFO_FINAL(size_upload, size_upload, PyLong_FromLongLong)
+RESPONSE_INFO_FINAL(size_download, size_download, PyLong_FromLongLong)
+RESPONSE_INFO(primary_ip, primary_ip, str_or_none)
+RESPONSE_INFO(redirect_url, redirect_url, str_or_none)
+
+#if LIBCURL_VERSION_NUM >= 0x080a00
+RESPONSE_INFO_FINAL(posttransfer_time, posttransfer_us, us_to_seconds)
+#else
 static PyObject *Response_get_posttransfer_time(Response *self, PyObject *args) {
     if (!response_final(self)) {
         return NULL;
     }
-#if LIBCURL_VERSION_NUM >= 0x080a00
-    curl_off_t value = 0;
-    curl_easy_getinfo(self->curl, CURLINFO_POSTTRANSFER_TIME_T, &value);
-    return PyFloat_FromDouble(value / 1e6);
-#else
     Py_RETURN_NONE;
-#endif
 }
+#endif
 
 static PyObject *Response_get_queue_time(Response *self, PyObject *args) {
     return PyFloat_FromDouble(self->queue_time);
 }
 
 static PyObject *Response_get_http_version(Response *self, PyObject *args) {
-    long version = 0;
-    response_getinfo(self, CURLINFO_HTTP_VERSION, &version);
+    TransferInfo *info = info_begin(self);
+    long version = info->http_version;
+    info_end(self);
     switch (version) {
     case CURL_HTTP_VERSION_1_0:
         return PyUnicode_FromString("HTTP/1.0");
@@ -1453,6 +1495,9 @@ static void dispatch_waiting(EventLoop *loop, Share *share) {
 }
 
 static void release_request(EventLoop *loop, AcRequestData *rd) {
+    info_capture(rd->curl, &rd->info, true);
+    rd->info.url = rd->url;
+    rd->url = NULL;
     if (rd->stream != NULL) {
         pthread_mutex_lock(&rd->stream->lock);
         paused_until_now(&rd->stream->paused_since, &rd->stream->paused_time);
@@ -1482,6 +1527,13 @@ static void release_request(EventLoop *loop, AcRequestData *rd) {
     }
     share_decref(rd->share);
     rd->share = NULL;
+    if (rd->result == CURLE_OK && loop->free_handle_count < HANDLE_POOL_SIZE) {
+        curl_easy_reset(rd->curl);
+        loop->free_handles[loop->free_handle_count++] = rd->curl;
+    } else {
+        curl_easy_cleanup(rd->curl);
+    }
+    rd->curl = NULL;
 }
 
 static void send_message(EventLoop *loop, AcRequestData *rd, int kind) {
@@ -1518,19 +1570,14 @@ static void send_message(EventLoop *loop, AcRequestData *rd, int kind) {
 
 static void send_request(EventLoop *loop, AcRequestData *rd) { send_message(loop, rd, MSG_DONE); }
 
-static char *getinfo_strdup(CURL *curl, CURLINFO info) {
-    char *value = NULL;
-    curl_easy_getinfo(curl, info, &value);
-    return value == NULL ? NULL : strdup(value);
-}
-
 static void send_headers(EventLoop *loop, AcRequestData *rd) {
     Stream *s = rd->stream;
-    curl_easy_getinfo(rd->curl, CURLINFO_RESPONSE_CODE, &s->response_code);
-    curl_easy_getinfo(rd->curl, CURLINFO_HTTP_VERSION, &s->http_version);
-    s->effective_url = getinfo_strdup(rd->curl, CURLINFO_EFFECTIVE_URL);
-    s->primary_ip = getinfo_strdup(rd->curl, CURLINFO_PRIMARY_IP);
-    s->redirect_url = getinfo_strdup(rd->curl, CURLINFO_REDIRECT_URL);
+    if (rd->curl != NULL) {
+        info_capture(rd->curl, &s->info, false);
+        s->info.url = strdup_or_null(rd->url);
+    } else {
+        info_copy_headers(&s->info, &rd->info);
+    }
     rd->headers_sent = true;
     send_message(loop, rd, MSG_HEADERS);
 }
@@ -1969,8 +2016,6 @@ void start_request(struct aeEventLoop *eventLoop, int fd, void *clientData, int 
     }
     free(rd->method);
     rd->method = NULL;
-    free(rd->url);
-    rd->url = NULL;
     if (rd->auth != NULL) {
         free(rd->auth);
         rd->auth = NULL;
@@ -2300,9 +2345,11 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
                 Py_DECREF(waiter);
             }
             Py_DECREF(rd->session);
-        } else if (rd->curl != NULL) {
+        }
+        if (rd->curl != NULL) {
             curl_easy_cleanup(rd->curl);
         }
+        info_free(&rd->info);
         if (rd->share != NULL) {
             share_decref(rd->share);
         }
@@ -2431,7 +2478,11 @@ static Response *response_from(AcRequestData *rd) {
     }
     response->header_bytes = NULL;
     response->body_bytes = NULL;
-    response->curl = rd->curl;
+    response->info = (TransferInfo){0};
+    if (rd->stream == NULL) {
+        response->info = rd->info;
+        rd->info = (TransferInfo){0};
+    }
     response->session = rd->session;
     response->queue_time = rd->queue_time;
     return response;
@@ -2444,14 +2495,14 @@ static PyObject *stream_finish(EventLoop *loop, AcRequestData *rd, CURLcode resu
     s->result = result;
     s->error = result == CURLE_OK ? NULL : strdup(error);
     s->owner = NULL;
-    s->owns_curl = s->response_alive;
-    bool cleanup = !s->response_alive;
+    if (rd->curl == NULL) {
+        info_free(&s->info);
+        s->info = rd->info;
+        rd->info = (TransferInfo){0};
+    }
     PyObject *waiter = s->waiter;
     s->waiter = NULL;
     pthread_mutex_unlock(&s->lock);
-    if (cleanup) {
-        queue_failed(loop, rd->curl, result);
-    }
     return waiter;
 }
 
@@ -2495,9 +2546,6 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
             Py_INCREF(rd->session);
             response->stream = rd->stream;
             stream_incref(rd->stream);
-            pthread_mutex_lock(&rd->stream->lock);
-            rd->stream->response_alive = true;
-            pthread_mutex_unlock(&rd->stream->lock);
             rd->delivered = true;
             append_completed(list, NULL, (PyObject *)response, rd->future);
             rd->future = NULL;
@@ -2524,13 +2572,13 @@ static PyObject *Eventloop_get_completed(PyObject *self, PyObject *args) {
         } else if (rd->result == CURLE_OK) {
             append_completed(list, NULL, (PyObject *)response_from(rd), rd->future);
         } else {
-            queue_failed(rd->session->loop, rd->curl, rd->result);
             Py_DECREF(rd->session);
             append_completed(list, Py_BuildValue("(is)", rd->result, error), NULL, rd->future);
         }
         free(rd->header.data);
         free(rd->body.data);
         free(rd->req_data_buf);
+        info_free(&rd->info);
         Py_XDECREF(rd->cookies);
         if (rd->stream != NULL) {
             stream_decref(rd->stream);

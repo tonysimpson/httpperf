@@ -57,6 +57,12 @@ async def test_credentials_in_the_url_are_basic_auth(httpbin, s, user, password)
     assert (await s.get(url)).status_code == 200
 
 
+@pytest.mark.parametrize("stream", [False, True])
+async def test_a_responses_url_leaves_out_the_credentials(httpbin, s, stream):
+    r = await s.get(httpbin.url.replace("//", "//user:pw@") + "/get", stream=stream)
+    assert r.url == httpbin.url + "/get"
+
+
 async def test_cookies_are_sent_to_a_url_with_credentials(httpbin, s):
     await s.get(httpbin.url + "/cookies/set?a=1")
     url = httpbin.url.replace("//", "//user:pw@") + "/cookies"
