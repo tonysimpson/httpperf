@@ -36,6 +36,9 @@ typedef struct conn {
     bool want_read;
     int64_t idle_since;
     int64_t idle_timeout;
+    int64_t created;
+    uint64_t pool;
+    bool closing;
     int64_t connect_deadline;
     struct sockaddr_storage addrs[MAX_ADDRS];
     socklen_t addr_lens[MAX_ADDRS];
@@ -72,6 +75,8 @@ struct hx_req {
     bool head;
     bool decode;
     bool fresh;
+    int64_t max_age;
+    uint64_t pool;
     bool close_after;
     int64_t idle_timeout;
     bool done;
@@ -101,6 +106,7 @@ struct hx_client {
     hx_io io;
     uint64_t next_conn_id;
     size_t open;
+    size_t idle;
     conn *conns;
     conn **by_fd;
     size_t by_fd_len;
@@ -185,6 +191,9 @@ static void conn_close(conn *k) {
         return;
     }
     hx_client *c = k->client;
+    if (k->state == CONN_IDLE) {
+        c->idle--;
+    }
     if (k->fd >= 0) {
         watch(k, 0);
         close(k->fd);
@@ -193,6 +202,9 @@ static void conn_close(conn *k) {
     k->state = CONN_CLOSED;
     c->open--;
     UNLINK(c->conns, k);
+    if (k->pool != 0 && c->io.connection != NULL) {
+        c->io.connection(c->io.ctx, k->pool, -1);
+    }
     if (k->req != NULL) {
         k->req->conn = NULL;
         k->req = NULL;
@@ -220,6 +232,9 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         q->lookup = NULL;
     }
     conn *k = q->conn;
+    if (!closed && k != NULL && (k->closing || (c->cfg.max_idle > 0 && c->idle >= c->cfg.max_idle))) {
+        closed = true;
+    }
     queued *e = enqueue(c, q, HX_EV_DONE);
     if (e != NULL) {
         e->ev.error = error;
@@ -245,6 +260,7 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
             conn_close(k);
         } else {
             k->state = CONN_IDLE;
+            c->idle++;
             k->idle_since = now(c);
             k->idle_timeout = q->idle_timeout;
             schedule(c, k->idle_timeout > 0 ? k->idle_since + k->idle_timeout : 0);
@@ -297,6 +313,9 @@ static void end_decoding(conn *k) {
 }
 
 static void begin(conn *k, struct hx_req *q) {
+    if (k->state == CONN_IDLE) {
+        k->client->idle--;
+    }
     k->req = q;
     q->conn = k;
     k->state = CONN_BUSY;
@@ -391,8 +410,13 @@ static conn *conn_open(hx_client *c, struct hx_req *q, const struct addrinfo *ai
         return NULL;
     }
     k->id = ++c->next_conn_id;
+    k->created = now(c);
+    k->pool = q->pool;
     LINK(c->conns, k);
     c->open++;
+    if (k->pool != 0 && c->io.connection != NULL) {
+        c->io.connection(c->io.ctx, k->pool, 1);
+    }
     k->state = CONN_CONNECTING;
     k->req = q;
     q->conn = k;
@@ -501,11 +525,18 @@ static void resolved(hx_client *c) {
     }
 }
 
-static conn *find_idle(hx_client *c, const char *key) {
-    for (conn *k = c->conns; k != NULL; k = k->next) {
-        if (k->state == CONN_IDLE && !k->pinned && strcmp(k->key, key) == 0) {
-            return k;
+static conn *find_idle(hx_client *c, const char *key, int64_t max_age) {
+    int64_t t = max_age > 0 ? now(c) : 0;
+    for (conn *k = c->conns, *after; k != NULL; k = after) {
+        after = k->next;
+        if (k->state != CONN_IDLE || k->pinned || strcmp(k->key, key) != 0) {
+            continue;
         }
+        if (max_age > 0 && t - k->created >= max_age) {
+            conn_close(k);
+            continue;
+        }
+        return k;
     }
     return NULL;
 }
@@ -519,6 +550,8 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     q->user = user;
     q->head = strcmp(r->method, "HEAD") == 0;
     q->decode = r->decode;
+    q->max_age = r->max_age_ns;
+    q->pool = r->pool;
     q->fresh = r->fresh_connection;
     q->close_after = r->close_after;
     q->port = r->port;
@@ -536,7 +569,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
         finish(q, rc == HX_EINVAL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
         return q;
     }
-    conn *k = q->fresh ? NULL : find_idle(c, q->key);
+    conn *k = q->fresh ? NULL : find_idle(c, q->key, q->max_age);
     if (k != NULL) {
         q->reused = true;
         q->times[HX_T_DNS] = q->times[HX_T_CONNECT] = q->times[HX_T_TLS] = q->times[HX_T_START];
@@ -836,6 +869,20 @@ int hx_client_events(hx_client *c, hx_event *out, int max) {
 }
 
 size_t hx_client_open_connections(const hx_client *c) { return c->open; }
+
+void hx_client_close_pool(hx_client *c, uint64_t pool) {
+    for (conn *k = c->conns, *after; k != NULL; k = after) {
+        after = k->next;
+        if (k->pool != pool) {
+            continue;
+        }
+        if (k->state == CONN_IDLE) {
+            conn_close(k);
+        } else {
+            k->closing = true;
+        }
+    }
+}
 
 hx_client *hx_client_new(const hx_config *cfg, hx_io io) {
     hx_client *c = calloc(1, sizeof(hx_client));

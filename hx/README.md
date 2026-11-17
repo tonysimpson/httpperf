@@ -5,7 +5,7 @@ The start of an HTTP client library to replace libcurl in httpperf. It lives her
 So far:
 
 - `include/hx.h`, the public interface: a client driven by the caller's loop (socket readiness, one timer, a clock), requests started and cancelled, and events pulled with `hx_client_events`.
-- `src/client.c`, the connection layer: plain HTTP/1.1 over TCP (no TLS yet), trying each address a name resolves to in turn, a keep-alive pool that drops connections the server closes, idle, request and connect timeouts, cancel, and timestamps and byte counts in every `DONE`. Event data stays valid until the next `hx_client_events` call.
+- `src/client.c`, the connection layer: plain HTTP/1.1 over TCP (no TLS yet), trying each address a name resolves to in turn, a keep-alive pool that drops connections the server closes (capped at `max_idle` idle connections in all, each reused only until `max_age_ns`), pools closed on request with `hx_client_close_pool` and counted through the optional `connection` hook, idle, request and connect timeouts, cancel, and timestamps and byte counts in every `DONE`. Event data stays valid until the next `hx_client_events` call.
 - `src/dns.c`, name lookups: `getaddrinfo` on up to four worker threads, results handed back through a pipe the caller watches. The client shares one lookup between requests for the same host and port and keeps results for `dns_ttl_ns` (60 seconds by default).
 - `src/decode.c`, gzip and deflate (with or without the zlib header) bodies decoded with zlib, including stacked codings such as `gzip, gzip`. A request asks for it with `decode`; an unknown coding fails only once body bytes arrive, as in curl.
 - `src/h1.c`, the sans-I/O HTTP/1.1 core, which writes requests and parses responses (with llhttp) into events.

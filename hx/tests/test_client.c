@@ -130,10 +130,21 @@ typedef struct {
 
 static loop the_loop;
 
-static hx_client *client(int64_t idle_timeout_ns) {
+static long pool_seven_open;
+
+static void count_connections(void *ctx, uint64_t pool, int delta) {
+    if (pool == 7) {
+        pool_seven_open += delta;
+    }
+}
+
+static hx_client *client_with(hx_config cfg) {
     the_loop = (loop){.epoll = epoll_create1(0)};
-    hx_config cfg = {.max_idle_per_host = 8, .idle_timeout_ns = idle_timeout_ns};
-    return hx_client_new(&cfg, (hx_io){watch, set_timer, clock_ns, &the_loop});
+    return hx_client_new(&cfg, (hx_io){watch, set_timer, clock_ns, &the_loop, count_connections});
+}
+
+static hx_client *client(int64_t idle_timeout_ns) {
+    return client_with((hx_config){.max_idle = 8, .idle_timeout_ns = idle_timeout_ns});
 }
 
 static void run(hx_client *c, outcome *o, int wanted, int max_ms) {
@@ -439,6 +450,70 @@ static void test_the_connection_is_reused_after_a_decoded_body(void) {
     finish_client(c);
 }
 
+static void test_only_max_idle_connections_stay_open(void) {
+    hx_client *c = client_with((hx_config){.max_idle = 1});
+    outcome o[3] = {0};
+    hx_request r = get("/");
+    for (int i = 0; i < 3; i++) {
+        hx_request_start(c, &r, &o[i]);
+    }
+    run(c, NULL, 3, 2000);
+    CHECK(o[0].status == 200 && o[1].status == 200 && o[2].status == 200 && hx_client_open_connections(c) == 1);
+    finish_client(c);
+}
+
+static void test_a_connection_past_its_max_age_is_not_reused(void) {
+    hx_client *c = client(0);
+    outcome first = {0}, second = {0};
+    hx_request r = get("/");
+    r.max_age_ns = 1000000;
+    hx_request_start(c, &r, &first);
+    run(c, &first, 1, 2000);
+    usleep(5000);
+    hx_request_start(c, &r, &second);
+    run(c, &second, 1, 2000);
+    CHECK(second.status == 200 && !second.last.reused && hx_client_open_connections(c) == 1);
+    finish_client(c);
+}
+
+static void test_the_connection_hook_counts_a_pools_connections(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/");
+    r.pool = 7;
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 2000);
+    CHECK(o.status == 200 && pool_seven_open == 1);
+    finish_client(c);
+    CHECK(pool_seven_open == 0);
+}
+
+static void test_closing_a_pool_closes_its_idle_connections(void) {
+    hx_client *c = client(0);
+    outcome mine = {0}, other = {0};
+    hx_request r = get("/");
+    r.pool = 7;
+    hx_request shared = get("/");
+    hx_request_start(c, &r, &mine);
+    hx_request_start(c, &shared, &other);
+    run(c, NULL, 2, 2000);
+    hx_client_close_pool(c, 7);
+    CHECK(pool_seven_open == 0 && hx_client_open_connections(c) == 1);
+    finish_client(c);
+}
+
+static void test_closing_a_pool_closes_a_busy_connection_once_its_request_ends(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/");
+    r.pool = 7;
+    hx_request_start(c, &r, &o);
+    hx_client_close_pool(c, 7);
+    run(c, &o, 1, 2000);
+    CHECK(o.status == 200 && o.last.connection_closed && hx_client_open_connections(c) == 0);
+    finish_client(c);
+}
+
 static void test_times_are_in_order(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -491,6 +566,11 @@ int main(void) {
     test_a_gzip_body_is_decoded_when_asked();
     test_a_gzip_body_is_left_alone_otherwise();
     test_the_connection_is_reused_after_a_decoded_body();
+    test_only_max_idle_connections_stay_open();
+    test_a_connection_past_its_max_age_is_not_reused();
+    test_the_connection_hook_counts_a_pools_connections();
+    test_closing_a_pool_closes_its_idle_connections();
+    test_closing_a_pool_closes_a_busy_connection_once_its_request_ends();
     test_times_are_in_order();
     test_many_requests_at_once();
     printf(failures ? "%d failed\n" : "all passed\n", failures);

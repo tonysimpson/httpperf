@@ -14,10 +14,11 @@ typedef struct {
     void (*set_timer)(void *ctx, int64_t deadline_ns);
     int64_t (*now)(void *ctx);
     void *ctx;
+    void (*connection)(void *ctx, uint64_t pool, int delta);
 } hx_io;
 
 typedef struct {
-    size_t max_idle_per_host;
+    size_t max_idle;
     int64_t idle_timeout_ns;
     size_t read_size;
     int64_t dns_ttl_ns;
@@ -40,6 +41,7 @@ typedef struct {
     int64_t timeout_ns;
     int64_t connect_timeout_ns;
     bool decode;
+    int64_t max_age_ns;
 } hx_request;
 
 typedef enum { HX_EV_HEADERS = 1, HX_EV_BODY, HX_EV_DONE } hx_event_type;
@@ -99,6 +101,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user);
 void hx_request_cancel(hx_req *q);
 int hx_client_events(hx_client *c, hx_event *out, int max);
 size_t hx_client_open_connections(const hx_client *c);
+void hx_client_close_pool(hx_client *c, uint64_t pool);
 void hx_client_free(hx_client *c);
 
 #endif

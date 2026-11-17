@@ -34,14 +34,49 @@ enum {
 };
 
 typedef struct {
-    atomic_long requests, errors, cancelled, connections, bytes_sent, bytes_received, running;
+    atomic_long requests, errors, cancelled, connections, bytes_sent, bytes_received, running, queued;
     atomic_long http_versions[4];
 } Stats;
 
 typedef struct EventLoop EventLoop;
 typedef struct Session Session;
+typedef struct Request Request;
 
-typedef struct Request {
+typedef struct Slot {
+    char key[300];
+    long active;
+    long waiting;
+    Request *head, *tail;
+    struct Slot *next;
+    struct Slot *ready_prev, *ready_next;
+    bool ready;
+} Slot;
+
+typedef struct Pool {
+    atomic_int refs;
+    atomic_long open;
+    struct Pool *next;
+} Pool;
+
+static void pool_decref(Pool *p) {
+    if (p != NULL && atomic_fetch_sub(&p->refs, 1) == 1) {
+        free(p);
+    }
+}
+
+typedef struct Limiter {
+    atomic_int refs;
+    pthread_mutex_t lock;
+    long max_host, max_total;
+    long connections;
+    Slot *slots;
+    Slot *ready_head, *ready_tail;
+    bool dispatching;
+    bool pending;
+    struct Limiter *pending_next;
+} Limiter;
+
+struct Request {
     atomic_int refs;
     struct Request *next;
     struct Request *cancel_next;
@@ -75,7 +110,14 @@ typedef struct Request {
     hx_buf received;
     uint64_t body_bytes;
     hx_event done;
-} Request;
+    int64_t max_age_ns;
+    Limiter *limiter;
+    Slot *slot;
+    Request *wait_prev, *wait_next;
+    bool waiting;
+    int64_t queued_at;
+    int64_t queue_ns;
+};
 
 struct EventLoop {
     PyObject_HEAD aeEventLoop *ae;
@@ -90,12 +132,15 @@ struct EventLoop {
     Request *abandoned;
     pthread_mutex_t lock;
     Request *incoming, *incoming_tail;
+    Pool *closing;
     Request *cancels, *cancels_tail;
     Request *completed, *completed_tail;
     Request *live;
     Stats stats;
     atomic_long open;
     size_t buffer_size;
+    Limiter *limiter;
+    Limiter *pending;
 };
 
 struct Session {
@@ -104,6 +149,9 @@ struct Session {
     bool own_pool;
     bool fresh;
     long idle_timeout;
+    long max_connection_age;
+    Limiter *limiter;
+    Pool *pool;
     Stats stats;
 };
 
@@ -115,6 +163,7 @@ typedef struct {
     PyObject *body_bytes;
     bool body_discarded;
     double times[HX_T_COUNT];
+    double queue_time;
     long long size_upload;
     long long size_download;
     char primary_ip[46];
@@ -164,6 +213,8 @@ static void free_strings(char **strings, size_t count) {
     free(strings);
 }
 
+static void limiter_decref(struct Limiter *l);
+
 static void request_free(Request *r) {
     free(r->url);
     free(r->host);
@@ -174,6 +225,7 @@ static void request_free(Request *r) {
     free(r->body);
     hx_buf_free(&r->header);
     hx_buf_free(&r->received);
+    limiter_decref(r->limiter);
     free(r);
 }
 
@@ -211,6 +263,9 @@ STAT(connections)
 STAT(bytes_sent)
 STAT(bytes_received)
 STAT(running)
+STAT(queued)
+
+static void slot_release(EventLoop *loop, Request *r);
 
 static void complete(EventLoop *loop, Request *r) {
     if (r->live_prev != NULL) {
@@ -231,9 +286,12 @@ static void complete(EventLoop *loop, Request *r) {
     }
 }
 
+static bool dispatch_pending(EventLoop *loop);
+
 static void handle_events(EventLoop *loop) {
     hx_event events[64];
     int count;
+again:
     while ((count = hx_client_events(loop->client, events, 64)) > 0) {
         for (int i = 0; i < count; i++) {
             hx_event *e = &events[i];
@@ -265,9 +323,13 @@ static void handle_events(EventLoop *loop) {
                     atomic_fetch_add_explicit(&r->session_stats->http_versions[e->version - 10], 1,
                                               memory_order_relaxed);
                 }
+                slot_release(loop, r);
                 complete(loop, r);
             }
         }
+    }
+    if (dispatch_pending(loop)) {
+        goto again;
     }
     atomic_store_explicit(&loop->open, (long)hx_client_open_connections(loop->client), memory_order_relaxed);
 }
@@ -276,6 +338,17 @@ static void on_fd(aeEventLoop *ae, int fd, void *data, int mask) {
     EventLoop *loop = data;
     hx_client_on_socket(loop->client, fd, (mask & AE_READABLE ? HX_READ : 0) | (mask & AE_WRITABLE ? HX_WRITE : 0));
     handle_events(loop);
+}
+
+static void on_connection(void *ctx, uint64_t pool, int delta) {
+    Pool *p = (Pool *)(uintptr_t)pool;
+    if (delta > 0) {
+        atomic_fetch_add(&p->refs, 1);
+        atomic_fetch_add_explicit(&p->open, 1, memory_order_relaxed);
+    } else {
+        atomic_fetch_sub_explicit(&p->open, 1, memory_order_relaxed);
+        pool_decref(p);
+    }
 }
 
 static void watch(void *ctx, hx_socket s, int events) {
@@ -308,7 +381,238 @@ static void set_timer(void *ctx, int64_t deadline) {
     loop->timer_id = aeCreateTimeEvent(loop->ae, ms < 0 ? 0 : ms, on_timer, loop, NULL);
 }
 
+static Limiter *limiter_new(long max_host, long max_total) {
+    Limiter *l = calloc(1, sizeof(Limiter));
+    if (l != NULL) {
+        atomic_init(&l->refs, 1);
+        pthread_mutex_init(&l->lock, NULL);
+        l->max_host = max_host;
+        l->max_total = max_total;
+    }
+    return l;
+}
+
+static void limiter_decref(Limiter *l) {
+    if (l == NULL || atomic_fetch_sub(&l->refs, 1) != 1) {
+        return;
+    }
+    while (l->slots != NULL) {
+        Slot *h = l->slots;
+        l->slots = h->next;
+        free(h);
+    }
+    pthread_mutex_destroy(&l->lock);
+    free(l);
+}
+
+static Slot *slot_for(Limiter *l, const Request *r) {
+    char key[300];
+    snprintf(key, sizeof(key), "http://%s:%u", r->host, r->port);
+    for (Slot *h = l->slots; h != NULL; h = h->next) {
+        if (strcmp(h->key, key) == 0) {
+            return h;
+        }
+    }
+    Slot *h = calloc(1, sizeof(Slot));
+    if (h != NULL) {
+        memcpy(h->key, key, sizeof(key));
+        pthread_mutex_lock(&l->lock);
+        h->next = l->slots;
+        l->slots = h;
+        pthread_mutex_unlock(&l->lock);
+    }
+    return h;
+}
+
+static bool slot_free(const Limiter *l, const Slot *h) {
+    if (l->max_host && h->active >= l->max_host) {
+        return false;
+    }
+    return !l->max_total || l->connections < l->max_total;
+}
+
+static void slot_use(Limiter *l, Slot *h, long delta) {
+    pthread_mutex_lock(&l->lock);
+    h->active += delta;
+    l->connections += delta;
+    pthread_mutex_unlock(&l->lock);
+}
+
+static void ready_remove(Limiter *l, Slot *h) {
+    if (h->ready_prev != NULL) {
+        h->ready_prev->ready_next = h->ready_next;
+    } else {
+        l->ready_head = h->ready_next;
+    }
+    if (h->ready_next != NULL) {
+        h->ready_next->ready_prev = h->ready_prev;
+    } else {
+        l->ready_tail = h->ready_prev;
+    }
+    h->ready_prev = h->ready_next = NULL;
+    h->ready = false;
+}
+
+static void ready_append(Limiter *l, Slot *h) {
+    h->ready_prev = l->ready_tail;
+    if (l->ready_tail != NULL) {
+        l->ready_tail->ready_next = h;
+    } else {
+        l->ready_head = h;
+    }
+    l->ready_tail = h;
+    h->ready = true;
+}
+
+static void wait_push(EventLoop *loop, Request *r) {
+    Limiter *l = r->limiter;
+    Slot *h = r->slot;
+    r->wait_prev = h->tail;
+    r->wait_next = NULL;
+    if (h->tail != NULL) {
+        h->tail->wait_next = r;
+    } else {
+        h->head = r;
+    }
+    h->tail = r;
+    pthread_mutex_lock(&l->lock);
+    h->waiting++;
+    pthread_mutex_unlock(&l->lock);
+    r->waiting = true;
+    r->queued_at = clock_ns();
+    stats_add(loop, r, stat_queued, 1);
+    if (!h->ready) {
+        ready_append(l, h);
+    }
+}
+
+static void wait_remove(EventLoop *loop, Request *r) {
+    Limiter *l = r->limiter;
+    Slot *h = r->slot;
+    if (r->wait_prev != NULL) {
+        r->wait_prev->wait_next = r->wait_next;
+    } else {
+        h->head = r->wait_next;
+    }
+    if (r->wait_next != NULL) {
+        r->wait_next->wait_prev = r->wait_prev;
+    } else {
+        h->tail = r->wait_prev;
+    }
+    r->wait_prev = r->wait_next = NULL;
+    pthread_mutex_lock(&l->lock);
+    h->waiting--;
+    pthread_mutex_unlock(&l->lock);
+    r->waiting = false;
+    stats_add(loop, r, stat_queued, -1);
+    if (h->head == NULL) {
+        ready_remove(l, h);
+    }
+}
+
+static void begin_request(EventLoop *loop, Request *r);
+
+static void dispatch(EventLoop *loop, Limiter *l) {
+    if (l->dispatching) {
+        return;
+    }
+    l->dispatching = true;
+    Slot *h = l->ready_head;
+    while (h != NULL) {
+        if (!slot_free(l, h)) {
+            h = h->ready_next;
+            continue;
+        }
+        Request *r = h->head;
+        wait_remove(loop, r);
+        if (h->ready) {
+            ready_remove(l, h);
+            ready_append(l, h);
+        }
+        r->queue_ns = clock_ns() - r->queued_at;
+        slot_use(l, h, 1);
+        begin_request(loop, r);
+        h = l->ready_head;
+    }
+    l->dispatching = false;
+}
+
+static void slot_release(EventLoop *loop, Request *r) {
+    if (r->slot == NULL) {
+        return;
+    }
+    Limiter *l = r->limiter;
+    slot_use(l, r->slot, -1);
+    r->slot = NULL;
+    if (!l->pending && l->ready_head != NULL) {
+        atomic_fetch_add(&l->refs, 1);
+        l->pending = true;
+        l->pending_next = loop->pending;
+        loop->pending = l;
+    }
+}
+
+static bool dispatch_pending(EventLoop *loop) {
+    Limiter *l = loop->pending;
+    loop->pending = NULL;
+    bool any = l != NULL;
+    while (l != NULL) {
+        Limiter *next = l->pending_next;
+        l->pending = false;
+        dispatch(loop, l);
+        limiter_decref(l);
+        l = next;
+    }
+    return any;
+}
+
+static PyObject *limiter_state(Limiter *l) {
+    if (l == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject *hosts = PyDict_New();
+    if (hosts == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&l->lock);
+    long connections = l->connections;
+    for (Slot *h = l->slots; h != NULL; h = h->next) {
+        PyObject *state =
+            Py_BuildValue("{s:l,s:l,s:O}", "active", h->active, "waiting", h->waiting, "multiplexed", Py_False);
+        if (state == NULL || PyDict_SetItemString(hosts, h->key, state) == -1) {
+            pthread_mutex_unlock(&l->lock);
+            Py_XDECREF(state);
+            Py_DECREF(hosts);
+            return NULL;
+        }
+        Py_DECREF(state);
+    }
+    pthread_mutex_unlock(&l->lock);
+    return Py_BuildValue("{s:l,s:N}", "connections", connections, "hosts", hosts);
+}
+
 static void start(EventLoop *loop, Request *r) {
+    r->live_next = loop->live;
+    if (loop->live != NULL) {
+        loop->live->live_prev = r;
+    }
+    loop->live = r;
+    r->started = true;
+    stats_add(loop, r, stat_requests, 1);
+    if (r->limiter != NULL) {
+        r->slot = slot_for(r->limiter, r);
+        if (r->slot != NULL && !slot_free(r->limiter, r->slot)) {
+            wait_push(loop, r);
+            return;
+        }
+        if (r->slot != NULL) {
+            slot_use(r->limiter, r->slot, 1);
+        }
+    }
+    begin_request(loop, r);
+}
+
+static void begin_request(EventLoop *loop, Request *r) {
     hx_request q = {
         .method = r->method,
         .host = r->host,
@@ -326,14 +630,8 @@ static void start(EventLoop *loop, Request *r) {
         .timeout_ns = r->timeout_ns,
         .connect_timeout_ns = r->connect_timeout_ns,
         .decode = true,
+        .max_age_ns = r->max_age_ns,
     };
-    r->live_next = loop->live;
-    if (loop->live != NULL) {
-        loop->live->live_prev = r;
-    }
-    loop->live = r;
-    r->started = true;
-    stats_add(loop, r, stat_requests, 1);
     stats_add(loop, r, stat_running, 1);
     r->hx = hx_request_start(loop->client, &q, r);
     if (r->hx == NULL) {
@@ -341,6 +639,7 @@ static void start(EventLoop *loop, Request *r) {
         r->finished = true;
         stats_add(loop, r, stat_running, -1);
         stats_add(loop, r, stat_errors, 1);
+        slot_release(loop, r);
         complete(loop, r);
     }
 }
@@ -350,8 +649,16 @@ static void on_wake(aeEventLoop *ae, int fd, void *data, int mask) {
     drain_pipe(fd);
     pthread_mutex_lock(&loop->lock);
     Request *incoming = loop->incoming, *cancels = loop->cancels;
+    Pool *closing = loop->closing;
     loop->incoming = loop->incoming_tail = loop->cancels = loop->cancels_tail = NULL;
+    loop->closing = NULL;
     pthread_mutex_unlock(&loop->lock);
+    while (closing != NULL) {
+        Pool *p = closing;
+        closing = p->next;
+        hx_client_close_pool(loop->client, (uint64_t)(uintptr_t)p);
+        pool_decref(p);
+    }
     while (incoming != NULL) {
         Request *r = incoming;
         incoming = r->next;
@@ -361,7 +668,14 @@ static void on_wake(aeEventLoop *ae, int fd, void *data, int mask) {
     while (cancels != NULL) {
         Request *r = cancels;
         cancels = r->cancel_next;
-        if (r->started && !r->finished && r->hx != NULL) {
+        if (r->waiting) {
+            wait_remove(loop, r);
+            r->slot = NULL;
+            r->done.error = HX_ERR_CANCELLED;
+            r->finished = true;
+            stats_add(loop, r, stat_cancelled, 1);
+            complete(loop, r);
+        } else if (r->started && !r->finished && r->hx != NULL) {
             hx_request_cancel(r->hx);
         }
         request_decref(r);
@@ -382,7 +696,7 @@ static PyObject *stats_dict(Stats *s, PyObject *open) {
                          "connections_open", open, "tls_handshakes", 0, "http_versions", "HTTP/1.0",
                          LOAD(http_versions[0]), "HTTP/1.1", LOAD(http_versions[1]), "HTTP/2", 0, "HTTP/3", 0,
                          "bytes_sent", LOAD(bytes_sent), "bytes_received", LOAD(bytes_received), "running",
-                         LOAD(running), "queued", 0);
+                         LOAD(running), "queued", LOAD(queued));
 #undef LOAD
 }
 
@@ -412,9 +726,16 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     self->timer_id = -1;
     self->buffer_size = buffer_size > 0 ? (size_t)buffer_size : 16384;
     pthread_mutex_init(&self->lock, NULL);
-    hx_config cfg = {.max_idle_per_host = (size_t)max_idle_connections, .read_size = self->buffer_size};
+    hx_config cfg = {.max_idle = (size_t)max_idle_connections, .read_size = self->buffer_size};
+    if (max_host_connections || max_total_connections) {
+        self->limiter = limiter_new(max_host_connections, max_total_connections);
+        if (self->limiter == NULL) {
+            Py_DECREF(self);
+            return PyErr_NoMemory();
+        }
+    }
     self->ae = aeCreateEventLoop(200);
-    self->client = hx_client_new(&cfg, (hx_io){watch, set_timer, io_now, self});
+    self->client = hx_client_new(&cfg, (hx_io){watch, set_timer, io_now, self, on_connection});
     if (self->ae == NULL || self->client == NULL || make_pipe(self->wake) == -1 || make_pipe(self->out) == -1 ||
         make_pipe(self->stop_pipe) == -1 ||
         aeCreateFileEvent(self->ae, self->wake[0], AE_READABLE, on_wake, self) == AE_ERR ||
@@ -440,9 +761,15 @@ static void EventLoop_dealloc(EventLoop *self) {
         self->abandoned = r->next;
         request_decref(r);
     }
+    while (self->closing != NULL) {
+        Pool *p = self->closing;
+        self->closing = p->next;
+        pool_decref(p);
+    }
     if (self->client != NULL) {
         hx_client_free(self->client);
     }
+    limiter_decref(self->limiter);
     if (self->ae != NULL) {
         aeDeleteEventLoop(self->ae);
     }
@@ -520,7 +847,7 @@ static PyObject *EventLoop_stats(EventLoop *self, PyObject *args) {
 
 static PyObject *EventLoop_host_stats(EventLoop *self, PyObject *args) { return PyDict_New(); }
 
-static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { Py_RETURN_NONE; }
+static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { return limiter_state(self->limiter); }
 
 static PyObject *EventLoop_get_out_fd(EventLoop *self, PyObject *args) { return PyLong_FromLong(self->out[0]); }
 
@@ -620,6 +947,7 @@ static Response *response_from(Request *r) {
         resp->times[i] = seconds(e, i);
     }
     resp->times[HX_T_TLS] = 0.0;
+    resp->queue_time = (double)((r->queue_ns + 500) / 1000) / 1e6;
     resp->size_upload = r->body != NULL ? (long long)r->body_len : 0;
     resp->size_download = (long long)r->body_bytes;
     memcpy(resp->primary_ip, e->primary_ip, sizeof(resp->primary_ip));
@@ -729,10 +1057,30 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->own_pool = own;
     self->fresh = none;
     self->idle_timeout = idle_timeout;
+    self->max_connection_age = max_connection_age;
+    if (own) {
+        self->pool = calloc(1, sizeof(Pool));
+        if (self->pool == NULL) {
+            Py_DECREF(self);
+            return PyErr_NoMemory();
+        }
+        atomic_init(&self->pool->refs, 1);
+    }
+    if (max_host_connections || max_connections) {
+        self->limiter = limiter_new(max_host_connections, max_connections);
+        if (self->limiter == NULL) {
+            Py_DECREF(self);
+            return PyErr_NoMemory();
+        }
+    }
     return (PyObject *)self;
 }
 
+static void close_pool(Session *self);
+
 static void Session_dealloc(Session *self) {
+    close_pool(self);
+    limiter_decref(self->limiter);
     Py_XDECREF(self->loop);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -1088,8 +1436,13 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     r->discard_body = discard_body;
     r->fresh = self->fresh;
     r->close_after = self->fresh || self->idle_timeout == 0;
-    r->pool = self->own_pool ? (uint64_t)(uintptr_t)self : 0;
+    r->pool = (uint64_t)(uintptr_t)self->pool;
     r->idle_timeout_ns = (int64_t)self->idle_timeout * 1000000000;
+    r->max_age_ns = (int64_t)self->max_connection_age * 1000000000;
+    r->limiter = self->limiter != NULL ? self->limiter : self->own_pool ? NULL : loop->limiter;
+    if (r->limiter != NULL) {
+        atomic_fetch_add(&r->limiter->refs, 1);
+    }
     r->timeout_ns = timeout_ns;
     r->connect_timeout_ns = connect_timeout_ns;
     r->session_stats = &self->stats;
@@ -1098,7 +1451,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     Py_INCREF(self);
     r->session = self;
     pthread_mutex_lock(&loop->lock);
-    bool was_empty = loop->incoming == NULL && loop->cancels == NULL;
+    bool was_empty = loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL;
     push(&loop->incoming, &loop->incoming_tail, r);
     pthread_mutex_unlock(&loop->lock);
     if (was_empty) {
@@ -1119,7 +1472,7 @@ static PyObject *Session_cancel(Session *self, PyObject *handle) {
     atomic_fetch_add(&r->refs, 1);
     r->cancel_next = NULL;
     pthread_mutex_lock(&loop->lock);
-    bool was_empty = loop->incoming == NULL && loop->cancels == NULL;
+    bool was_empty = loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL;
     if (loop->cancels_tail != NULL) {
         loop->cancels_tail->cancel_next = r;
     } else {
@@ -1134,13 +1487,38 @@ static PyObject *Session_cancel(Session *self, PyObject *handle) {
 }
 
 static PyObject *Session_stats(Session *self, PyObject *args) {
-    Py_INCREF(Py_None);
-    return stats_dict(&self->stats, Py_None);
+    if (self->pool == NULL) {
+        Py_INCREF(Py_None);
+        return stats_dict(&self->stats, Py_None);
+    }
+    PyObject *open = PyLong_FromLong(atomic_load_explicit(&self->pool->open, memory_order_relaxed));
+    return open != NULL ? stats_dict(&self->stats, open) : NULL;
+}
+
+static void close_pool(Session *self) {
+    Pool *p = self->pool;
+    EventLoop *loop = self->loop;
+    self->pool = NULL;
+    if (p == NULL || loop == NULL || atomic_load(&loop->closed)) {
+        pool_decref(p);
+        return;
+    }
+    pthread_mutex_lock(&loop->lock);
+    bool was_empty = loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL;
+    p->next = loop->closing;
+    loop->closing = p;
+    pthread_mutex_unlock(&loop->lock);
+    if (was_empty) {
+        poke(loop->wake[1]);
+    }
 }
 
 static PyObject *Session_close(Session *self, PyObject *args) {
     Py_BEGIN_CRITICAL_SECTION(self);
-    self->closed = true;
+    if (!self->closed) {
+        self->closed = true;
+        close_pool(self);
+    }
     Py_END_CRITICAL_SECTION();
     Py_RETURN_NONE;
 }
@@ -1149,7 +1527,7 @@ static PyObject *Session_get_cookielist(Session *self, PyObject *args) { return 
 
 static PyObject *Session_apply_cookielist(Session *self, PyObject *args) { Py_RETURN_NONE; }
 
-static PyObject *Session_limiter_state(Session *self, PyObject *args) { Py_RETURN_NONE; }
+static PyObject *Session_limiter_state(Session *self, PyObject *args) { return limiter_state(self->limiter); }
 
 static PyMethodDef Session_methods[] = {
     {"request", (PyCFunction)(void (*)(void))Session_request, METH_VARARGS | METH_KEYWORDS, "Send a request"},
@@ -1274,6 +1652,10 @@ static PyObject *Response_get_size_download(Response *self, PyObject *args) {
 
 static PyObject *Response_get_zero(Response *self, PyObject *args) { return PyFloat_FromDouble(0.0); }
 
+static PyObject *Response_get_queue_time(Response *self, PyObject *args) {
+    return PyFloat_FromDouble(self->queue_time);
+}
+
 static PyMethodDef Response_methods[] = {
     {"get_effective_url", (PyCFunction)Response_get_effective_url, METH_NOARGS, ""},
     {"get_response_code", (PyCFunction)Response_get_response_code, METH_NOARGS, ""},
@@ -1288,7 +1670,7 @@ static PyMethodDef Response_methods[] = {
     {"get_size_download", (PyCFunction)Response_get_size_download, METH_NOARGS, ""},
     {"get_primary_ip", (PyCFunction)Response_get_primary_ip, METH_NOARGS, ""},
     {"get_http_version", (PyCFunction)Response_get_http_version, METH_NOARGS, ""},
-    {"get_queue_time", (PyCFunction)Response_get_zero, METH_NOARGS, ""},
+    {"get_queue_time", (PyCFunction)Response_get_queue_time, METH_NOARGS, ""},
     {"get_redirect_url", (PyCFunction)Response_get_redirect_url, METH_NOARGS, ""},
     {"get_header", (PyCFunction)Response_get_header, METH_NOARGS, ""},
     {"get_body", (PyCFunction)Response_get_body, METH_NOARGS, ""},
