@@ -1,7 +1,7 @@
 PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
-C_SOURCES := src/httpperf.c src/hx/module.c $(wildcard hx/include/*.h hx/src/*.[ch] hx/tests/*.c)
+C_SOURCES := src/httpperf.c src/parse_headers.h src/hx/module.c $(wildcard hx/include/*.h hx/src/*.[ch] hx/tests/*.c)
 HX_CORE := hx/src/client.c hx/src/h1.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
@@ -11,7 +11,7 @@ GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
 
 venv: $(INSTALLED)
 
-$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/hx/*.c src/ae/*.c src/ae/*.h) | $(UV)
+$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/*.h src/hx/*.c src/ae/*.c src/ae/*.h) | $(UV)
 	test -x $(VENV)/bin/python || $(UV) venv -p $(PY_VERSION) $(VENV)
 	$(UV) pip install --python $(VENV)/bin/python $(GROUPS) --reinstall-package httpperf -e .
 	touch $@
