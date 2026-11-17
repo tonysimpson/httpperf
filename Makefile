@@ -1,8 +1,8 @@
 PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
-C_SOURCES := src/httpperf.c src/hx/module.c $(wildcard hx/src/*.[ch] hx/tests/*.c)
-HX_CORE := hx/src/h1.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
+C_SOURCES := src/httpperf.c src/hx/module.c $(wildcard hx/include/*.h hx/src/*.[ch] hx/tests/*.c)
+HX_CORE := hx/src/client.c hx/src/h1.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
@@ -20,11 +20,14 @@ $(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/hx/*.c src/ae/*.c s
 	python3 -m venv .tools
 	.tools/bin/pip install uv
 
+HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -pthread
+
 hx-test:
 	mkdir -p build/hx
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined \
-		hx/tests/test_h1.c $(HX_CORE) -o build/hx/test_h1
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -o build/hx/test_h1
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -o build/hx/test_client
 	build/hx/test_h1
+	build/hx/test_client
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest
