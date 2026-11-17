@@ -3,6 +3,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -388,6 +389,10 @@ void hx_request_cancel(hx_req *q) {
 }
 
 static void connected(conn *k) {
+    struct pollfd p = {.fd = k->fd, .events = POLLOUT};
+    if (poll(&p, 1, 0) == 0) {
+        return;
+    }
     int err = 0;
     socklen_t len = sizeof(err);
     getsockopt(k->fd, SOL_SOCKET, SO_ERROR, &err, &len);

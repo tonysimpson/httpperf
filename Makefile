@@ -11,7 +11,7 @@ GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
 
 venv: $(INSTALLED)
 
-$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/*.h src/hx/*.c src/ae/*.c src/ae/*.h) | $(UV)
+$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/*.h src/hx/*.c hx/src/*.[ch] hx/include/*.h src/ae/*.c src/ae/*.h) | $(UV)
 	test -x $(VENV)/bin/python || $(UV) venv -p $(PY_VERSION) $(VENV)
 	$(UV) pip install --python $(VENV)/bin/python $(GROUPS) --reinstall-package httpperf -e .
 	touch $@

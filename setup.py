@@ -27,7 +27,16 @@ setup(
         ),
         Extension(
             "httpperf._httpperf_hx",
-            sources=["src/hx/module.c"],
+            sources=[
+                "src/hx/module.c",
+                "src/ae/ae.c",
+                "src/ae/zmalloc.c",
+                "hx/src/client.c",
+                "hx/src/h1.c",
+                "hx/vendor/llhttp/llhttp.c",
+                "hx/vendor/llhttp/api.c",
+                "hx/vendor/llhttp/http.c",
+            ],
             extra_compile_args=compile_args,
         ),
     ]
