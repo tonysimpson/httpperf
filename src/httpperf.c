@@ -933,7 +933,9 @@ static PyObject *str_or_none(const char *value) {
         return value;                                                      \
     }
 
-static PyObject *us_to_seconds(curl_off_t us) { return PyFloat_FromDouble(us / 1e6); }
+#ifndef CURLU_GET_EMPTY
+#define CURLU_GET_EMPTY 0
+#endif
 
 static char *url_without_credentials(const char *url) {
     char *result = NULL;
@@ -975,6 +977,8 @@ RESPONSE_INFO(primary_ip, primary_ip, str_or_none)
 RESPONSE_INFO(redirect_url, redirect_url, str_or_none)
 
 #if LIBCURL_VERSION_NUM >= 0x080a00
+static PyObject *us_to_seconds(curl_off_t us) { return PyFloat_FromDouble(us / 1e6); }
+
 RESPONSE_INFO_FINAL(posttransfer_time, posttransfer_us, us_to_seconds)
 #else
 static PyObject *Response_get_posttransfer_time(Response *self, PyObject *args) {
