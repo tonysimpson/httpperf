@@ -9,12 +9,12 @@ LOGS=.ci-local
 
 if [ "${1:-}" = "--one" ]; then
     if [ "$2" = system ]; then
-        set -- "$1" "$2" httpperf-ci-system 3.13 "" ""
+        set -- "$1" "$2" httpperf-ci-system 3.13 "" "" hx-test
     else
-        set -- "$1" "$2" httpperf-ci "$2" -I/opt/curl/include "-L/opt/curl/lib -Wl,-rpath,/opt/curl/lib"
+        set -- "$1" "$2" httpperf-ci "$2" -I/opt/curl/include "-L/opt/curl/lib -Wl,-rpath,/opt/curl/lib" ""
     fi
     if podman run --rm -v "$PWD:/src:ro,Z" -v httpperf-ci-uv:/root/.cache/uv \
-        -e PY_VERSION="$4" -e PYTEST_ARGS="${PYTEST_ARGS:-}" -e CFLAGS="$5" -e LDFLAGS="$6" \
+        -e PY_VERSION="$4" -e PYTEST_ARGS="${PYTEST_ARGS:-}" -e CFLAGS="$5" -e LDFLAGS="$6" -e HX_TEST="$7" \
         "$3" sh -c '
             set -e
             mkdir /work
@@ -22,6 +22,7 @@ if [ "${1:-}" = "--one" ]; then
                 --exclude="*.so" --exclude=__pycache__ -cf - . | tar -C /work -xf -
             cd /work
             make venv PY_VERSION=$PY_VERSION > /dev/null
+            if [ -n "$HX_TEST" ]; then CFLAGS= LDFLAGS= make hx-test > /tmp/hx-c.log 2>&1 || { cat /tmp/hx-c.log; exit 1; }; fi
             HTTPPERF_BACKEND=hx .venv/bin/python -m pytest -q -p no:cacheprovider $PYTEST_ARGS > /tmp/hx.log || { cat /tmp/hx.log; exit 1; }
             .venv/bin/python -m pytest -p no:cacheprovider $PYTEST_ARGS
         ' > "$LOGS/$2.log" 2>&1; then

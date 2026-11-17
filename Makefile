@@ -1,12 +1,13 @@
 PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
-C_SOURCES := src/httpperf.c src/hx/module.c
+C_SOURCES := src/httpperf.c src/hx/module.c $(wildcard hx/src/*.[ch] hx/tests/*.c)
+HX_CORE := hx/src/h1.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
 
-.PHONY: venv test ci-local lint lint-fix clean distclean release
+.PHONY: venv test hx-test ci-local lint lint-fix clean distclean release
 
 venv: $(INSTALLED)
 
@@ -18,6 +19,12 @@ $(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/hx/*.c src/ae/*.c s
 .tools/bin/uv:
 	python3 -m venv .tools
 	.tools/bin/pip install uv
+
+hx-test:
+	mkdir -p build/hx
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined \
+		hx/tests/test_h1.c $(HX_CORE) -o build/hx/test_h1
+	build/hx/test_h1
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest
