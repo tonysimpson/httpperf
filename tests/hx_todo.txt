@@ -7,11 +7,6 @@ tests/test_connections.py::test_a_schemes_proxy_beats_all_proxy[https]
 tests/test_connections.py::test_proxy_credentials_come_from_the_proxy_url
 tests/test_connections.py::test_proxy_environment[environment1-True]
 tests/test_connections.py::test_proxy_environment[environment3-True]
-tests/test_host_stats.py::test_errors_are_counted_per_host
-tests/test_host_stats.py::test_every_host_is_kept
-tests/test_host_stats.py::test_host_stats_are_off_by_default
-tests/test_host_stats.py::test_requests_are_counted_per_host
-tests/test_host_stats.py::test_spellings_of_a_host_share_its_counts
 tests/test_http_versions.py::test_a_failed_request_does_not_stop_multiplexing
 tests/test_http_versions.py::test_a_multiplexed_host_takes_one_limiter_slot[HTTP/2]
 tests/test_http_versions.py::test_a_multiplexed_host_takes_one_limiter_slot[HTTP/3]

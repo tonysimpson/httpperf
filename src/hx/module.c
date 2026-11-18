@@ -39,6 +39,19 @@ typedef struct {
     atomic_long http_versions[4];
 } Stats;
 
+typedef struct HostStats {
+    Stats stats;
+    struct HostStats *next, *chain;
+    char key[300];
+} HostStats;
+
+typedef struct {
+    HostStats *head;
+    HostStats **buckets;
+    size_t bucket_count, count;
+    pthread_mutex_t lock;
+} HostTable;
+
 typedef struct EventLoop EventLoop;
 typedef struct Session Session;
 typedef struct Request Request;
@@ -124,6 +137,7 @@ struct Request {
     PyObject *future;
     Session *session;
     Stats *session_stats;
+    Stats *host_counts;
     char *url;
     char *host;
     char *authority;
@@ -186,6 +200,8 @@ struct EventLoop {
     Request *live;
     Stats stats;
     atomic_long open;
+    bool host_stats;
+    HostTable hosts;
     size_t buffer_size;
     Limiter *limiter;
     Limiter *pending;
@@ -380,6 +396,68 @@ static int64_t io_now(void *ctx) { return clock_ns(); }
 static void stats_add(EventLoop *loop, Request *r, atomic_long *(*field)(Stats *), long n) {
     atomic_fetch_add_explicit(field(&loop->stats), n, memory_order_relaxed);
     atomic_fetch_add_explicit(field(r->session_stats), n, memory_order_relaxed);
+    if (r->host_counts != NULL) {
+        atomic_fetch_add_explicit(field(r->host_counts), n, memory_order_relaxed);
+    }
+}
+
+static size_t key_hash(const char *key) {
+    size_t h = 5381;
+    for (; *key; key++) {
+        h = h * 33 + (unsigned char)*key;
+    }
+    return h;
+}
+
+static bool hosts_grow(HostTable *t) {
+    size_t count = t->bucket_count ? t->bucket_count * 2 : 64;
+    HostStats **buckets = calloc(count, sizeof(HostStats *));
+    if (buckets == NULL) {
+        return false;
+    }
+    for (HostStats *h = t->head; h != NULL; h = h->next) {
+        size_t b = key_hash(h->key) & (count - 1);
+        h->chain = buckets[b];
+        buckets[b] = h;
+    }
+    free(t->buckets);
+    t->buckets = buckets;
+    t->bucket_count = count;
+    return true;
+}
+
+static Stats *host_stats_for(HostTable *t, const Request *r) {
+    char key[300];
+    int n = snprintf(key, sizeof(key), "http://%s:%u", r->host, r->port);
+    for (int i = 7; i < n; i++) {
+        if (key[i] >= 'A' && key[i] <= 'Z') {
+            key[i] = (char)(key[i] - 'A' + 'a');
+        }
+    }
+    if (t->bucket_count > 0) {
+        for (HostStats *h = t->buckets[key_hash(key) & (t->bucket_count - 1)]; h != NULL; h = h->chain) {
+            if (strcmp(h->key, key) == 0) {
+                return &h->stats;
+            }
+        }
+    }
+    if (t->count >= t->bucket_count && !hosts_grow(t)) {
+        return NULL;
+    }
+    HostStats *h = calloc(1, sizeof(HostStats));
+    if (h == NULL) {
+        return NULL;
+    }
+    memcpy(h->key, key, sizeof(key));
+    size_t b = key_hash(key) & (t->bucket_count - 1);
+    h->chain = t->buckets[b];
+    t->buckets[b] = h;
+    t->count++;
+    pthread_mutex_lock(&t->lock);
+    h->next = t->head;
+    t->head = h;
+    pthread_mutex_unlock(&t->lock);
+    return &h->stats;
 }
 
 #define STAT(name) \
@@ -632,6 +710,10 @@ again:
                     atomic_fetch_add_explicit(&loop->stats.http_versions[e->version - 10], 1, memory_order_relaxed);
                     atomic_fetch_add_explicit(&r->session_stats->http_versions[e->version - 10], 1,
                                               memory_order_relaxed);
+                    if (r->host_counts != NULL) {
+                        atomic_fetch_add_explicit(&r->host_counts->http_versions[e->version - 10], 1,
+                                                  memory_order_relaxed);
+                    }
                 }
                 slot_release(loop, r);
                 if (r->upload != NULL) {
@@ -914,6 +996,9 @@ static void start(EventLoop *loop, Request *r) {
     }
     loop->live = r;
     r->started = true;
+    if (loop->host_stats) {
+        r->host_counts = host_stats_for(&loop->hosts, r);
+    }
     stats_add(loop, r, stat_requests, 1);
     if (r->limiter != NULL) {
         r->slot = slot_for(r->limiter, r);
@@ -1089,6 +1174,8 @@ static PyObject *EventLoop_new(PyTypeObject *type, PyObject *args, PyObject *kwd
     }
     self->wake[0] = self->wake[1] = self->out[0] = self->out[1] = self->stop_pipe[0] = self->stop_pipe[1] = -1;
     self->timer_id = -1;
+    self->host_stats = host_stats;
+    pthread_mutex_init(&self->hosts.lock, NULL);
     self->buffer_size = buffer_size > 0 ? (size_t)buffer_size : 16384;
     pthread_mutex_init(&self->lock, NULL);
     hx_config cfg = {.max_idle = (size_t)max_idle_connections, .read_size = self->buffer_size};
@@ -1135,6 +1222,13 @@ static void EventLoop_dealloc(EventLoop *self) {
         hx_client_free(self->client);
     }
     limiter_decref(self->limiter);
+    while (self->hosts.head != NULL) {
+        HostStats *h = self->hosts.head;
+        self->hosts.head = h->next;
+        free(h);
+    }
+    free(self->hosts.buckets);
+    pthread_mutex_destroy(&self->hosts.lock);
     if (self->ae != NULL) {
         aeDeleteEventLoop(self->ae);
     }
@@ -1251,7 +1345,25 @@ static PyObject *EventLoop_stats(EventLoop *self, PyObject *args) {
     return stats_dict(&self->stats, PyLong_FromLong(atomic_load_explicit(&self->open, memory_order_relaxed)));
 }
 
-static PyObject *EventLoop_host_stats(EventLoop *self, PyObject *args) { return PyDict_New(); }
+static PyObject *EventLoop_host_stats(EventLoop *self, PyObject *args) {
+    if (!self->host_stats) {
+        PyErr_SetString(PyExc_RuntimeError, "host stats are off: create the engine with host_stats=True");
+        return NULL;
+    }
+    PyObject *result = PyDict_New();
+    pthread_mutex_lock(&self->hosts.lock);
+    HostStats *head = self->hosts.head;
+    pthread_mutex_unlock(&self->hosts.lock);
+    for (HostStats *h = head; result != NULL && h != NULL; h = h->next) {
+        Py_INCREF(Py_None);
+        PyObject *stats = stats_dict(&h->stats, Py_None);
+        if (stats == NULL || PyDict_SetItemString(result, h->key, stats) == -1) {
+            Py_CLEAR(result);
+        }
+        Py_XDECREF(stats);
+    }
+    return result;
+}
 
 static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { return limiter_state(self->limiter); }
 
