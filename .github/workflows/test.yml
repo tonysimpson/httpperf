@@ -59,6 +59,19 @@ jobs:
       - run: make test DEPS= PY_VERSION=3.13
       - run: make hx-test DEPS=
 
+  system-ubuntu-26:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev
+          libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev
+      - run: make venv DEPS= PY_VERSION=3.13
+      - run: HTTPPERF_BACKEND=hx .venv/bin/python -m pytest -q
+      - run: make hx-test DEPS=
+      - run: HTTPPERF_BACKEND=hx .venv/bin/python -c "import httpperf; httpperf.Session(http_version='HTTP/3')"
+
   lint:
     runs-on: ubuntu-24.04
     steps:

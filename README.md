@@ -427,7 +427,7 @@ There are two backends, each its own extension module with the same API: `_httpp
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 
-`make ci-local` runs CI's test jobs with Podman on a copy of the working tree, four at a time: every Python version in the manylinux_2_34 image against the curl the wheels bundle, and `system`, Python 3.13 on Ubuntu 24.04 against its libcurl 8.5. `PYTHONS="3.9 system"` picks which, `JOBS` sets how many run at once, and `PYTEST_ARGS` is passed to pytest. Logs go to `.ci-local/`. The first run builds curl into a local image (a few minutes); it's rebuilt only when `tools/build-libcurl.sh` changes.
+`make ci-local` runs CI's test jobs with Podman on a copy of the working tree, four at a time: every Python version in the manylinux_2_34 image against the curl the wheels bundle, `system`, Python 3.13 on Ubuntu 24.04 against its libcurl 8.5, and `system26`, hx only, Python 3.13 on Ubuntu 26.04 against its own libraries, which give hx HTTP/3 over OpenSSL. `PYTHONS="3.9 system"` picks which, `JOBS` sets how many run at once, and `PYTEST_ARGS` is passed to pytest. Logs go to `.ci-local/`. The first run builds curl into a local image (a few minutes); it's rebuilt only when `tools/build-libcurl.sh` changes.
 
 To release, set `__version__` in `httpperf/version.py` (for example `1.0rc1` or `1.0`), commit and push to main, then run `make release`. It tags `v<version>` and pushes the tag, and the release workflow builds the wheels and publishes them to PyPI.
 
