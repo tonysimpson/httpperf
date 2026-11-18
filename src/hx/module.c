@@ -401,6 +401,11 @@ static void stats_add(EventLoop *loop, Request *r, atomic_long *(*field)(Stats *
     }
 }
 
+static int host_key(const Request *r, char *key, size_t size) {
+    bool v6 = strchr(r->host, ':') != NULL;
+    return snprintf(key, size, v6 ? "http://[%s]:%u" : "http://%s:%u", r->host, r->port);
+}
+
 static size_t key_hash(const char *key) {
     size_t h = 5381;
     for (; *key; key++) {
@@ -428,7 +433,7 @@ static bool hosts_grow(HostTable *t) {
 
 static Stats *host_stats_for(HostTable *t, const Request *r) {
     char key[300];
-    int n = snprintf(key, sizeof(key), "http://%s:%u", r->host, r->port);
+    int n = host_key(r, key, sizeof(key));
     for (int i = 7; i < n; i++) {
         if (key[i] >= 'A' && key[i] <= 'Z') {
             key[i] = (char)(key[i] - 'A' + 'a');
@@ -805,7 +810,7 @@ static void limiter_decref(Limiter *l) {
 
 static Slot *slot_for(Limiter *l, const Request *r) {
     char key[300];
-    snprintf(key, sizeof(key), "http://%s:%u", r->host, r->port);
+    host_key(r, key, sizeof(key));
     for (Slot *h = l->slots; h != NULL; h = h->next) {
         if (strcmp(h->key, key) == 0) {
             return h;

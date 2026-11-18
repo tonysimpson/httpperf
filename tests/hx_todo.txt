@@ -28,7 +28,6 @@ tests/test_http_versions.py::test_responses_report_their_version[HTTP/2]
 tests/test_http_versions.py::test_responses_report_their_version[HTTP/3]
 tests/test_http_versions.py::test_the_limiter_follows_a_host_back_to_http1
 tests/test_limiter.py::test_busy_host_records_are_kept
-tests/test_limiter.py::test_host_keys_of_unusual_urls
 tests/test_limiter.py::test_idle_host_records_are_freed
 tests/test_redirects.py::test_a_location_with_another_scheme_is_an_error
 tests/test_tls.py::test_a_certificate_must_be_a_pair
