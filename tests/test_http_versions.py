@@ -17,9 +17,16 @@ import httpperf
 async def app(scope, receive, send):
     if scope["type"] != "http":
         return
+    received = 0
+    while scope["path"] == "/count":
+        message = await receive()
+        received += len(message.get("body", b""))
+        if not message.get("more_body"):
+            break
     await asyncio.sleep(0.5 if scope["path"] == "/slow" else 0.05)
+    text = scope["http_version"] + (" %d" % received if scope["path"] == "/count" else "")
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
-    await send({"type": "http.response.body", "body": scope["http_version"].encode()})
+    await send({"type": "http.response.body", "body": text.encode()})
 
 
 CA = pytest_httpbin.certs.where()
@@ -102,6 +109,28 @@ def limiter_host(owner):
 )
 async def test_requests_use_the_chosen_version(h2_url, version, server_saw):
     assert (await get_with(h2_url, version)).text == server_saw
+
+
+async def pieces(count, size):
+    for _ in range(count):
+        yield b"x" * size
+
+
+@pytest.mark.parametrize(
+    "version, server_saw", [pytest.param("HTTP/3", "3", marks=needs_http3), ("HTTP/2", "2"), ("HTTP/1.1", "1.1")]
+)
+async def test_a_streamed_upload_uses_the_chosen_version(h2_url, version, server_saw):
+    async with httpperf.Session(verify=CA, http_version=version) as s:
+        response = await s.post(h2_url + "count", data=pieces(50, 10000))
+    assert response.text == server_saw + " 500000"
+
+
+@pytest.mark.parametrize("version", MULTIPLEXED)
+async def test_a_streamed_upload_shares_the_connection(h2_url, version):
+    async with httpperf.Session(verify=CA, connections="session", http_version=version) as s:
+        first = await s.get(h2_url)
+        upload = await s.post(h2_url + "count", data=pieces(3, 1000))
+    assert first.connect_time > 0 and upload.connect_time == 0
 
 
 @pytest.mark.parametrize("version", ALL_VERSIONS)

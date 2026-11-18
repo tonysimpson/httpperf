@@ -35,11 +35,14 @@ static int server_port;
 static SSL_CTX *server_ctx;
 static int server_connections;
 static int serving;
+static __thread int32_t hang_up;
 
 typedef struct {
     char path[64];
     const char *body;
     size_t len, at;
+    size_t received;
+    char text[32];
 } stream;
 
 static nghttp2_ssize send_body(nghttp2_session *ng, int32_t id, uint8_t *buf, size_t len, uint32_t *flags,
@@ -72,6 +75,12 @@ static int on_header(nghttp2_session *ng, const nghttp2_frame *frame, const uint
 
 static int on_frame(nghttp2_session *ng, const nghttp2_frame *frame, void *user) {
     stream *s = nghttp2_session_get_stream_user_data(ng, frame->hd.stream_id);
+    if (s != NULL && frame->hd.type == NGHTTP2_HEADERS && strcmp(s->path, "/hang-up") == 0) {
+        nghttp2_nv status = {(uint8_t *)":status", (uint8_t *)"200", 7, 3, 0};
+        nghttp2_submit_headers(ng, NGHTTP2_FLAG_NONE, frame->hd.stream_id, NULL, &status, 1, NULL);
+        hang_up = frame->hd.stream_id;
+        return 0;
+    }
     if (s == NULL || !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
         return 0;
     }
@@ -80,6 +89,9 @@ static int on_frame(nghttp2_session *ng, const nghttp2_frame *frame, void *user)
     if (strcmp(s->path, "/big") == 0) {
         s->body = big;
         s->len = sizeof(big);
+    } else if (strcmp(s->path, "/count") == 0) {
+        s->len = (size_t)snprintf(s->text, sizeof(s->text), "%zu", s->received);
+        s->body = s->text;
     } else {
         s->body = "ok";
         s->len = 2;
@@ -87,6 +99,14 @@ static int on_frame(nghttp2_session *ng, const nghttp2_frame *frame, void *user)
     nghttp2_nv status = {(uint8_t *)":status", (uint8_t *)"200", 7, 3, 0};
     nghttp2_data_provider2 body = {.source.ptr = s, .read_callback = send_body};
     nghttp2_submit_response2(ng, frame->hd.stream_id, &status, 1, &body);
+    return 0;
+}
+
+static int on_data(nghttp2_session *ng, uint8_t flags, int32_t id, const uint8_t *data, size_t len, void *user) {
+    stream *s = nghttp2_session_get_stream_user_data(ng, id);
+    if (s != NULL) {
+        s->received += len;
+    }
     return 0;
 }
 
@@ -117,6 +137,7 @@ static void *serve_one(void *arg) {
     nghttp2_session_callbacks_set_on_header_callback(cb, on_header);
     nghttp2_session_callbacks_set_on_frame_recv_callback(cb, on_frame);
     nghttp2_session_callbacks_set_on_stream_close_callback(cb, on_close);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, on_data);
     nghttp2_session *ng;
     nghttp2_session_server_new(&ng, cb, NULL);
     nghttp2_session_callbacks_del(cb);
@@ -128,6 +149,12 @@ static void *serve_one(void *arg) {
             nghttp2_ssize n;
             while ((n = nghttp2_session_mem_send2(ng, &data)) > 0) {
                 SSL_write(ssl, data, (int)n);
+            }
+            if (hang_up != 0) {
+                free(nghttp2_session_get_stream_user_data(ng, hang_up));
+                nghttp2_session_set_stream_user_data(ng, hang_up, NULL);
+                hang_up = 0;
+                break;
             }
             if (!nghttp2_session_want_read(ng) && !nghttp2_session_want_write(ng)) {
                 break;
@@ -207,6 +234,10 @@ static void watch(void *ctx, hx_socket s, int events) {
 static void set_timer(void *ctx, int64_t deadline) { ((loop *)ctx)->deadline = deadline; }
 
 typedef struct {
+    hx_req *req;
+    size_t to_send;
+    size_t piece;
+    int send_ready;
     int status;
     char body[16];
     size_t body_len;
@@ -240,6 +271,16 @@ static void run(hx_client *c, int wanted, int max_ms) {
                     memcpy(mine->body + mine->body_len, events[i].data, n);
                     mine->body_len += n;
                     mine->body_total += events[i].len;
+                } else if (events[i].type == HX_EV_SEND_READY) {
+                    static char piece[4096];
+                    mine->send_ready++;
+                    size_t n = mine->to_send < mine->piece ? mine->to_send : mine->piece;
+                    mine->to_send -= n;
+                    if (n > 0) {
+                        hx_request_send(mine->req, piece, n);
+                    } else {
+                        hx_request_end_body(mine->req);
+                    }
                 } else if (events[i].type == HX_EV_DONE) {
                     mine->done++;
                     mine->last = events[i];
@@ -283,6 +324,21 @@ static outcome fetch(hx_client *c, hx_request r) {
     hx_request_start(c, &r, &o);
     run(c, 1, 3000);
     return o;
+}
+
+static outcome upload_to(hx_client *c, const char *target, int64_t size, size_t total, size_t piece) {
+    hx_request r = get(target);
+    r.method = "POST";
+    r.upload = true;
+    r.upload_size = size;
+    outcome o = {.to_send = total, .piece = piece};
+    o.req = hx_request_start(c, &r, &o);
+    run(c, 1, 3000);
+    return o;
+}
+
+static outcome upload(hx_client *c, int64_t size, size_t total, size_t piece) {
+    return upload_to(c, "/count", size, total, piece);
 }
 
 static void finish_client(hx_client *c) {
@@ -364,6 +420,54 @@ static void test_freeing_the_client_with_streams_open_is_safe(void) {
     CHECK(b.done == 0);
 }
 
+static void test_an_upload_of_unknown_size_goes_over_h2(void) {
+    hx_client *c = client(0);
+    outcome o = upload(c, -1, 100000, 4096);
+    CHECK(o.last.error == HX_OK && o.last.version == 20 && o.status == 200);
+    CHECK(o.body_len == 6 && memcmp(o.body, "100000", 6) == 0);
+    finish_client(c);
+}
+
+static void test_an_upload_of_known_size_goes_over_h2(void) {
+    hx_client *c = client(0);
+    outcome o = upload(c, 5000, 5000, 1000);
+    CHECK(o.last.error == HX_OK && o.last.version == 20);
+    CHECK(o.body_len == 4 && memcmp(o.body, "5000", 4) == 0);
+    finish_client(c);
+}
+
+static void test_an_empty_upload_goes_over_h2(void) {
+    hx_client *c = client(0);
+    outcome o = upload(c, -1, 0, 1000);
+    CHECK(o.last.error == HX_OK && o.last.version == 20);
+    CHECK(o.body_len == 1 && o.body[0] == '0');
+    finish_client(c);
+}
+
+static void test_an_upload_asks_for_each_piece(void) {
+    hx_client *c = client(0);
+    outcome o = upload(c, -1, 10000, 1000);
+    CHECK(o.last.error == HX_OK && o.send_ready == 11);
+    finish_client(c);
+}
+
+static void test_an_upload_shares_the_connection_with_other_requests(void) {
+    hx_client *c = client(0);
+    int before = __atomic_load_n(&server_connections, __ATOMIC_SEQ_CST);
+    outcome a = fetch(c, get("/"));
+    outcome b = upload(c, -1, 3000, 1000);
+    CHECK(a.last.error == HX_OK && b.last.error == HX_OK && b.last.reused);
+    CHECK(__atomic_load_n(&server_connections, __ATOMIC_SEQ_CST) == before + 1);
+    finish_client(c);
+}
+
+static void test_a_server_hanging_up_mid_upload_fails_the_request(void) {
+    hx_client *c = client(0);
+    outcome o = upload_to(c, "/hang-up", -1, 1000000, 4096);
+    CHECK(o.done == 1 && (o.last.error == HX_ERR_RECEIVE || o.last.error == HX_ERR_SEND));
+    finish_client(c);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     start_server();
@@ -374,6 +478,12 @@ int main(void) {
     test_cancelling_one_stream_leaves_the_others();
     test_freeing_the_client_with_requests_waiting_is_safe();
     test_freeing_the_client_with_streams_open_is_safe();
+    test_an_upload_of_unknown_size_goes_over_h2();
+    test_an_upload_of_known_size_goes_over_h2();
+    test_an_empty_upload_goes_over_h2();
+    test_an_upload_asks_for_each_piece();
+    test_an_upload_shares_the_connection_with_other_requests();
+    test_a_server_hanging_up_mid_upload_fails_the_request();
     int64_t end = clock_ns(NULL) + 3000000000;
     while (__atomic_load_n(&serving, __ATOMIC_SEQ_CST) > 0 && clock_ns(NULL) < end) {
         usleep(1000);
