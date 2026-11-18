@@ -83,6 +83,7 @@ struct hx_req {
     bool asked;
     bool paused;
     bool retried;
+    int send_errno;
     bool close_after;
     int64_t idle_timeout;
     bool done;
@@ -321,6 +322,10 @@ static int reading(const conn *k) { return k->req != NULL && k->req->paused ? 0 
 
 static void send_some(conn *k) {
     struct hx_req *q = k->req;
+    if (q->send_errno != 0) {
+        k->out.len = k->out_sent = 0;
+        return;
+    }
     while (k->out_sent < k->out.len) {
         ssize_t n = send(k->fd, k->out.data + k->out_sent, k->out.len - k->out_sent, MSG_NOSIGNAL);
         if (n < 0) {
@@ -330,6 +335,12 @@ static void send_some(conn *k) {
             }
             if (errno == EINTR) {
                 continue;
+            }
+            if (q->upload) {
+                q->send_errno = errno;
+                k->out.len = k->out_sent = 0;
+                watch(k, reading(k));
+                return;
             }
             fail(k, HX_ERR_SEND, errno);
             return;
@@ -571,14 +582,19 @@ static void resolved(hx_client *c) {
     }
 }
 
-static conn *find_idle(hx_client *c, const char *key, int64_t max_age) {
+static bool still_open(const conn *k) {
+    char b;
+    return recv(k->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+}
+
+static conn *find_idle(hx_client *c, const char *key, int64_t max_age, bool check) {
     int64_t t = max_age > 0 ? now(c) : 0;
     for (conn *k = c->conns, *after; k != NULL; k = after) {
         after = k->next;
         if (k->state != CONN_IDLE || k->pinned || strcmp(k->key, key) != 0) {
             continue;
         }
-        if (max_age > 0 && t - k->created >= max_age) {
+        if ((max_age > 0 && t - k->created >= max_age) || (check && !still_open(k))) {
             conn_close(k);
             continue;
         }
@@ -620,7 +636,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
         finish(q, rc == HX_EINVAL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
         return q;
     }
-    conn *k = q->fresh ? NULL : find_idle(c, q->key, q->max_age);
+    conn *k = q->fresh ? NULL : find_idle(c, q->key, q->max_age, q->upload);
     if (k != NULL) {
         q->reused = true;
         q->times[HX_T_DNS] = q->times[HX_T_CONNECT] = q->times[HX_T_TLS] = q->times[HX_T_START];
@@ -801,7 +817,10 @@ static void receive(conn *k) {
         if (count > 0 && events[count - 1].type == HX_H1_DONE) {
             finish(q, HX_OK, 0, true);
         } else {
-            fail(k, HX_ERR_RECEIVE, n < 0 ? errno : 0);
+            fail(k, q->send_errno != 0 ? HX_ERR_SEND : HX_ERR_RECEIVE,
+                 q->send_errno != 0 ? q->send_errno
+                 : n < 0            ? errno
+                                    : 0);
         }
         return;
     }

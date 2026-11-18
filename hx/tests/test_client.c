@@ -612,6 +612,25 @@ static void test_a_response_before_the_whole_upload_closes_the_connection(void) 
     finish_client(c);
 }
 
+static void test_a_response_is_kept_when_the_rest_of_the_upload_cannot_be_sent(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = upload(-1);
+    r.target = "/close";
+    hx_req *q = hx_request_start(c, &r, &o);
+    hx_request_pause(q, true);
+    run(c, &o, 1, 100);
+    static char block[65536];
+    for (int i = 0; i < 64; i++) {
+        hx_request_send(q, block, sizeof(block));
+        run(c, &o, 1, 5);
+    }
+    hx_request_pause(q, false);
+    run(c, &o, 1, 2000);
+    CHECK(o.status == 200 && o.last.error == HX_OK);
+    finish_client(c);
+}
+
 static void test_a_paused_request_reads_nothing_until_resumed(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -636,6 +655,22 @@ static void test_a_reused_connection_the_server_just_closed_is_retried_on_a_new_
     hx_request_start(c, &r, &second);
     run(c, &second, 1, 2000);
     CHECK(first.status == 200 && second.status == 200 && second.last.error == HX_OK && !second.last.reused);
+    finish_client(c);
+}
+
+static void test_an_upload_does_not_reuse_a_connection_the_server_closed(void) {
+    hx_client *c = client(0);
+    outcome first = {0}, second = {0};
+    hx_request drop = get("/drop");
+    hx_request_start(c, &drop, &first);
+    run(c, &first, 1, 2000);
+    usleep(50000);
+    hx_request r = upload(2);
+    hx_req *q = hx_request_start(c, &r, &second);
+    hx_request_send(q, "ok", 2);
+    hx_request_end_body(q);
+    run(c, &second, 1, 2000);
+    CHECK(second.status == 200 && second.last.error == HX_OK && !second.last.reused);
     finish_client(c);
 }
 
@@ -700,8 +735,10 @@ int main(void) {
     test_an_upload_of_unknown_length_is_chunked();
     test_an_upload_asks_for_its_body_once_the_headers_are_sent();
     test_a_response_before_the_whole_upload_closes_the_connection();
+    test_a_response_is_kept_when_the_rest_of_the_upload_cannot_be_sent();
     test_a_paused_request_reads_nothing_until_resumed();
     test_a_reused_connection_the_server_just_closed_is_retried_on_a_new_one();
+    test_an_upload_does_not_reuse_a_connection_the_server_closed();
     test_times_are_in_order();
     test_many_requests_at_once();
     printf(failures ? "%d failed\n" : "all passed\n", failures);
