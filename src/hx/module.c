@@ -56,6 +56,12 @@ typedef struct {
     pthread_mutex_t lock;
 } HostTable;
 
+typedef struct {
+    char *host, *auth;
+    uint16_t port;
+    bool set, unsupported;
+} Proxy;
+
 typedef struct EventLoop EventLoop;
 typedef struct Session Session;
 typedef struct Request Request;
@@ -149,7 +155,7 @@ struct Request {
     char *target;
     char *method;
     uint16_t port;
-    char *proxy_host;
+    char *proxy_host, *proxy_auth;
     uint16_t proxy_port;
     char **headers;
     size_t header_count;
@@ -231,10 +237,8 @@ struct Session {
     Pool *pool;
     hx_jar *jar;
     pthread_mutex_t jar_lock;
-    char *proxy_host, *proxy_auth, *no_proxy;
-    uint16_t proxy_port;
-    bool proxy_unsupported;
-    bool https_proxy;
+    Proxy proxy, https_proxy;
+    char *no_proxy;
     uint64_t tls_cache;
     Stats stats;
 };
@@ -310,6 +314,7 @@ static void request_free(Request *r) {
     free(r->host);
     free(r->authority);
     free(r->proxy_host);
+    free(r->proxy_auth);
     free(r->ca_file);
     free(r->ca_path);
     free(r->ca_pem);
@@ -1126,8 +1131,11 @@ static void begin_request(EventLoop *loop, Request *r) {
     add_cookie_header(r);
     hx_request q = {
         .method = r->method,
-        .host = r->proxy_host != NULL ? r->proxy_host : r->host,
-        .port = r->proxy_host != NULL ? r->proxy_port : r->port,
+        .host = r->proxy_host != NULL && !r->tls ? r->proxy_host : r->host,
+        .port = r->proxy_host != NULL && !r->tls ? r->proxy_port : r->port,
+        .proxy_host = r->tls ? r->proxy_host : NULL,
+        .proxy_port = r->proxy_port,
+        .proxy_auth = r->proxy_auth,
         .authority = r->authority,
         .target = r->target,
         .headers = (const char *const *)r->headers,
@@ -1500,6 +1508,8 @@ static int error_code(hx_error e) {
         return E_SSL_CERTPROBLEM;
     case HX_ERR_TLS_CA:
         return E_SSL_CACERT_BADFILE;
+    case HX_ERR_TUNNEL:
+        return E_RECV_ERROR;
     }
     return E_RECV_ERROR;
 }
@@ -1544,6 +1554,13 @@ static void error_text(const Request *r, char *message, size_t size) {
         break;
     case HX_ERR_TLS_CERT:
         snprintf(message, size, "could not load PEM client certificate from %s", r->cert_file ? r->cert_file : "");
+        break;
+    case HX_ERR_TUNNEL:
+        if (e->sys_errno != 0) {
+            snprintf(message, size, "CONNECT tunnel failed, response %d", e->sys_errno);
+        } else {
+            snprintf(message, size, "Proxy CONNECT aborted");
+        }
         break;
     case HX_ERR_TLS_CA:
         snprintf(message, size, "error setting certificate verify locations: CAfile: %s CApath: %s",
@@ -1783,21 +1800,11 @@ static bool no_proxy_for(const char *list, const char *host) {
 static int parse_url(Request *r, const char *url, char **user, char **password);
 static char *basic_auth(const char *user, const char *password);
 
-static int read_proxy(Session *self) {
-    char *https = env_value("https_proxy", "HTTPS_PROXY");
-    if (https == NULL) {
-        https = env_value("all_proxy", "ALL_PROXY");
-    }
-    self->https_proxy = https != NULL;
-    free(https);
-    self->no_proxy = env_value("no_proxy", "NO_PROXY");
-    char *url = env_value("http_proxy", NULL);
-    if (url == NULL) {
-        url = env_value("all_proxy", "ALL_PROXY");
-    }
+static int parse_proxy(Proxy *proxy, char *url) {
     if (url == NULL) {
         return 0;
     }
+    proxy->set = true;
     char *full = strstr(url, "://") != NULL ? strdup(url) : NULL;
     if (full == NULL && (full = malloc(strlen(url) + 8)) != NULL) {
         sprintf(full, "http://%s", url);
@@ -1808,22 +1815,24 @@ static int read_proxy(Session *self) {
     int code = full != NULL ? parse_url(&p, full, &user, &password) : E_OUT_OF_MEMORY;
     free(full);
     if (code == 0 && (p.bad_scheme || p.tls)) {
-        self->proxy_unsupported = true;
+        proxy->unsupported = true;
     } else if (code == 0) {
         const char *colon = strrchr(p.authority, ':');
         bool explicit_port = colon != NULL && strchr(colon, ']') == NULL;
-        self->proxy_host = p.host;
+        proxy->host = p.host;
         p.host = NULL;
-        self->proxy_port = explicit_port ? p.port : 1080;
+        proxy->port = explicit_port ? p.port : 1080;
         if (user != NULL) {
             char *header = basic_auth(user, password != NULL ? password : "");
-            self->proxy_auth = header != NULL ? malloc(strlen(header) + 7) : NULL;
-            if (self->proxy_auth != NULL) {
-                sprintf(self->proxy_auth, "Proxy-%s", header);
+            proxy->auth = header != NULL ? malloc(strlen(header) + 7) : NULL;
+            if (proxy->auth != NULL) {
+                sprintf(proxy->auth, "Proxy-%s", header);
             }
             free(header);
-            code = self->proxy_auth != NULL ? 0 : E_OUT_OF_MEMORY;
+            code = proxy->auth != NULL ? 0 : E_OUT_OF_MEMORY;
         }
+    } else {
+        proxy->set = false;
     }
     free(user);
     free(password);
@@ -1832,6 +1841,26 @@ static int read_proxy(Session *self) {
     free(p.target);
     free(p.url);
     return code == E_OUT_OF_MEMORY ? -1 : 0;
+}
+
+static void proxy_free(Proxy *proxy) {
+    free(proxy->host);
+    free(proxy->auth);
+}
+
+static int read_proxy(Session *self) {
+    self->no_proxy = env_value("no_proxy", "NO_PROXY");
+    char *http = env_value("http_proxy", NULL);
+    char *https = env_value("https_proxy", "HTTPS_PROXY");
+    if (http == NULL) {
+        http = env_value("all_proxy", "ALL_PROXY");
+    }
+    if (https == NULL) {
+        https = env_value("all_proxy", "ALL_PROXY");
+    }
+    int a = parse_proxy(&self->proxy, http);
+    int b = parse_proxy(&self->https_proxy, https);
+    return a == -1 || b == -1 ? -1 : 0;
 }
 
 static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
@@ -1916,8 +1945,8 @@ static void close_pool(Session *self);
 
 static void Session_dealloc(Session *self) {
     close_pool(self);
-    free(self->proxy_host);
-    free(self->proxy_auth);
+    proxy_free(&self->proxy);
+    proxy_free(&self->https_proxy);
     free(self->no_proxy);
     if (self->jar != NULL) {
         hx_jar_free(self->jar);
@@ -2182,27 +2211,30 @@ static int parse_tls(Request *r, PyObject *cert, PyObject *verify) {
 }
 
 static int use_proxy(Session *self, Request *r) {
-    if (r->tls) {
-        return self->https_proxy && !no_proxy_for(self->no_proxy, r->host) ? -3 : 0;
-    }
-    if ((self->proxy_host == NULL && !self->proxy_unsupported) || r->bad_scheme ||
-        no_proxy_for(self->no_proxy, r->host)) {
+    Proxy *proxy = r->tls ? &self->https_proxy : &self->proxy;
+    if (!proxy->set || r->bad_scheme || no_proxy_for(self->no_proxy, r->host)) {
         return 0;
     }
-    if (self->proxy_unsupported) {
+    if (proxy->unsupported) {
         return -2;
     }
+    r->proxy_host = strdup(proxy->host);
+    r->proxy_port = proxy->port;
+    if (r->proxy_host == NULL) {
+        return -1;
+    }
+    if (r->tls) {
+        r->proxy_auth = proxy->auth != NULL ? strdup(proxy->auth) : NULL;
+        return proxy->auth != NULL && r->proxy_auth == NULL ? -1 : 0;
+    }
     char *target = malloc(strlen(r->authority) + strlen(r->target) + 8);
-    r->proxy_host = strdup(self->proxy_host);
-    if (target == NULL || r->proxy_host == NULL ||
-        (self->proxy_auth != NULL && add_header(r, strdup(self->proxy_auth)) != 0)) {
+    if (target == NULL || (proxy->auth != NULL && add_header(r, strdup(proxy->auth)) != 0)) {
         free(target);
         return -1;
     }
     sprintf(target, "http://%s%s", r->authority, r->target);
     free(r->target);
     r->target = target;
-    r->proxy_port = self->proxy_port;
     return 0;
 }
 
@@ -2405,10 +2437,6 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         request_free(r);
         if (proxy == -2) {
             PyErr_SetString(PyExc_NotImplementedError, "the hx backend only does http:// proxies so far");
-            return NULL;
-        }
-        if (proxy == -3) {
-            PyErr_SetString(PyExc_NotImplementedError, "https through a proxy isn't on the hx backend yet");
             return NULL;
         }
         return PyErr_NoMemory();

@@ -53,6 +53,9 @@ typedef struct {
     const char *cert_file;
     const char *key_file;
     uint64_t tls_cache;
+    const char *proxy_host;
+    uint16_t proxy_port;
+    const char *proxy_auth;
 } hx_request;
 
 typedef enum { HX_EV_HEADERS = 1, HX_EV_BODY, HX_EV_DONE, HX_EV_SEND_READY } hx_event_type;
@@ -74,6 +77,7 @@ typedef enum {
     HX_ERR_TLS_VERIFY,
     HX_ERR_TLS_CERT,
     HX_ERR_TLS_CA,
+    HX_ERR_TUNNEL,
 } hx_error;
 
 enum {

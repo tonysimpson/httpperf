@@ -18,7 +18,7 @@
 
 #define MAX_ADDRS 8
 
-typedef enum { CONN_CONNECTING, CONN_HANDSHAKE, CONN_BUSY, CONN_IDLE, CONN_CLOSED } conn_state;
+typedef enum { CONN_CONNECTING, CONN_TUNNEL, CONN_HANDSHAKE, CONN_BUSY, CONN_IDLE, CONN_CLOSED } conn_state;
 
 typedef struct conn {
     hx_client *client;
@@ -55,6 +55,7 @@ typedef struct conn {
     hx_tls_ctx *tls;
     char session_key[320];
     const char *tls_detail;
+    size_t tunnel_len;
     struct hx_req *req;
     struct conn *prev, *next;
 } conn;
@@ -105,6 +106,9 @@ struct hx_req {
     char key[300];
     char host[256];
     uint16_t port;
+    char proxy_host[256];
+    uint16_t proxy_port;
+    char *proxy_auth;
     int64_t connect_timeout;
     lookup *lookup;
     struct hx_req *dns_next;
@@ -163,6 +167,16 @@ struct hx_client {
     } while (0)
 
 static int64_t now(hx_client *c) { return c->io.now(c->io.ctx); }
+
+static void req_free(struct hx_req *q) {
+    hx_buf_free(&q->request);
+    free(q->proxy_auth);
+    free(q);
+}
+
+static const char *target_host(const struct hx_req *q) { return q->proxy_host[0] ? q->proxy_host : q->host; }
+
+static uint16_t target_port(const struct hx_req *q) { return q->proxy_host[0] ? q->proxy_port : q->port; }
 
 static void watch(conn *k, int events) {
     if (k->watching != events) {
@@ -299,8 +313,7 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         }
     }
     if (e == NULL) {
-        hx_buf_free(&q->request);
-        free(q);
+        req_free(q);
     }
 }
 
@@ -574,7 +587,7 @@ static void open_for(hx_client *c, struct hx_req *q, const struct addrinfo *ai) 
 
 static void resolve(hx_client *c, struct hx_req *q) {
     char key[264];
-    snprintf(key, sizeof(key), "%s:%u", q->host, q->port);
+    snprintf(key, sizeof(key), "%s:%u", target_host(q), target_port(q));
     int64_t t = now(c);
     for (cached **p = &c->cache; *p != NULL;) {
         cached *e = *p;
@@ -604,7 +617,7 @@ static void resolve(hx_client *c, struct hx_req *q) {
             c->io.watch(c->io.ctx, hx_dns_fd(c->dns), HX_READ);
         }
         l = calloc(1, sizeof(lookup));
-        if (l == NULL || hx_dns_lookup(c->dns, q->host, q->port, c->next_lookup_id + 1) == -1) {
+        if (l == NULL || hx_dns_lookup(c->dns, target_host(q), target_port(q), c->next_lookup_id + 1) == -1) {
             free(l);
             finish(q, HX_ERR_NOMEM, 0, false);
             return;
@@ -719,8 +732,16 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
             return q;
         }
         q->tls_cache = r->tls_cache;
-        snprintf(q->key, sizeof(q->key), "%llu/%s:%u/%llu/%llu", (unsigned long long)r->pool, r->host, r->port,
-                 (unsigned long long)q->tls->id, (unsigned long long)r->tls_cache);
+        if (r->proxy_host != NULL) {
+            snprintf(q->proxy_host, sizeof(q->proxy_host), "%s", r->proxy_host);
+            q->proxy_port = r->proxy_port;
+            if (r->proxy_auth != NULL && (q->proxy_auth = strdup(r->proxy_auth)) == NULL) {
+                finish(q, HX_ERR_NOMEM, 0, false);
+                return q;
+            }
+        }
+        snprintf(q->key, sizeof(q->key), "%llu/%s:%u/%llu/%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port,
+                 (unsigned long long)q->tls->id, (unsigned long long)r->tls_cache, q->proxy_host, q->proxy_port);
     } else {
         snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
     }
@@ -749,8 +770,8 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
 static void connect_new(hx_client *c, struct hx_req *q) {
     struct addrinfo hints = {.ai_socktype = SOCK_STREAM, .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV}, *ai = NULL;
     char port[8];
-    snprintf(port, sizeof(port), "%u", q->port);
-    if (getaddrinfo(q->host, port, &hints, &ai) == 0) {
+    snprintf(port, sizeof(port), "%u", target_port(q));
+    if (getaddrinfo(target_host(q), port, &hints, &ai) == 0) {
         open_for(c, q, ai);
         freeaddrinfo(ai);
     } else {
@@ -863,6 +884,74 @@ static void handshake(conn *k) {
     fail(k, HX_ERR_TLS, err == SSL_ERROR_SYSCALL ? errno : 0);
 }
 
+static void start_tls(conn *k) {
+    k->ssl = hx_tls_new(&k->client->tls, k->tls, k->req->host, k->session_key, k);
+    if (k->ssl == NULL || SSL_set_fd(k->ssl, k->fd) != 1) {
+        fail(k, HX_ERR_NOMEM, 0);
+        return;
+    }
+    k->state = CONN_HANDSHAKE;
+    handshake(k);
+}
+
+static bool head_complete(const char *buf, size_t len) {
+    for (size_t i = 3; i < len; i++) {
+        if (buf[i] == '\n' && buf[i - 1] == '\r' && buf[i - 2] == '\n' && buf[i - 3] == '\r') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tunnel(conn *k) {
+    while (k->out_sent < k->out.len) {
+        ssize_t n = send(k->fd, k->out.data + k->out_sent, k->out.len - k->out_sent, MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            watch(k, HX_WRITE);
+            return;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            fail(k, HX_ERR_SEND, errno);
+            return;
+        }
+        k->out_sent += (size_t)n;
+    }
+    watch(k, HX_READ);
+    for (;;) {
+        if (k->tunnel_len == k->rcap) {
+            fail(k, HX_ERR_TUNNEL, 0);
+            return;
+        }
+        ssize_t n = recv(k->fd, k->rbuf + k->tunnel_len, k->rcap - k->tunnel_len, 0);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            fail(k, n == 0 ? HX_ERR_TUNNEL : HX_ERR_RECEIVE, n == 0 ? 0 : errno);
+            return;
+        }
+        k->tunnel_len += (size_t)n;
+        if (!head_complete(k->rbuf, k->tunnel_len)) {
+            continue;
+        }
+        int status = k->tunnel_len > 12 && memcmp(k->rbuf, "HTTP/1.", 7) == 0 ? atoi(k->rbuf + 9) : 0;
+        k->out.len = k->out_sent = 0;
+        k->tunnel_len = 0;
+        if (status < 200 || status > 299) {
+            fail(k, HX_ERR_TUNNEL, status);
+            return;
+        }
+        start_tls(k);
+        return;
+    }
+}
+
 static void connected(conn *k) {
     struct pollfd p = {.fd = k->fd, .events = POLLOUT};
     if (poll(&p, 1, 0) == 0) {
@@ -885,14 +974,29 @@ static void connected(conn *k) {
     }
     struct hx_req *q = k->req;
     q->times[HX_T_CONNECT] = now(k->client);
-    if (k->tls != NULL) {
-        k->ssl = hx_tls_new(&k->client->tls, k->tls, q->host, k->session_key, k);
-        if (k->ssl == NULL || SSL_set_fd(k->ssl, k->fd) != 1) {
+    if (k->tls != NULL && q->proxy_host[0]) {
+        bool v6 = strchr(q->host, ':') != NULL;
+        char line[600];
+        int n =
+            snprintf(line, sizeof(line),
+                     v6 ? "CONNECT [%s]:%u HTTP/1.1\r\nHost: [%s]:%u\r\n" : "CONNECT %s:%u HTTP/1.1\r\nHost: %s:%u\r\n",
+                     q->host, q->port, q->host, q->port);
+        k->out.len = k->out_sent = 0;
+        bool ok = hx_buf_append(&k->out, line, (size_t)n) &&
+                  (q->proxy_auth == NULL ||
+                   (hx_buf_append_str(&k->out, q->proxy_auth) && hx_buf_append(&k->out, "\r\n", 2))) &&
+                  hx_buf_append(&k->out, "\r\n", 2);
+        if (!ok) {
             fail(k, HX_ERR_NOMEM, 0);
             return;
         }
-        k->state = CONN_HANDSHAKE;
-        handshake(k);
+        k->state = CONN_TUNNEL;
+        k->tunnel_len = 0;
+        tunnel(k);
+        return;
+    }
+    if (k->tls != NULL) {
+        start_tls(k);
         return;
     }
     q->times[HX_T_TLS] = q->times[HX_T_CONNECT];
@@ -1085,6 +1189,10 @@ void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
         handshake(k);
         return;
     }
+    if (k->state == CONN_TUNNEL) {
+        tunnel(k);
+        return;
+    }
     if ((events & HX_WRITE) && k->state == CONN_BUSY && k->req != NULL) {
         send_some(k);
     }
@@ -1111,11 +1219,12 @@ void hx_client_on_timer(hx_client *c) {
     }
     for (conn *k = c->conns, *after; k != NULL; k = after) {
         after = k->next;
-        int64_t deadline = k->state == CONN_IDLE && k->idle_timeout > 0                ? k->idle_since + k->idle_timeout
-                           : k->state == CONN_CONNECTING || k->state == CONN_HANDSHAKE ? k->connect_deadline
-                                                                                       : 0;
+        int64_t deadline = k->state == CONN_IDLE && k->idle_timeout > 0 ? k->idle_since + k->idle_timeout
+                           : k->state == CONN_CONNECTING || k->state == CONN_TUNNEL || k->state == CONN_HANDSHAKE
+                               ? k->connect_deadline
+                               : 0;
         if (deadline > 0 && deadline <= t) {
-            if (k->state == CONN_CONNECTING || k->state == CONN_HANDSHAKE) {
+            if (k->state == CONN_CONNECTING || k->state == CONN_TUNNEL || k->state == CONN_HANDSHAKE) {
                 fail(k, HX_ERR_TIMEOUT, 0);
             } else if (!k->pinned) {
                 conn_close(k);
@@ -1165,8 +1274,7 @@ int hx_client_events(hx_client *c, hx_event *out, int max) {
             release_later(c, e->pin);
         }
         if (e->done != NULL) {
-            hx_buf_free(&e->done->request);
-            free(e->done);
+            req_free(e->done);
         }
     }
     if (c->queue_pos == c->queue_len) {
@@ -1223,8 +1331,7 @@ void hx_client_free(hx_client *c) {
     while (c->reqs != NULL) {
         struct hx_req *q = c->reqs;
         UNLINK(c->reqs, q);
-        hx_buf_free(&q->request);
-        free(q);
+        req_free(q);
     }
     while (c->conns != NULL) {
         conn *k = c->conns;
@@ -1235,8 +1342,7 @@ void hx_client_free(hx_client *c) {
     }
     for (size_t i = c->queue_pos; i < c->queue_len; i++) {
         if (c->queue[i].done != NULL) {
-            hx_buf_free(&c->queue[i].done->request);
-            free(c->queue[i].done);
+            req_free(c->queue[i].done);
         }
     }
     for (size_t i = 0; i < c->released_len; i++) {

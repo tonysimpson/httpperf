@@ -3,6 +3,7 @@
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -111,6 +112,94 @@ static void start_server(void) {
     server_port = ntohs(addr.sin_port);
     pthread_t t;
     pthread_create(&t, NULL, server, (void *)(intptr_t)listener);
+    pthread_detach(t);
+}
+
+static int proxy_port;
+static bool proxy_refuses;
+static char proxy_saw[1024];
+
+static int listen_any(int *port) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    bind(listener, (struct sockaddr *)&addr, sizeof(addr));
+    listen(listener, 64);
+    socklen_t len = sizeof(addr);
+    getsockname(listener, (struct sockaddr *)&addr, &len);
+    *port = ntohs(addr.sin_port);
+    return listener;
+}
+
+static void relay(int a, int b) {
+    char buf[16384];
+    struct pollfd p[2] = {{.fd = a, .events = POLLIN}, {.fd = b, .events = POLLIN}};
+    while (poll(p, 2, 5000) > 0) {
+        for (int i = 0; i < 2; i++) {
+            if (p[i].revents == 0) {
+                continue;
+            }
+            ssize_t n = recv(p[i].fd, buf, sizeof(buf), 0);
+            if (n <= 0 || send(p[1 - i].fd, buf, (size_t)n, MSG_NOSIGNAL) != n) {
+                return;
+            }
+        }
+    }
+}
+
+static void *proxy_one(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    char head[1024];
+    size_t len = 0;
+    while (len < sizeof(head) - 1) {
+        ssize_t n = recv(fd, head + len, sizeof(head) - 1 - len, 0);
+        if (n <= 0) {
+            break;
+        }
+        len += (size_t)n;
+        head[len] = '\0';
+        if (strstr(head, "\r\n\r\n") != NULL) {
+            break;
+        }
+    }
+    head[len] = '\0';
+    snprintf(proxy_saw, sizeof(proxy_saw), "%s", head);
+    if (proxy_refuses) {
+        const char *r = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+        send(fd, r, strlen(r), MSG_NOSIGNAL);
+    } else {
+        int up = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons((uint16_t)server_port)};
+        if (connect(up, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            const char *r = "HTTP/1.1 200 Connection established\r\n\r\n";
+            send(fd, r, strlen(r), MSG_NOSIGNAL);
+            relay(fd, up);
+        }
+        close(up);
+    }
+    close(fd);
+    return NULL;
+}
+
+static void *proxy(void *arg) {
+    int listener = (int)(intptr_t)arg;
+    for (;;) {
+        int fd = accept(listener, NULL, NULL);
+        if (fd < 0) {
+            return NULL;
+        }
+        pthread_t t;
+        pthread_create(&t, NULL, proxy_one, (void *)(intptr_t)fd);
+        pthread_detach(t);
+    }
+}
+
+static void start_proxy(void) {
+    int listener = listen_any(&proxy_port);
+    pthread_t t;
+    pthread_create(&t, NULL, proxy, (void *)(intptr_t)listener);
     pthread_detach(t);
 }
 
@@ -348,6 +437,41 @@ static void test_a_body_bigger_than_the_read_buffer_arrives_whole(void) {
     finish_client(c);
 }
 
+static hx_request proxied(void) {
+    hx_request r = get("/");
+    r.proxy_host = "127.0.0.1";
+    r.proxy_port = (uint16_t)proxy_port;
+    return r;
+}
+
+static void test_a_request_tunnels_through_a_proxy(void) {
+    proxy_refuses = false;
+    hx_client *c = client(0);
+    outcome o = fetch(c, proxied());
+    char want[64];
+    snprintf(want, sizeof(want), "CONNECT 127.0.0.1:%d HTTP/1.1\r\n", server_port);
+    CHECK(o.last.error == HX_OK && o.status == 200 && strncmp(proxy_saw, want, strlen(want)) == 0);
+    finish_client(c);
+}
+
+static void test_a_refused_tunnel_is_a_tunnel_error(void) {
+    proxy_refuses = true;
+    hx_client *c = client(0);
+    outcome o = fetch(c, proxied());
+    CHECK(o.last.error == HX_ERR_TUNNEL && o.last.sys_errno == 403);
+    finish_client(c);
+}
+
+static void test_proxy_credentials_go_with_the_connect(void) {
+    proxy_refuses = true;
+    hx_client *c = client(0);
+    hx_request r = proxied();
+    r.proxy_auth = "Proxy-Authorization: Basic dXNlcjpwdw==";
+    fetch(c, r);
+    CHECK(strstr(proxy_saw, "\r\nProxy-Authorization: Basic dXNlcjpwdw==\r\n") != NULL);
+    finish_client(c);
+}
+
 static void test_plain_http_to_a_tls_server_does_not_succeed(void) {
     hx_client *c = client(0);
     hx_request r = get("/");
@@ -360,6 +484,7 @@ static void test_plain_http_to_a_tls_server_does_not_succeed(void) {
 
 int main(void) {
     start_server();
+    start_proxy();
     test_a_request_to_a_trusted_server_succeeds();
     test_the_handshake_is_timed_after_the_connect();
     test_an_untrusted_server_fails_verification();
@@ -373,6 +498,9 @@ int main(void) {
     test_a_session_outlives_its_closed_connection();
     test_another_tls_cache_does_not_resume();
     test_a_body_bigger_than_the_read_buffer_arrives_whole();
+    test_a_request_tunnels_through_a_proxy();
+    test_a_refused_tunnel_is_a_tunnel_error();
+    test_proxy_credentials_go_with_the_connect();
     test_plain_http_to_a_tls_server_does_not_succeed();
     printf(failures ? "%d failed\n" : "all passed\n", failures);
     return failures != 0;
