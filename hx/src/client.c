@@ -71,6 +71,8 @@ typedef struct conn {
     struct hx_req *touched;
     struct hx_req *req;
     struct conn *prev, *next;
+    bool listed_idle;
+    struct conn *idle_prev, *idle_next;
 } conn;
 
 typedef struct lookup {
@@ -157,6 +159,7 @@ struct hx_client {
     size_t open;
     size_t idle;
     conn *conns;
+    conn *idle_head, *idle_tail;
     conn **by_fd;
     size_t by_fd_len;
     struct hx_req *reqs;
@@ -303,11 +306,44 @@ static void conn_free(conn *k) {
     free(k);
 }
 
+static void idle_add(conn *k) {
+    hx_client *c = k->client;
+    k->listed_idle = true;
+    k->idle_next = NULL;
+    k->idle_prev = c->idle_tail;
+    if (c->idle_tail != NULL) {
+        c->idle_tail->idle_next = k;
+    } else {
+        c->idle_head = k;
+    }
+    c->idle_tail = k;
+}
+
+static void idle_remove(conn *k) {
+    if (!k->listed_idle) {
+        return;
+    }
+    hx_client *c = k->client;
+    k->listed_idle = false;
+    if (k->idle_prev != NULL) {
+        k->idle_prev->idle_next = k->idle_next;
+    } else {
+        c->idle_head = k->idle_next;
+    }
+    if (k->idle_next != NULL) {
+        k->idle_next->idle_prev = k->idle_prev;
+    } else {
+        c->idle_tail = k->idle_prev;
+    }
+    k->idle_prev = k->idle_next = NULL;
+}
+
 static void conn_close(conn *k) {
     if (k->state == CONN_CLOSED) {
         return;
     }
     hx_client *c = k->client;
+    idle_remove(k);
     if (k->state == CONN_IDLE) {
         c->idle--;
     }
@@ -405,6 +441,7 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         } else {
             k->state = CONN_IDLE;
             c->idle++;
+            idle_add(k);
             k->idle_since = now(c);
             k->idle_timeout = q->idle_timeout;
             schedule(c, k->idle_timeout > 0 ? k->idle_since + k->idle_timeout : 0);
@@ -573,6 +610,7 @@ static void begin(conn *k, struct hx_req *q) {
     if (k->state == CONN_IDLE) {
         k->client->idle--;
     }
+    idle_remove(k);
     k->req = q;
     q->conn = k;
     k->state = CONN_BUSY;
@@ -802,8 +840,8 @@ static bool still_open(conn *k) {
 
 static conn *find_idle(hx_client *c, const char *key, int64_t max_age, bool check) {
     int64_t t = max_age > 0 ? now(c) : 0;
-    for (conn *k = c->conns, *after; k != NULL; k = after) {
-        after = k->next;
+    for (conn *k = c->idle_head, *after; k != NULL; k = after) {
+        after = k->idle_next;
         if (k->state != CONN_IDLE || k->pinned || k->h2 || strcmp(k->key, key) != 0) {
             continue;
         }
