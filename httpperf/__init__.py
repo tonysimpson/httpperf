@@ -1138,10 +1138,13 @@ class Engine:
         for error, response, future in self._ae_loop.get_completed():
             if future.done():
                 continue
-            if response is not None or error is None:
-                future.set_result(response)
-            else:
-                future.set_exception(_error(*error))
+            try:
+                if response is not None or error is None:
+                    future.set_result(response)
+                else:
+                    future.set_exception(_error(*error))
+            except RuntimeError:
+                pass
 
     def close(self):
         if self._closed:

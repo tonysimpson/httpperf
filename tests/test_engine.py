@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import warnings
 
 import pytest
@@ -157,6 +158,29 @@ def test_an_engine_moves_to_a_new_loop_once_the_old_one_closes(two_loops):
     fail_on(first, session)
     first.close()
     fail_on(second, session)
+
+
+def test_responses_for_a_closed_loop_do_not_stop_responses_for_the_new_one(two_loops, server):
+    first, second = two_loops
+    first.set_exception_handler(lambda loop, context: None)
+    session = httpperf.Session(engine=httpperf.Engine())
+
+    async def start_old_requests():
+        [asyncio.ensure_future(session.get(server.url + "/slow")) for _ in range(10)]
+        while len(server.started) < 10:
+            await asyncio.sleep(0.01)
+
+    async def new_request():
+        request = asyncio.ensure_future(session.get(server.url + "/slow"))
+        while len(server.started) < 11:
+            await asyncio.sleep(0.01)
+        server.release.set()
+        time.sleep(0.3)
+        return await asyncio.wait_for(request, 5)
+
+    first.run_until_complete(start_old_requests())
+    first.close()
+    assert second.run_until_complete(new_request()).status_code == 200
 
 
 def test_a_closed_engine_refuses_requests():
