@@ -398,7 +398,12 @@ static void info_capture(CURL *curl, TransferInfo *info, bool final) {
     curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME, &info->pretransfer_time);
     curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME, &info->starttransfer_time);
 #if LIBCURL_VERSION_NUM >= 0x080a00
+    curl_off_t pretransfer_us = 0;
     curl_easy_getinfo(curl, CURLINFO_POSTTRANSFER_TIME_T, &info->posttransfer_us);
+    curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME_T, &pretransfer_us);
+    if (info->posttransfer_us < pretransfer_us) {
+        info->posttransfer_us = pretransfer_us;
+    }
 #endif
     curl_easy_getinfo(curl, CURLINFO_SIZE_UPLOAD_T, &info->size_upload);
     curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &info->size_download);
