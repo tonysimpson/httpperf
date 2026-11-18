@@ -42,9 +42,11 @@ typedef struct {
     int64_t connect_timeout_ns;
     bool decode;
     int64_t max_age_ns;
+    bool upload;
+    int64_t upload_size;
 } hx_request;
 
-typedef enum { HX_EV_HEADERS = 1, HX_EV_BODY, HX_EV_DONE } hx_event_type;
+typedef enum { HX_EV_HEADERS = 1, HX_EV_BODY, HX_EV_DONE, HX_EV_SEND_READY } hx_event_type;
 
 typedef enum {
     HX_OK = 0,
@@ -99,6 +101,9 @@ void hx_client_on_socket(hx_client *c, hx_socket s, int events);
 void hx_client_on_timer(hx_client *c);
 hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user);
 void hx_request_cancel(hx_req *q);
+int hx_request_send(hx_req *q, const char *data, size_t len);
+int hx_request_end_body(hx_req *q);
+void hx_request_pause(hx_req *q, bool paused);
 int hx_client_events(hx_client *c, hx_event *out, int max);
 size_t hx_client_open_connections(const hx_client *c);
 void hx_client_close_pool(hx_client *c, uint64_t pool);

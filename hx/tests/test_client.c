@@ -2,7 +2,9 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -23,6 +25,35 @@ static int failures;
 
 static int server_port;
 
+static bool body_complete(const char *buf, size_t len, size_t *body) {
+    const char *end = strstr(buf, "\r\n\r\n");
+    if (end == NULL) {
+        return false;
+    }
+    *body = (size_t)(end + 4 - buf);
+    const char *cl = strstr(buf, "Content-Length: ");
+    if (cl != NULL && cl < end) {
+        return len >= *body + (size_t)atol(cl + 16);
+    }
+    return len >= *body + 5 && memcmp(buf + len - 5, "0\r\n\r\n", 5) == 0;
+}
+
+static void echo(int fd, char *buf, size_t len) {
+    size_t body = 0;
+    while (!body_complete(buf, len, &body)) {
+        ssize_t n = recv(fd, buf + len, 4095 - len, 0);
+        if (n <= 0) {
+            return;
+        }
+        len += (size_t)n;
+        buf[len] = '\0';
+    }
+    char head[64];
+    int n = snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", len - body);
+    send(fd, head, (size_t)n, MSG_NOSIGNAL);
+    send(fd, buf + body, len - body, MSG_NOSIGNAL);
+}
+
 static void *serve_one(void *arg) {
     int fd = (int)(intptr_t)arg;
     char buf[4096];
@@ -33,6 +64,10 @@ static void *serve_one(void *arg) {
         }
         buf[n] = '\0';
         if (strstr(buf, " /hang ") != NULL) {
+            continue;
+        }
+        if (strstr(buf, " /echo ") != NULL) {
+            echo(fd, buf, (size_t)n);
             continue;
         }
         if (strstr(buf, " /close ") != NULL) {
@@ -124,6 +159,7 @@ typedef struct {
     char body[256];
     size_t body_len;
     size_t body_total;
+    int ready;
     int done;
     hx_event last;
 } outcome;
@@ -164,6 +200,8 @@ static void run(hx_client *c, outcome *o, int wanted, int max_ms) {
                     memcpy(mine->body + mine->body_len, events[i].data, n);
                     mine->body_len += n;
                     mine->body_total += events[i].len;
+                } else if (events[i].type == HX_EV_SEND_READY) {
+                    mine->ready++;
                 } else {
                     mine->done++;
                     mine->last = events[i];
@@ -514,6 +552,80 @@ static void test_closing_a_pool_closes_a_busy_connection_once_its_request_ends(v
     finish_client(c);
 }
 
+static hx_request upload(int64_t size) {
+    hx_request r = get("/echo");
+    r.method = "POST";
+    r.upload = true;
+    r.upload_size = size;
+    return r;
+}
+
+static void test_an_upload_with_a_length_is_sent_as_it_comes(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = upload(5);
+    hx_req *q = hx_request_start(c, &r, &o);
+    hx_request_send(q, "hel", 3);
+    hx_request_send(q, "lo", 2);
+    hx_request_end_body(q);
+    run(c, &o, 1, 2000);
+    CHECK(o.status == 200 && o.body_len == 5 && memcmp(o.body, "hello", 5) == 0);
+    finish_client(c);
+}
+
+static void test_an_upload_of_unknown_length_is_chunked(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = upload(-1);
+    hx_req *q = hx_request_start(c, &r, &o);
+    hx_request_send(q, "hel", 3);
+    hx_request_send(q, "lo", 2);
+    hx_request_end_body(q);
+    run(c, &o, 1, 2000);
+    const char *want = "3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
+    CHECK(o.status == 200 && o.body_len == strlen(want) && memcmp(o.body, want, o.body_len) == 0);
+    finish_client(c);
+}
+
+static void test_an_upload_asks_for_its_body_once_the_headers_are_sent(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = upload(2);
+    hx_req *q = hx_request_start(c, &r, &o);
+    run(c, &o, 1, 200);
+    CHECK(o.ready == 1 && o.done == 0);
+    hx_request_send(q, "ok", 2);
+    hx_request_end_body(q);
+    run(c, &o, 1, 2000);
+    CHECK(o.done == 1 && o.body_len == 2 && memcmp(o.body, "ok", 2) == 0);
+    finish_client(c);
+}
+
+static void test_a_response_before_the_whole_upload_closes_the_connection(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = upload(100);
+    r.target = "/";
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 2000);
+    CHECK(o.status == 200 && o.last.connection_closed && hx_client_open_connections(c) == 0);
+    finish_client(c);
+}
+
+static void test_a_paused_request_reads_nothing_until_resumed(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/big");
+    hx_req *q = hx_request_start(c, &r, &o);
+    hx_request_pause(q, true);
+    run(c, &o, 1, 200);
+    CHECK(o.done == 0 && o.body_total == 0);
+    hx_request_pause(q, false);
+    run(c, &o, 1, 2000);
+    CHECK(o.done == 1 && o.body_total == 200000 - 100);
+    finish_client(c);
+}
+
 static void test_times_are_in_order(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -571,6 +683,11 @@ int main(void) {
     test_the_connection_hook_counts_a_pools_connections();
     test_closing_a_pool_closes_its_idle_connections();
     test_closing_a_pool_closes_a_busy_connection_once_its_request_ends();
+    test_an_upload_with_a_length_is_sent_as_it_comes();
+    test_an_upload_of_unknown_length_is_chunked();
+    test_an_upload_asks_for_its_body_once_the_headers_are_sent();
+    test_a_response_before_the_whole_upload_closes_the_connection();
+    test_a_paused_request_reads_nothing_until_resumed();
     test_times_are_in_order();
     test_many_requests_at_once();
     printf(failures ? "%d failed\n" : "all passed\n", failures);

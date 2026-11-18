@@ -76,8 +76,46 @@ typedef struct Limiter {
     struct Limiter *pending_next;
 } Limiter;
 
+#define STREAM_BUFFER (1024 * 1024)
+
+typedef struct Stream {
+    pthread_mutex_t lock;
+    atomic_int refs;
+    hx_buf buf, spare;
+    bool paused, want_wake, complete;
+    PyObject *waiter;
+    Request *req;
+    int64_t paused_since, paused_ns;
+    hx_event done;
+    long long size_download, size_upload;
+    int error_code;
+    char error[512];
+} Stream;
+
+typedef struct Upload {
+    pthread_mutex_t lock;
+    atomic_int refs;
+    char *ring;
+    size_t head, len;
+    bool eof, ended, done, hungry, want_wake;
+    PyObject *waiter;
+    Request *req;
+    EventLoop *loop;
+    long long total;
+    int64_t paused_since, paused_ns;
+} Upload;
+
+enum { NOTE_HEADERS, NOTE_STREAM_WAKE, NOTE_UPLOAD_WAKE, NOTE_STREAM_RESUME, NOTE_UPLOAD_RESUME };
+
+typedef struct Note {
+    int kind;
+    void *ptr;
+    struct Note *next;
+} Note;
+
 struct Request {
     atomic_int refs;
+    atomic_bool cancel_sent;
     struct Request *next;
     struct Request *cancel_next;
     struct Request *live_prev, *live_next;
@@ -117,6 +155,11 @@ struct Request {
     bool waiting;
     int64_t queued_at;
     int64_t queue_ns;
+    Stream *stream;
+    Upload *upload;
+    int64_t upload_size;
+    bool delivered;
+    int head_status, head_version;
 };
 
 struct EventLoop {
@@ -133,6 +176,8 @@ struct EventLoop {
     pthread_mutex_t lock;
     Request *incoming, *incoming_tail;
     Pool *closing;
+    Note *resumes, *resumes_tail;
+    Note *notes, *notes_tail;
     Request *cancels, *cancels_tail;
     Request *completed, *completed_tail;
     Request *live;
@@ -164,6 +209,10 @@ typedef struct {
     bool body_discarded;
     double times[HX_T_COUNT];
     double queue_time;
+    Stream *stream;
+    Upload *upload;
+    EventLoop *loop;
+    bool synced;
     long long size_upload;
     long long size_download;
     char primary_ip[46];
@@ -214,6 +263,8 @@ static void free_strings(char **strings, size_t count) {
 }
 
 static void limiter_decref(struct Limiter *l);
+static void stream_decref(Stream *s);
+static void upload_decref(Upload *u);
 
 static void request_free(Request *r) {
     free(r->url);
@@ -225,6 +276,8 @@ static void request_free(Request *r) {
     free(r->body);
     hx_buf_free(&r->header);
     hx_buf_free(&r->received);
+    stream_decref(r->stream);
+    upload_decref(r->upload);
     limiter_decref(r->limiter);
     free(r);
 }
@@ -243,6 +296,75 @@ static void push(Request **head, Request **tail, Request *r) {
         *head = r;
     }
     *tail = r;
+}
+
+static void note_push(Note **head, Note **tail, Note *n) {
+    n->next = NULL;
+    if (*tail != NULL) {
+        (*tail)->next = n;
+    } else {
+        *head = n;
+    }
+    *tail = n;
+}
+
+static bool inbox_empty(EventLoop *loop) {
+    return loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL && loop->resumes == NULL;
+}
+
+static Stream *stream_new(void) {
+    Stream *s = calloc(1, sizeof(Stream));
+    if (s != NULL) {
+        pthread_mutex_init(&s->lock, NULL);
+        atomic_init(&s->refs, 1);
+    }
+    return s;
+}
+
+static void stream_decref(Stream *s) {
+    if (s == NULL || atomic_fetch_sub(&s->refs, 1) != 1) {
+        return;
+    }
+    hx_buf_free(&s->buf);
+    hx_buf_free(&s->spare);
+    pthread_mutex_destroy(&s->lock);
+    free(s);
+}
+
+static Upload *upload_new(void) {
+    Upload *u = calloc(1, sizeof(Upload));
+    if (u == NULL || (u->ring = malloc(STREAM_BUFFER)) == NULL) {
+        free(u);
+        return NULL;
+    }
+    pthread_mutex_init(&u->lock, NULL);
+    atomic_init(&u->refs, 1);
+    return u;
+}
+
+static void upload_decref(Upload *u) {
+    if (u == NULL || atomic_fetch_sub(&u->refs, 1) != 1) {
+        return;
+    }
+    free(u->ring);
+    pthread_mutex_destroy(&u->lock);
+    free(u);
+}
+
+static void send_resume(EventLoop *loop, int kind, void *ptr) {
+    Note *n = malloc(sizeof(Note));
+    if (n == NULL) {
+        return;
+    }
+    n->kind = kind;
+    n->ptr = ptr;
+    pthread_mutex_lock(&loop->lock);
+    bool was_empty = inbox_empty(loop);
+    note_push(&loop->resumes, &loop->resumes_tail, n);
+    pthread_mutex_unlock(&loop->lock);
+    if (was_empty) {
+        poke(loop->wake[1]);
+    }
 }
 
 static void watch(void *ctx, hx_socket s, int events);
@@ -267,6 +389,30 @@ STAT(queued)
 
 static void slot_release(EventLoop *loop, Request *r);
 
+static void notify(EventLoop *loop, int kind, void *ptr) {
+    Note *n = malloc(sizeof(Note));
+    if (n == NULL) {
+        return;
+    }
+    n->kind = kind;
+    n->ptr = ptr;
+    pthread_mutex_lock(&loop->lock);
+    bool was_empty = loop->completed == NULL && loop->notes == NULL;
+    note_push(&loop->notes, &loop->notes_tail, n);
+    pthread_mutex_unlock(&loop->lock);
+    if (was_empty) {
+        poke(loop->out[1]);
+    }
+}
+
+static PyObject *take_waiter(pthread_mutex_t *lock, PyObject **waiter) {
+    pthread_mutex_lock(lock);
+    PyObject *w = *waiter;
+    *waiter = NULL;
+    pthread_mutex_unlock(lock);
+    return w;
+}
+
 static void complete(EventLoop *loop, Request *r) {
     if (r->live_prev != NULL) {
         r->live_prev->live_next = r->live_next;
@@ -278,7 +424,7 @@ static void complete(EventLoop *loop, Request *r) {
     }
     r->live_prev = r->live_next = NULL;
     pthread_mutex_lock(&loop->lock);
-    bool was_empty = loop->completed == NULL;
+    bool was_empty = loop->completed == NULL && loop->notes == NULL;
     push(&loop->completed, &loop->completed_tail, r);
     pthread_mutex_unlock(&loop->lock);
     if (was_empty) {
@@ -287,6 +433,120 @@ static void complete(EventLoop *loop, Request *r) {
 }
 
 static bool dispatch_pending(EventLoop *loop);
+static int error_code(hx_error e);
+static void error_text(const Request *r, char *message, size_t size);
+
+static void stream_append(EventLoop *loop, Request *r, const char *data, size_t len) {
+    Stream *s = r->stream;
+    pthread_mutex_lock(&s->lock);
+    bool ok = hx_buf_append(&s->buf, data, len);
+    bool pause = ok && s->buf.len >= STREAM_BUFFER && !s->paused;
+    if (pause) {
+        s->paused = true;
+        s->paused_since = clock_ns();
+    }
+    bool wake = s->want_wake;
+    s->want_wake = false;
+    pthread_mutex_unlock(&s->lock);
+    if (!ok) {
+        hx_request_cancel(r->hx);
+        return;
+    }
+    if (pause) {
+        hx_request_pause(r->hx, true);
+    }
+    if (wake) {
+        atomic_fetch_add(&s->refs, 1);
+        notify(loop, NOTE_STREAM_WAKE, s);
+    }
+}
+
+static void stream_finish(EventLoop *loop, Request *r) {
+    Stream *s = r->stream;
+    char message[512] = "";
+    if (r->done.error != HX_OK) {
+        error_text(r, message, sizeof(message));
+    }
+    pthread_mutex_lock(&s->lock);
+    s->done = r->done;
+    s->size_download = (long long)r->body_bytes;
+    s->size_upload = r->upload != NULL ? r->upload->total : (long long)r->body_len;
+    s->error_code = r->done.error != HX_OK ? error_code(r->done.error) : 0;
+    memcpy(s->error, message, sizeof(message));
+    if (s->paused) {
+        s->paused_ns += clock_ns() - s->paused_since;
+        s->paused = false;
+    }
+    s->complete = true;
+    Request *held = s->req;
+    s->req = NULL;
+    s->want_wake = false;
+    bool wake = s->waiter != NULL;
+    pthread_mutex_unlock(&s->lock);
+    if (wake) {
+        atomic_fetch_add(&s->refs, 1);
+        notify(loop, NOTE_STREAM_WAKE, s);
+    }
+    request_decref(held);
+}
+
+static void upload_pump(EventLoop *loop, Request *r, bool asked) {
+    Upload *u = r->upload;
+    if (r->hx == NULL || r->finished) {
+        return;
+    }
+    pthread_mutex_lock(&u->lock);
+    if (!asked && !u->hungry) {
+        pthread_mutex_unlock(&u->lock);
+        return;
+    }
+    if (u->hungry) {
+        u->paused_ns += clock_ns() - u->paused_since;
+        u->hungry = false;
+    }
+    bool sent = u->len > 0;
+    while (u->len > 0) {
+        size_t n = STREAM_BUFFER - u->head < u->len ? STREAM_BUFFER - u->head : u->len;
+        hx_request_send(r->hx, u->ring + u->head, n);
+        u->head = (u->head + n) % STREAM_BUFFER;
+        u->len -= n;
+        u->total += (long long)n;
+    }
+    bool end = u->eof && !u->ended;
+    if (end) {
+        u->ended = true;
+    } else if (!sent && !u->eof) {
+        u->hungry = true;
+        u->paused_since = clock_ns();
+    }
+    bool wake = u->want_wake;
+    u->want_wake = false;
+    pthread_mutex_unlock(&u->lock);
+    if (end) {
+        hx_request_end_body(r->hx);
+    }
+    if (wake) {
+        atomic_fetch_add(&u->refs, 1);
+        notify(loop, NOTE_UPLOAD_WAKE, u);
+    }
+}
+
+static void upload_done(EventLoop *loop, Request *r) {
+    Upload *u = r->upload;
+    pthread_mutex_lock(&u->lock);
+    u->done = true;
+    u->req = NULL;
+    if (u->hungry) {
+        u->paused_ns += clock_ns() - u->paused_since;
+        u->hungry = false;
+    }
+    bool wake = u->waiter != NULL;
+    pthread_mutex_unlock(&u->lock);
+    if (wake) {
+        atomic_fetch_add(&u->refs, 1);
+        notify(loop, NOTE_UPLOAD_WAKE, u);
+    }
+}
 
 static void handle_events(EventLoop *loop) {
     hx_event events[64];
@@ -296,13 +556,29 @@ again:
         for (int i = 0; i < count; i++) {
             hx_event *e = &events[i];
             Request *r = e->user;
+            if (r->finished) {
+                continue;
+            }
             if (e->type == HX_EV_HEADERS) {
                 r->header.len = 0;
                 hx_buf_append(&r->header, e->data, e->len);
+                if (r->stream != NULL) {
+                    r->head_status = e->status;
+                    r->head_version = e->version;
+                    r->delivered = true;
+                    atomic_fetch_add(&r->refs, 1);
+                    notify(loop, NOTE_HEADERS, r);
+                }
             } else if (e->type == HX_EV_BODY) {
                 r->body_bytes += e->len;
-                if (!r->discard_body) {
+                if (r->stream != NULL) {
+                    stream_append(loop, r, e->data, e->len);
+                } else if (!r->discard_body) {
                     hx_buf_append(&r->received, e->data, e->len);
+                }
+            } else if (e->type == HX_EV_SEND_READY) {
+                if (r->upload != NULL) {
+                    upload_pump(loop, r, true);
                 }
             } else {
                 r->done = *e;
@@ -324,6 +600,12 @@ again:
                                               memory_order_relaxed);
                 }
                 slot_release(loop, r);
+                if (r->upload != NULL) {
+                    upload_done(loop, r);
+                }
+                if (r->delivered) {
+                    stream_finish(loop, r);
+                }
                 complete(loop, r);
             }
         }
@@ -631,6 +913,8 @@ static void begin_request(EventLoop *loop, Request *r) {
         .connect_timeout_ns = r->connect_timeout_ns,
         .decode = true,
         .max_age_ns = r->max_age_ns,
+        .upload = r->upload != NULL,
+        .upload_size = r->upload_size,
     };
     stats_add(loop, r, stat_running, 1);
     r->hx = hx_request_start(loop->client, &q, r);
@@ -650,9 +934,35 @@ static void on_wake(aeEventLoop *ae, int fd, void *data, int mask) {
     pthread_mutex_lock(&loop->lock);
     Request *incoming = loop->incoming, *cancels = loop->cancels;
     Pool *closing = loop->closing;
+    Note *resumes = loop->resumes;
     loop->incoming = loop->incoming_tail = loop->cancels = loop->cancels_tail = NULL;
     loop->closing = NULL;
+    loop->resumes = loop->resumes_tail = NULL;
     pthread_mutex_unlock(&loop->lock);
+    while (resumes != NULL) {
+        Note *n = resumes;
+        resumes = n->next;
+        if (n->kind == NOTE_STREAM_RESUME) {
+            Stream *st = n->ptr;
+            pthread_mutex_lock(&st->lock);
+            Request *r = st->req;
+            pthread_mutex_unlock(&st->lock);
+            if (r != NULL && !r->finished && r->hx != NULL) {
+                hx_request_pause(r->hx, false);
+            }
+            stream_decref(st);
+        } else {
+            Upload *u = n->ptr;
+            pthread_mutex_lock(&u->lock);
+            Request *r = u->req;
+            pthread_mutex_unlock(&u->lock);
+            if (r != NULL) {
+                upload_pump(loop, r, false);
+            }
+            upload_decref(u);
+        }
+        free(n);
+    }
     while (closing != NULL) {
         Pool *p = closing;
         closing = p->next;
@@ -804,12 +1114,49 @@ static PyObject *EventLoop_stop(EventLoop *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static void free_notes(Note *n) {
+    while (n != NULL) {
+        Note *next = n->next;
+        if (n->kind == NOTE_HEADERS) {
+            request_decref(n->ptr);
+        } else if (n->kind == NOTE_STREAM_WAKE || n->kind == NOTE_STREAM_RESUME) {
+            stream_decref(n->ptr);
+        } else {
+            upload_decref(n->ptr);
+        }
+        free(n);
+        n = next;
+    }
+}
+
 static void abandon_list(EventLoop *loop, PyObject *futures, Request *r, bool live) {
     while (r != NULL) {
         Request *next = live ? r->live_next : r->next;
         if (r->future != NULL) {
             PyList_Append(futures, r->future);
             Py_CLEAR(r->future);
+        }
+        if (r->delivered) {
+            Stream *st = r->stream;
+            pthread_mutex_lock(&st->lock);
+            Request *held = NULL;
+            if (!st->complete) {
+                st->complete = true;
+                st->error_code = E_ABORTED_BY_CALLBACK;
+                snprintf(st->error, sizeof(st->error), "engine closed before the request finished");
+                held = st->req;
+                st->req = NULL;
+            }
+            PyObject *w = st->waiter;
+            st->waiter = NULL;
+            pthread_mutex_unlock(&st->lock);
+            if (w != NULL) {
+                PyList_Append(futures, w);
+                Py_DECREF(w);
+            }
+            if (held != NULL) {
+                request_decref(held);
+            }
         }
         Py_CLEAR(r->session);
         r->next = loop->abandoned;
@@ -829,9 +1176,13 @@ static PyObject *EventLoop_abandon(EventLoop *self, PyObject *args) {
     }
     pthread_mutex_lock(&self->lock);
     Request *incoming = self->incoming, *completed = self->completed, *cancels = self->cancels;
+    Note *notes = self->notes, *resumes = self->resumes;
     self->incoming = self->incoming_tail = self->completed = self->completed_tail = NULL;
     self->cancels = self->cancels_tail = NULL;
+    self->notes = self->notes_tail = self->resumes = self->resumes_tail = NULL;
     pthread_mutex_unlock(&self->lock);
+    free_notes(notes);
+    free_notes(resumes);
     Request *live = self->live;
     self->live = NULL;
     free_cancels(cancels);
@@ -880,48 +1231,51 @@ static int error_code(hx_error e) {
     return E_RECV_ERROR;
 }
 
-static PyObject *error_tuple(Request *r) {
+static void error_text(const Request *r, char *message, size_t size) {
     const hx_event *e = &r->done;
-    char message[512];
     switch (e->error) {
     case HX_ERR_DNS:
-        snprintf(message, sizeof(message), "Could not resolve host: %s", r->host);
+        snprintf(message, size, "Could not resolve host: %s", r->host);
         break;
     case HX_ERR_CONNECT:
-        snprintf(message, sizeof(message), "Failed to connect to %s port %u: %s", r->host, r->port,
+        snprintf(message, size, "Failed to connect to %s port %u: %s", r->host, r->port,
                  e->sys_errno ? strerror(e->sys_errno) : "Couldn't connect to server");
         break;
     case HX_ERR_TIMEOUT:
-        snprintf(message, sizeof(message), "Operation timed out after %lld milliseconds",
+        snprintf(message, size, "Operation timed out after %lld milliseconds",
                  (long long)((e->times[HX_T_DONE] - e->times[HX_T_START]) / 1000000));
         break;
     case HX_ERR_SEND:
-        snprintf(message, sizeof(message), "Send failure: %s", strerror(e->sys_errno));
+        snprintf(message, size, "Send failure: %s", strerror(e->sys_errno));
         break;
     case HX_ERR_RECEIVE:
-        snprintf(message, sizeof(message), "%s",
+        snprintf(message, size, "%s",
                  e->sys_errno ? strerror(e->sys_errno) : "Server closed the connection before the response ended");
         break;
     case HX_ERR_PROTOCOL:
-        snprintf(message, sizeof(message), "Invalid HTTP response from the server");
+        snprintf(message, size, "Invalid HTTP response from the server");
         break;
     case HX_ERR_DECODE:
-        snprintf(message, sizeof(message), "Error while processing content unencoding");
+        snprintf(message, size, "Error while processing content unencoding");
         break;
     case HX_ERR_UNKNOWN_ENCODING:
-        snprintf(message, sizeof(message),
-                 "Unrecognized content encoding type. hx understands deflate, gzip content encodings.");
+        snprintf(message, size, "Unrecognized content encoding type. hx understands deflate, gzip content encodings.");
         break;
     case HX_ERR_CANCELLED:
-        snprintf(message, sizeof(message), "Request cancelled");
+        snprintf(message, size, "Request cancelled");
         break;
     case HX_ERR_INVALID:
-        snprintf(message, sizeof(message), "Malformed request");
+        snprintf(message, size, "Malformed request");
         break;
     default:
-        snprintf(message, sizeof(message), "Out of memory");
+        snprintf(message, size, "Out of memory");
     }
-    return Py_BuildValue("(is)", error_code(e->error), message);
+}
+
+static PyObject *error_tuple(Request *r) {
+    char message[512];
+    error_text(r, message, sizeof(message));
+    return Py_BuildValue("(is)", error_code(r->done.error), message);
 }
 
 static double seconds(const hx_event *e, int point) {
@@ -947,25 +1301,118 @@ static Response *response_from(Request *r) {
         resp->times[i] = seconds(e, i);
     }
     resp->times[HX_T_TLS] = 0.0;
-    resp->queue_time = (double)((r->queue_ns + 500) / 1000) / 1e6;
     resp->size_upload = r->body != NULL ? (long long)r->body_len : 0;
     resp->size_download = (long long)r->body_bytes;
     memcpy(resp->primary_ip, e->primary_ip, sizeof(resp->primary_ip));
     resp->url = r->url;
     r->url = NULL;
+    resp->queue_time = (double)((r->queue_ns + 500) / 1000) / 1e6;
+    resp->stream = NULL;
+    resp->upload = NULL;
+    resp->loop = NULL;
+    resp->synced = true;
+    if (r->upload != NULL) {
+        resp->size_upload = r->upload->total;
+        resp->upload = r->upload;
+        atomic_fetch_add(&r->upload->refs, 1);
+    }
     return resp;
+}
+
+static Response *response_at_headers(Request *r) {
+    Response *resp = response_from(r);
+    if (resp == NULL) {
+        return NULL;
+    }
+    resp->status = r->head_status;
+    resp->version = r->head_version;
+    for (int i = 0; i < HX_T_COUNT; i++) {
+        resp->times[i] = 0.0;
+    }
+    resp->size_download = 0;
+    resp->primary_ip[0] = '\0';
+    resp->stream = r->stream;
+    atomic_fetch_add(&r->stream->refs, 1);
+    resp->loop = r->loop;
+    Py_INCREF(r->loop);
+    resp->synced = false;
+    return resp;
+}
+
+static bool response_sync(Response *self) {
+    if (self->synced) {
+        return true;
+    }
+    Stream *s = self->stream;
+    pthread_mutex_lock(&s->lock);
+    if (s->complete) {
+        self->synced = true;
+        for (int i = 0; i < HX_T_COUNT; i++) {
+            self->times[i] = seconds(&s->done, i);
+        }
+        self->times[HX_T_TLS] = 0.0;
+        self->size_download = s->size_download;
+        self->size_upload = s->size_upload;
+        memcpy(self->primary_ip, s->done.primary_ip, sizeof(self->primary_ip));
+    }
+    pthread_mutex_unlock(&s->lock);
+    if (!self->synced) {
+        PyErr_SetString(PyExc_RuntimeError, "the body hasn't been read yet");
+    }
+    return self->synced;
+}
+
+static void append_entry(PyObject **list, PyObject *entry) {
+    if (*list != NULL && (entry == NULL || PyList_Append(*list, entry) == -1)) {
+        Py_CLEAR(*list);
+    }
+    Py_XDECREF(entry);
 }
 
 static PyObject *EventLoop_get_completed(EventLoop *self, PyObject *args) {
     drain_pipe(self->out[0]);
     pthread_mutex_lock(&self->lock);
     Request *r = self->completed;
+    Note *notes = self->notes;
     self->completed = self->completed_tail = NULL;
+    self->notes = self->notes_tail = NULL;
     pthread_mutex_unlock(&self->lock);
     PyObject *list = PyList_New(0);
+    while (notes != NULL) {
+        Note *n = notes;
+        notes = n->next;
+        if (n->kind == NOTE_HEADERS) {
+            Request *h = n->ptr;
+            Response *resp = response_at_headers(h);
+            append_entry(&list, resp != NULL ? Py_BuildValue("(ONO)", Py_None, resp, h->future) : NULL);
+            Py_CLEAR(h->future);
+            request_decref(h);
+        } else if (n->kind == NOTE_STREAM_WAKE) {
+            Stream *st = n->ptr;
+            PyObject *w = take_waiter(&st->lock, &st->waiter);
+            if (w != NULL) {
+                append_entry(&list, Py_BuildValue("(OON)", Py_None, Py_None, w));
+            }
+            stream_decref(st);
+        } else {
+            Upload *up = n->ptr;
+            PyObject *w = take_waiter(&up->lock, &up->waiter);
+            if (w != NULL) {
+                append_entry(&list, Py_BuildValue("(OON)", Py_None, Py_None, w));
+            }
+            upload_decref(up);
+        }
+        free(n);
+    }
     while (r != NULL) {
         Request *next = r->next;
         PyObject *entry = NULL;
+        if (r->delivered) {
+            Py_CLEAR(r->session);
+            request_decref(r);
+            r = next;
+            continue;
+        }
         if (list != NULL) {
             if (r->done.error == HX_OK) {
                 Response *resp = response_from(r);
@@ -1333,6 +1780,8 @@ static int parse_timeout(PyObject *value, const char *name, int64_t *ns) {
     return 0;
 }
 
+static void upload_capsule_free(PyObject *capsule);
+
 static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
     PyObject *future, *headers, *auth, *cookies;
     const char *method, *url;
@@ -1349,8 +1798,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
                                      &discard_body, &stream, &upload_size, &websocket)) {
         return NULL;
     }
-    if (stream || websocket || upload_size >= -1) {
-        PyErr_SetString(PyExc_NotImplementedError, "streaming, uploads and WebSockets aren't on the hx backend yet");
+    if (websocket) {
+        PyErr_SetString(PyExc_NotImplementedError, "WebSockets aren't on the hx backend yet");
         return NULL;
     }
     if (cookies != Py_None) {
@@ -1446,33 +1895,64 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     r->timeout_ns = timeout_ns;
     r->connect_timeout_ns = connect_timeout_ns;
     r->session_stats = &self->stats;
+    PyObject *capsule = NULL;
+    if (stream) {
+        r->stream = stream_new();
+        if (r->stream == NULL) {
+            request_free(r);
+            return PyErr_NoMemory();
+        }
+        r->stream->req = r;
+        atomic_fetch_add(&r->refs, 1);
+    }
+    if (upload_size >= -1) {
+        r->upload = upload_new();
+        if (r->upload == NULL) {
+            request_free(r);
+            return PyErr_NoMemory();
+        }
+        r->upload_size = upload_size;
+        r->upload->req = r;
+        r->upload->loop = loop;
+        Py_INCREF(loop);
+        atomic_fetch_add(&r->upload->refs, 1);
+        capsule = PyCapsule_New(r->upload, "httpperf.upload", upload_capsule_free);
+        if (capsule == NULL) {
+            Py_DECREF(loop);
+            upload_decref(r->upload);
+            request_free(r);
+            return NULL;
+        }
+    }
+    PyObject *handle = PyLong_FromVoidPtr(r);
+    if (handle == NULL) {
+        Py_XDECREF(capsule);
+        request_free(r);
+        return NULL;
+    }
     Py_INCREF(future);
     r->future = future;
     Py_INCREF(self);
     r->session = self;
     pthread_mutex_lock(&loop->lock);
-    bool was_empty = loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL;
+    bool was_empty = inbox_empty(loop);
     push(&loop->incoming, &loop->incoming_tail, r);
     pthread_mutex_unlock(&loop->lock);
     if (was_empty) {
         poke(loop->wake[1]);
     }
-    return PyLong_FromVoidPtr(r);
+    return capsule != NULL ? Py_BuildValue("(NN)", handle, capsule) : handle;
 }
 
-static PyObject *Session_cancel(Session *self, PyObject *handle) {
-    Request *r = PyLong_AsVoidPtr(handle);
-    if (r == NULL) {
-        return NULL;
-    }
-    EventLoop *loop = r->loop;
-    if (atomic_load(&loop->closed)) {
-        Py_RETURN_NONE;
+static void send_cancel(EventLoop *loop, Request *r) {
+    bool expected = false;
+    if (atomic_load(&loop->closed) || !atomic_compare_exchange_strong(&r->cancel_sent, &expected, true)) {
+        return;
     }
     atomic_fetch_add(&r->refs, 1);
     r->cancel_next = NULL;
     pthread_mutex_lock(&loop->lock);
-    bool was_empty = loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL;
+    bool was_empty = inbox_empty(loop);
     if (loop->cancels_tail != NULL) {
         loop->cancels_tail->cancel_next = r;
     } else {
@@ -1483,6 +1963,14 @@ static PyObject *Session_cancel(Session *self, PyObject *handle) {
     if (was_empty) {
         poke(loop->wake[1]);
     }
+}
+
+static PyObject *Session_cancel(Session *self, PyObject *handle) {
+    Request *r = PyLong_AsVoidPtr(handle);
+    if (r == NULL) {
+        return NULL;
+    }
+    send_cancel(r->loop, r);
     Py_RETURN_NONE;
 }
 
@@ -1504,7 +1992,7 @@ static void close_pool(Session *self) {
         return;
     }
     pthread_mutex_lock(&loop->lock);
-    bool was_empty = loop->incoming == NULL && loop->cancels == NULL && loop->closing == NULL;
+    bool was_empty = inbox_empty(loop);
     p->next = loop->closing;
     loop->closing = p;
     pthread_mutex_unlock(&loop->lock);
@@ -1549,7 +2037,28 @@ static PyTypeObject SessionType = {
     .tp_new = Session_new,
 };
 
+static void stream_cancel(Response *self) {
+    Stream *st = self->stream;
+    pthread_mutex_lock(&st->lock);
+    Request *r = st->req;
+    if (r != NULL) {
+        atomic_fetch_add(&r->refs, 1);
+    }
+    pthread_mutex_unlock(&st->lock);
+    if (r != NULL) {
+        send_cancel(self->loop, r);
+        request_decref(r);
+    }
+}
+
 static void Response_dealloc(Response *self) {
+    if (self->stream != NULL) {
+        stream_cancel(self);
+        Py_XDECREF(take_waiter(&self->stream->lock, &self->stream->waiter));
+        stream_decref(self->stream);
+    }
+    upload_decref(self->upload);
+    Py_XDECREF(self->loop);
     hx_buf_free(&self->header);
     hx_buf_free(&self->body);
     Py_XDECREF(self->body_bytes);
@@ -1594,6 +2103,9 @@ static PyObject *Response_get_body(Response *self, PyObject *args) {
 static PyObject *Response_get_effective_url(Response *self, PyObject *args) { return PyUnicode_FromString(self->url); }
 
 static PyObject *Response_get_primary_ip(Response *self, PyObject *args) {
+    if (!response_sync(self)) {
+        return NULL;
+    }
     return PyUnicode_FromString(self->primary_ip);
 }
 
@@ -1632,6 +2144,9 @@ static PyObject *Response_get_redirect_url(Response *self, PyObject *args) {
 
 #define TIME(name, point)                                                  \
     static PyObject *Response_get_##name(Response *self, PyObject *args) { \
+        if (!response_sync(self)) {                                        \
+            return NULL;                                                   \
+        }                                                                  \
         return PyFloat_FromDouble(self->times[point]);                     \
     }
 TIME(total_time, HX_T_DONE)
@@ -1643,14 +2158,106 @@ TIME(posttransfer_time, HX_T_LAST_SENT)
 TIME(starttransfer_time, HX_T_FIRST_BYTE)
 
 static PyObject *Response_get_size_upload(Response *self, PyObject *args) {
+    if (!response_sync(self)) {
+        return NULL;
+    }
     return PyLong_FromLongLong(self->size_upload);
 }
 
 static PyObject *Response_get_size_download(Response *self, PyObject *args) {
+    if (!response_sync(self)) {
+        return NULL;
+    }
     return PyLong_FromLongLong(self->size_download);
 }
 
-static PyObject *Response_get_zero(Response *self, PyObject *args) { return PyFloat_FromDouble(0.0); }
+static PyObject *Response_stream_take(Response *self, PyObject *args) {
+    Stream *st = self->stream;
+    pthread_mutex_lock(&st->lock);
+    hx_buf taken = st->buf;
+    st->buf = st->spare;
+    st->spare = taken;
+    bool resume = st->paused;
+    if (resume) {
+        st->paused = false;
+        st->paused_ns += clock_ns() - st->paused_since;
+        atomic_fetch_add(&st->refs, 1);
+    }
+    bool complete = st->complete;
+    pthread_mutex_unlock(&st->lock);
+    if (resume) {
+        if (atomic_load(&self->loop->closed)) {
+            stream_decref(st);
+        } else {
+            send_resume(self->loop, NOTE_STREAM_RESUME, st);
+        }
+    }
+    if (st->spare.len == 0 && complete) {
+        Py_RETURN_NONE;
+    }
+    PyObject *data = PyBytes_FromStringAndSize(st->spare.data, (Py_ssize_t)st->spare.len);
+    st->spare.len = 0;
+    return data;
+}
+
+static PyObject *Response_stream_wait(Response *self, PyObject *waiter) {
+    Stream *st = self->stream;
+    pthread_mutex_lock(&st->lock);
+    bool wait = st->buf.len == 0 && !st->complete;
+    PyObject *old = NULL;
+    if (wait) {
+        old = st->waiter;
+        Py_INCREF(waiter);
+        st->waiter = waiter;
+        st->want_wake = true;
+    }
+    pthread_mutex_unlock(&st->lock);
+    Py_XDECREF(old);
+    return PyBool_FromLong(wait);
+}
+
+static PyObject *Response_stream_close(Response *self, PyObject *args) {
+    if (self->stream != NULL) {
+        stream_cancel(self);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *Response_stream_result(Response *self, PyObject *args) {
+    Stream *st = self->stream;
+    if (st == NULL) {
+        Py_RETURN_NONE;
+    }
+    pthread_mutex_lock(&st->lock);
+    int code = st->complete ? st->error_code : 0;
+    char message[512];
+    memcpy(message, st->error, sizeof(message));
+    pthread_mutex_unlock(&st->lock);
+    if (code == 0) {
+        Py_RETURN_NONE;
+    }
+    return Py_BuildValue("(is)", code, message);
+}
+
+static PyObject *Response_get_paused_time(Response *self, PyObject *args) {
+    int64_t ns = 0;
+    if (self->stream != NULL) {
+        pthread_mutex_lock(&self->stream->lock);
+        bool complete = self->stream->complete;
+        ns += self->stream->paused_ns;
+        pthread_mutex_unlock(&self->stream->lock);
+        if (!complete) {
+            PyErr_SetString(PyExc_RuntimeError, "the body hasn't been read yet");
+            return NULL;
+        }
+    }
+    if (self->upload != NULL) {
+        pthread_mutex_lock(&self->upload->lock);
+        ns += self->upload->paused_ns;
+        pthread_mutex_unlock(&self->upload->lock);
+    }
+    return PyFloat_FromDouble((double)ns / 1e9);
+}
 
 static PyObject *Response_get_queue_time(Response *self, PyObject *args) {
     return PyFloat_FromDouble(self->queue_time);
@@ -1674,7 +2281,11 @@ static PyMethodDef Response_methods[] = {
     {"get_redirect_url", (PyCFunction)Response_get_redirect_url, METH_NOARGS, ""},
     {"get_header", (PyCFunction)Response_get_header, METH_NOARGS, ""},
     {"get_body", (PyCFunction)Response_get_body, METH_NOARGS, ""},
-    {"get_paused_time", (PyCFunction)Response_get_zero, METH_NOARGS, ""},
+    {"get_paused_time", (PyCFunction)Response_get_paused_time, METH_NOARGS, ""},
+    {"stream_take", (PyCFunction)Response_stream_take, METH_NOARGS, ""},
+    {"stream_wait", (PyCFunction)Response_stream_wait, METH_O, ""},
+    {"stream_close", (PyCFunction)Response_stream_close, METH_NOARGS, ""},
+    {"stream_result", (PyCFunction)Response_stream_result, METH_NOARGS, ""},
     {NULL}};
 
 static PyTypeObject ResponseType = {
@@ -1687,11 +2298,90 @@ static PyTypeObject ResponseType = {
 
 static PyObject *module_default_ca_file(PyObject *module, PyObject *args) { Py_RETURN_NONE; }
 
-static PyObject *module_upload_push(PyObject *module, PyObject *args) { Py_RETURN_NONE; }
+static void upload_capsule_free(PyObject *capsule) {
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    Py_XDECREF(take_waiter(&u->lock, &u->waiter));
+    Py_XDECREF((PyObject *)u->loop);
+    upload_decref(u);
+}
 
-static PyObject *module_upload_finish(PyObject *module, PyObject *upload) { Py_RETURN_NONE; }
+static void upload_resume(Upload *u) {
+    if (atomic_load(&u->loop->closed)) {
+        return;
+    }
+    atomic_fetch_add(&u->refs, 1);
+    send_resume(u->loop, NOTE_UPLOAD_RESUME, u);
+}
 
-static PyObject *module_upload_wait(PyObject *module, PyObject *args) { Py_RETURN_FALSE; }
+static PyObject *module_upload_push(PyObject *module, PyObject *args) {
+    PyObject *capsule;
+    Py_buffer data;
+    if (!PyArg_ParseTuple(args, "Oy*", &capsule, &data)) {
+        return NULL;
+    }
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    if (u == NULL) {
+        PyBuffer_Release(&data);
+        return NULL;
+    }
+    pthread_mutex_lock(&u->lock);
+    if (u->done) {
+        pthread_mutex_unlock(&u->lock);
+        PyBuffer_Release(&data);
+        Py_RETURN_NONE;
+    }
+    size_t n = (size_t)data.len < STREAM_BUFFER - u->len ? (size_t)data.len : STREAM_BUFFER - u->len;
+    size_t tail = (u->head + u->len) % STREAM_BUFFER;
+    size_t first = STREAM_BUFFER - tail < n ? STREAM_BUFFER - tail : n;
+    memcpy(u->ring + tail, data.buf, first);
+    memcpy(u->ring, (char *)data.buf + first, n - first);
+    u->len += n;
+    bool resume = u->hungry && n > 0;
+    pthread_mutex_unlock(&u->lock);
+    PyBuffer_Release(&data);
+    if (resume) {
+        upload_resume(u);
+    }
+    return PyLong_FromSize_t(n);
+}
+
+static PyObject *module_upload_finish(PyObject *module, PyObject *capsule) {
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    if (u == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&u->lock);
+    u->eof = true;
+    bool resume = u->hungry;
+    pthread_mutex_unlock(&u->lock);
+    if (resume) {
+        upload_resume(u);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *module_upload_wait(PyObject *module, PyObject *args) {
+    PyObject *capsule, *waiter;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &waiter)) {
+        return NULL;
+    }
+    Upload *u = PyCapsule_GetPointer(capsule, "httpperf.upload");
+    if (u == NULL) {
+        return NULL;
+    }
+    pthread_mutex_lock(&u->lock);
+    bool wait = !u->done && u->len > STREAM_BUFFER / 2;
+    PyObject *old = NULL;
+    if (wait) {
+        old = u->waiter;
+        Py_INCREF(waiter);
+        u->waiter = waiter;
+        u->want_wake = true;
+    }
+    pthread_mutex_unlock(&u->lock);
+    Py_XDECREF(old);
+    return PyBool_FromLong(wait);
+}
 
 static PyMethodDef module_methods[] = {
     {"default_ca_file", module_default_ca_file, METH_NOARGS, "The built-in CA bundle path, or None"},

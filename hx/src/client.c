@@ -77,6 +77,11 @@ struct hx_req {
     bool fresh;
     int64_t max_age;
     uint64_t pool;
+    bool upload;
+    bool chunked;
+    bool body_done;
+    bool asked;
+    bool paused;
     bool close_after;
     int64_t idle_timeout;
     bool done;
@@ -232,6 +237,9 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         q->lookup = NULL;
     }
     conn *k = q->conn;
+    if (!closed && k != NULL && q->upload && !q->body_done) {
+        closed = true;
+    }
     if (!closed && k != NULL && (k->closing || (c->cfg.max_idle > 0 && c->idle >= c->cfg.max_idle))) {
         closed = true;
     }
@@ -281,13 +289,15 @@ static void fail(conn *k, hx_error error, int sys_errno) {
     }
 }
 
+static int reading(const conn *k) { return k->req != NULL && k->req->paused ? 0 : HX_READ; }
+
 static void send_some(conn *k) {
     struct hx_req *q = k->req;
     while (k->out_sent < k->out.len) {
         ssize_t n = send(k->fd, k->out.data + k->out_sent, k->out.len - k->out_sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                watch(k, HX_READ | HX_WRITE);
+                watch(k, reading(k) | HX_WRITE);
                 return;
             }
             if (errno == EINTR) {
@@ -296,14 +306,20 @@ static void send_some(conn *k) {
             fail(k, HX_ERR_SEND, errno);
             return;
         }
-        if (k->out_sent == 0) {
+        if (q->times[HX_T_FIRST_SENT] == 0) {
             q->times[HX_T_FIRST_SENT] = now(k->client);
         }
         k->out_sent += (size_t)n;
         q->sent += (uint64_t)n;
     }
-    q->times[HX_T_LAST_SENT] = now(k->client);
-    watch(k, HX_READ);
+    k->out.len = k->out_sent = 0;
+    watch(k, reading(k));
+    if (!q->upload || q->body_done) {
+        q->times[HX_T_LAST_SENT] = now(k->client);
+    } else if (!q->asked) {
+        q->asked = true;
+        enqueue(k->client, q, HX_EV_SEND_READY);
+    }
 }
 
 static void end_decoding(conn *k) {
@@ -552,6 +568,8 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     q->decode = r->decode;
     q->max_age = r->max_age_ns;
     q->pool = r->pool;
+    q->upload = r->upload;
+    q->chunked = r->upload && r->upload_size < 0;
     q->fresh = r->fresh_connection;
     q->close_after = r->close_after;
     q->port = r->port;
@@ -562,8 +580,11 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
     LINK(c->reqs, q);
     schedule(c, q->deadline);
-    hx_h1_request h = {r->method,       r->target, r->authority, r->headers,
-                       r->header_count, r->body,   r->body_len,  HX_H1_NO_UPLOAD};
+    hx_h1_request h = {
+        r->method,       r->target,
+        r->authority,    r->headers,
+        r->header_count, r->upload ? NULL : r->body,
+        r->body_len,     !r->upload ? HX_H1_NO_UPLOAD : r->upload_size < 0 ? HX_H1_CHUNKED : r->upload_size};
     int rc = hx_h1_write_request(&q->request, &h);
     if (rc != 0) {
         finish(q, rc == HX_EINVAL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
@@ -587,6 +608,57 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
         resolve(c, q);
     }
     return q;
+}
+
+static hx_buf *body_buffer(struct hx_req *q) {
+    conn *k = q->conn;
+    return k != NULL && k->req == q && k->state == CONN_BUSY ? &k->out : &q->request;
+}
+
+static void body_written(struct hx_req *q) {
+    q->asked = false;
+    conn *k = q->conn;
+    if (k != NULL && k->req == q && k->state == CONN_BUSY) {
+        send_some(k);
+    }
+}
+
+int hx_request_send(hx_req *q, const char *data, size_t len) {
+    if (q->done || !q->upload || q->body_done) {
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    hx_buf *out = body_buffer(q);
+    if (q->chunked ? hx_h1_write_chunk(out, data, len) != 0 : !hx_buf_append(out, data, len)) {
+        return -1;
+    }
+    body_written(q);
+    return 0;
+}
+
+int hx_request_end_body(hx_req *q) {
+    if (q->done || !q->upload || q->body_done) {
+        return -1;
+    }
+    if (q->chunked && !hx_buf_append(body_buffer(q), "0\r\n\r\n", 5)) {
+        return -1;
+    }
+    q->body_done = true;
+    body_written(q);
+    return 0;
+}
+
+void hx_request_pause(hx_req *q, bool paused) {
+    if (q->done || q->paused == paused) {
+        return;
+    }
+    q->paused = paused;
+    conn *k = q->conn;
+    if (k != NULL && k->req == q && k->state == CONN_BUSY) {
+        watch(k, reading(k) | (k->watching & HX_WRITE));
+    }
 }
 
 void hx_request_cancel(hx_req *q) {
@@ -841,7 +913,7 @@ int hx_client_events(hx_client *c, hx_event *out, int max) {
         k->pinned = false;
         if (k->state == CONN_CLOSED) {
             conn_free(k);
-        } else if (k->want_read) {
+        } else if (k->want_read && reading(k)) {
             k->want_read = false;
             receive(k);
         }
