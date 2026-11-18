@@ -41,7 +41,7 @@ setup(
                 "hx/vendor/llhttp/api.c",
                 "hx/vendor/llhttp/http.c",
             ],
-            libraries=["z", "ssl", "crypto"],
+            libraries=["z", "ssl", "crypto", "nghttp2"],
             extra_compile_args=compile_args,
         ),
     ]

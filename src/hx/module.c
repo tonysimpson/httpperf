@@ -70,6 +70,7 @@ typedef struct Slot {
     char key[300];
     long active;
     long waiting;
+    bool multiplexed;
     Request *head, *tail;
     struct Slot *next, *prev;
     int64_t last_used;
@@ -195,6 +196,7 @@ struct Request {
     char *ca_file, *ca_path, *ca_pem, *cert_file, *key_file;
     size_t ca_pem_len;
     uint64_t tls_cache;
+    bool h2;
     char *path;
 };
 
@@ -240,6 +242,7 @@ struct Session {
     Proxy proxy, https_proxy;
     char *no_proxy;
     uint64_t tls_cache;
+    bool h2;
     Stats stats;
 };
 
@@ -506,6 +509,7 @@ STAT(running)
 STAT(queued)
 
 static void slot_release(EventLoop *loop, Request *r);
+static void slot_mode(EventLoop *loop, Request *r, int version);
 
 static void notify(EventLoop *loop, int kind, void *ptr) {
     Note *n = malloc(sizeof(Note));
@@ -704,6 +708,7 @@ again:
                 continue;
             }
             if (e->type == HX_EV_HEADERS) {
+                slot_mode(loop, r, e->version);
                 r->header.len = 0;
                 hx_buf_append(&r->header, e->data, e->len);
                 if (r->session != NULL) {
@@ -741,13 +746,12 @@ again:
                     stats_add(loop, r, stat_cancelled, 1);
                 } else if (e->error != HX_OK) {
                     stats_add(loop, r, stat_errors, 1);
-                } else if (e->version == 10 || e->version == 11) {
-                    atomic_fetch_add_explicit(&loop->stats.http_versions[e->version - 10], 1, memory_order_relaxed);
-                    atomic_fetch_add_explicit(&r->session_stats->http_versions[e->version - 10], 1,
-                                              memory_order_relaxed);
+                } else if (e->version == 10 || e->version == 11 || e->version == 20) {
+                    int v = e->version == 20 ? 2 : e->version - 10;
+                    atomic_fetch_add_explicit(&loop->stats.http_versions[v], 1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&r->session_stats->http_versions[v], 1, memory_order_relaxed);
                     if (r->host_counts != NULL) {
-                        atomic_fetch_add_explicit(&r->host_counts->http_versions[e->version - 10], 1,
-                                                  memory_order_relaxed);
+                        atomic_fetch_add_explicit(&r->host_counts->http_versions[v], 1, memory_order_relaxed);
                     }
                 }
                 slot_release(loop, r);
@@ -906,6 +910,9 @@ static Slot *slot_for(Limiter *l, const Request *r) {
 }
 
 static bool slot_free(const Limiter *l, const Slot *h) {
+    if (h->multiplexed && h->active > 0) {
+        return true;
+    }
     if (l->max_host && h->active >= l->max_host) {
         return false;
     }
@@ -914,8 +921,9 @@ static bool slot_free(const Limiter *l, const Slot *h) {
 
 static void slot_use(Limiter *l, Slot *h, long delta) {
     pthread_mutex_lock(&l->lock);
+    long before = h->active;
     h->active += delta;
-    l->connections += delta;
+    l->connections += h->multiplexed ? (h->active > 0) - (before > 0) : delta;
     pthread_mutex_unlock(&l->lock);
 }
 
@@ -1018,6 +1026,32 @@ static void dispatch(EventLoop *loop, Limiter *l) {
     l->dispatching = false;
 }
 
+static void dispatch_later(EventLoop *loop, Limiter *l) {
+    if (!l->pending && l->ready_head != NULL) {
+        atomic_fetch_add(&l->refs, 1);
+        l->pending = true;
+        l->pending_next = loop->pending;
+        loop->pending = l;
+    }
+}
+
+static void slot_mode(EventLoop *loop, Request *r, int version) {
+    Slot *h = r->slot;
+    bool multiplexed = version == 20;
+    if (h == NULL || (version != 10 && version != 11 && version != 20) || h->multiplexed == multiplexed) {
+        return;
+    }
+    Limiter *l = r->limiter;
+    pthread_mutex_lock(&l->lock);
+    long many = h->active > 0 ? h->active - 1 : 0;
+    l->connections += multiplexed ? -many : many;
+    h->multiplexed = multiplexed;
+    pthread_mutex_unlock(&l->lock);
+    if (multiplexed) {
+        dispatch_later(loop, l);
+    }
+}
+
 static void slot_release(EventLoop *loop, Request *r) {
     if (r->slot == NULL) {
         return;
@@ -1025,12 +1059,7 @@ static void slot_release(EventLoop *loop, Request *r) {
     Limiter *l = r->limiter;
     slot_use(l, r->slot, -1);
     r->slot = NULL;
-    if (!l->pending && l->ready_head != NULL) {
-        atomic_fetch_add(&l->refs, 1);
-        l->pending = true;
-        l->pending_next = loop->pending;
-        loop->pending = l;
-    }
+    dispatch_later(loop, l);
 }
 
 static bool dispatch_pending(EventLoop *loop) {
@@ -1058,8 +1087,8 @@ static PyObject *limiter_state(Limiter *l) {
     pthread_mutex_lock(&l->lock);
     long connections = l->connections;
     for (Slot *h = l->slots; h != NULL; h = h->next) {
-        PyObject *state =
-            Py_BuildValue("{s:l,s:l,s:O}", "active", h->active, "waiting", h->waiting, "multiplexed", Py_False);
+        PyObject *state = Py_BuildValue("{s:l,s:l,s:O}", "active", h->active, "waiting", h->waiting, "multiplexed",
+                                        h->multiplexed ? Py_True : Py_False);
         if (state == NULL || PyDict_SetItemString(hosts, h->key, state) == -1) {
             pthread_mutex_unlock(&l->lock);
             Py_XDECREF(state);
@@ -1161,6 +1190,7 @@ static void begin_request(EventLoop *loop, Request *r) {
         .cert_file = r->cert_file,
         .key_file = r->key_file,
         .tls_cache = r->tls_cache,
+        .h2 = r->h2,
     };
     stats_add(loop, r, stat_running, 1);
     r->hx = hx_request_start(loop->client, &q, r);
@@ -1247,11 +1277,11 @@ static void on_stop(aeEventLoop *ae, int fd, void *data, int mask) {
 
 static PyObject *stats_dict(Stats *s, PyObject *open) {
 #define LOAD(field) atomic_load_explicit(&s->field, memory_order_relaxed)
-    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:N,s:i,s:{s:l,s:l,s:i,s:i},s:l,s:l,s:l,s:i}", "requests", LOAD(requests),
+    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:N,s:i,s:{s:l,s:l,s:l,s:i},s:l,s:l,s:l,s:i}", "requests", LOAD(requests),
                          "errors", LOAD(errors), "cancelled", LOAD(cancelled), "connections", LOAD(connections),
                          "connections_open", open, "tls_handshakes", 0, "http_versions", "HTTP/1.0",
-                         LOAD(http_versions[0]), "HTTP/1.1", LOAD(http_versions[1]), "HTTP/2", 0, "HTTP/3", 0,
-                         "bytes_sent", LOAD(bytes_sent), "bytes_received", LOAD(bytes_received), "running",
+                         LOAD(http_versions[0]), "HTTP/1.1", LOAD(http_versions[1]), "HTTP/2", LOAD(http_versions[2]),
+                         "HTTP/3", 0, "bytes_sent", LOAD(bytes_sent), "bytes_received", LOAD(bytes_received), "running",
                          LOAD(running), "queued", LOAD(queued));
 #undef LOAD
 }
@@ -1917,6 +1947,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;
     self->tls_cache = strcmp(tls, "session") == 0 ? atomic_fetch_add(&tls_caches, 1) + 1 : 0;
+    self->h2 = strcmp(http_version, "HTTP/1.1") != 0;
     pthread_mutex_init(&self->jar_lock, NULL);
     self->jar = hx_jar_new();
     if (self->jar == NULL || read_proxy(self) == -1) {
@@ -2430,6 +2461,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     }
     r->loop = loop;
     r->tls_cache = self->tls_cache;
+    r->h2 = self->h2;
     r->send_cookies = !has_cookie;
     r->path = copy(r->target, strcspn(r->target, "?#"));
     int proxy = r->path != NULL ? use_proxy(self, r) : -1;
@@ -2683,6 +2715,9 @@ static PyObject *Response_get_http_version(Response *self, PyObject *args) {
     }
     if (self->version == 11) {
         return PyUnicode_FromString("HTTP/1.1");
+    }
+    if (self->version == 20) {
+        return PyUnicode_FromString("HTTP/2");
     }
     Py_RETURN_NONE;
 }

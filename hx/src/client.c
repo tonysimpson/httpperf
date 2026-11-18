@@ -3,6 +3,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include "ng.h"
 #include <openssl/err.h>
 #include <poll.h>
 #include <stdio.h>
@@ -56,6 +57,17 @@ typedef struct conn {
     char session_key[320];
     const char *tls_detail;
     size_t tunnel_len;
+    bool may_h2;
+    bool h2;
+    bool in_ng;
+    bool dirty;
+    bool close_after;
+    struct conn *dirty_next;
+    nghttp2_session *ng;
+    size_t streams;
+    struct hx_req *stream_list;
+    struct hx_req *waiters;
+    struct hx_req *touched;
     struct hx_req *req;
     struct conn *prev, *next;
 } conn;
@@ -110,6 +122,21 @@ struct hx_req {
     uint16_t proxy_port;
     char *proxy_auth;
     int64_t connect_timeout;
+    bool h2_offer;
+    int32_t stream_id;
+    bool stream_closed;
+    int h2_status;
+    hx_error h2_error;
+    hx_buf h2_head;
+    bool dec_bad;
+    size_t body_off;
+    size_t unconsumed;
+    hx_decoder *dec;
+    hx_buf dec_out;
+    bool touched;
+    struct hx_req *s_prev, *s_next, *touched_next;
+    conn *waiting_on;
+    struct hx_req *wait_next;
     lookup *lookup;
     struct hx_req *dns_next;
     struct hx_req *prev, *next;
@@ -142,6 +169,9 @@ struct hx_client {
     cached *cache;
     hx_tls tls;
     conn *receiving;
+    nghttp2_session_callbacks *h2_callbacks;
+    nghttp2_option *h2_option;
+    conn *dirty;
 };
 
 #define LINK(head, item)           \
@@ -170,8 +200,58 @@ static int64_t now(hx_client *c) { return c->io.now(c->io.ctx); }
 
 static void req_free(struct hx_req *q) {
     hx_buf_free(&q->request);
+    hx_buf_free(&q->h2_head);
+    if (q->dec != NULL) {
+        hx_decoder_free(q->dec);
+        free(q->dec);
+    }
+    hx_buf_free(&q->dec_out);
     free(q->proxy_auth);
     free(q);
+}
+
+static void connect_new(hx_client *c, struct hx_req *q);
+static void process_dirty(hx_client *c);
+
+static void mark_dirty(conn *k) {
+    if (!k->dirty) {
+        k->dirty = true;
+        k->dirty_next = k->client->dirty;
+        k->client->dirty = k;
+    }
+}
+
+static void unwait(struct hx_req *q) {
+    struct hx_req **p = &q->waiting_on->waiters;
+    while (*p != NULL && *p != q) {
+        p = &(*p)->wait_next;
+    }
+    if (*p == q) {
+        *p = q->wait_next;
+    }
+    q->waiting_on = NULL;
+    q->wait_next = NULL;
+}
+
+static void h2_detach(conn *k, struct hx_req *q) {
+    if (!q->stream_closed && q->stream_id > 0 && k->ng != NULL) {
+        nghttp2_submit_rst_stream(k->ng, NGHTTP2_FLAG_NONE, q->stream_id, NGHTTP2_CANCEL);
+        nghttp2_session_set_stream_user_data(k->ng, q->stream_id, NULL);
+        q->stream_closed = true;
+    }
+    if (q->s_prev != NULL) {
+        q->s_prev->s_next = q->s_next;
+    } else {
+        k->stream_list = q->s_next;
+    }
+    if (q->s_next != NULL) {
+        q->s_next->s_prev = q->s_prev;
+    }
+    q->s_prev = q->s_next = NULL;
+    k->streams--;
+    k->idle_timeout = q->idle_timeout;
+    q->conn = NULL;
+    mark_dirty(k);
 }
 
 static const char *target_host(const struct hx_req *q) { return q->proxy_host[0] ? q->proxy_host : q->host; }
@@ -210,6 +290,9 @@ static queued *enqueue(hx_client *c, struct hx_req *q, hx_event_type type) {
 }
 
 static void conn_free(conn *k) {
+    if (k->ng != NULL) {
+        nghttp2_session_del(k->ng);
+    }
     hx_decoder_free(&k->decoder);
     hx_buf_free(&k->decoded);
     hx_h1_free(&k->h1);
@@ -250,7 +333,12 @@ static void conn_close(conn *k) {
         k->req->conn = NULL;
         k->req = NULL;
     }
-    if (!k->pinned && k->queued == 0 && c->receiving != k) {
+    while (k->waiters != NULL) {
+        struct hx_req *w = k->waiters;
+        unwait(w);
+        connect_new(c, w);
+    }
+    if (!k->pinned && k->queued == 0 && c->receiving != k && !k->dirty) {
         conn_free(k);
     }
 }
@@ -272,20 +360,27 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         }
         q->lookup = NULL;
     }
+    if (q->waiting_on != NULL) {
+        unwait(q);
+    }
     conn *k = q->conn;
+    bool on_h2 = k != NULL && k->h2;
     if (!closed && k != NULL && q->upload && !q->body_done) {
         closed = true;
     }
     if (!closed && k != NULL && (k->closing || (c->cfg.max_idle > 0 && c->idle >= c->cfg.max_idle))) {
         closed = true;
     }
+    if (on_h2) {
+        closed = false;
+    }
     queued *e = enqueue(c, q, HX_EV_DONE);
     if (e != NULL) {
         e->ev.error = error;
         e->ev.sys_errno = sys_errno;
         e->ev.detail = error != HX_OK ? q->detail : NULL;
-        e->ev.status = k != NULL ? k->h1.status : 0;
-        e->ev.version = k != NULL ? k->h1.version : 0;
+        e->ev.status = k == NULL ? 0 : on_h2 ? q->h2_status : k->h1.status;
+        e->ev.version = k == NULL ? 0 : on_h2 ? 20 : k->h1.version;
         e->ev.reused = q->reused;
         e->ev.connection_closed = closed;
         e->ev.connection_id = k != NULL ? k->id : 0;
@@ -298,7 +393,9 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         e->done = q;
     }
     UNLINK(c->reqs, q);
-    if (k != NULL) {
+    if (on_h2) {
+        h2_detach(k, q);
+    } else if (k != NULL) {
         k->req = NULL;
         q->conn = NULL;
         if (closed) {
@@ -316,8 +413,6 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
         req_free(q);
     }
 }
-
-static void connect_new(hx_client *c, struct hx_req *q);
 
 static bool retry(conn *k, hx_error error) {
     struct hx_req *q = k->req;
@@ -347,6 +442,22 @@ static void fail(conn *k, hx_error error, int sys_errno) {
     }
     if (k->req != NULL && k->req->detail == NULL) {
         k->req->detail = k->tls_detail;
+    }
+    while (k->stream_list != NULL) {
+        struct hx_req *q = k->stream_list;
+        q->stream_closed = true;
+        if (q->detail == NULL) {
+            q->detail = k->tls_detail;
+        }
+        finish(q, error, sys_errno, true);
+    }
+    while (k->waiters != NULL) {
+        struct hx_req *w = k->waiters;
+        unwait(w);
+        if (w->detail == NULL) {
+            w->detail = k->tls_detail;
+        }
+        finish(w, error, sys_errno, false);
     }
     if (k->req != NULL) {
         finish(k->req, error, sys_errno, true);
@@ -545,6 +656,7 @@ static conn *conn_open(hx_client *c, struct hx_req *q, const struct addrinfo *ai
     k->rcap = c->cfg.read_size;
     memcpy(k->key, q->key, sizeof(k->key));
     k->tls = q->tls;
+    k->may_h2 = q->h2_offer;
     if (q->tls != NULL) {
         snprintf(k->session_key, sizeof(k->session_key), "%llu/%s:%u/%llu", (unsigned long long)q->tls_cache, q->host,
                  q->port, (unsigned long long)q->tls->id);
@@ -690,7 +802,7 @@ static conn *find_idle(hx_client *c, const char *key, int64_t max_age, bool chec
     int64_t t = max_age > 0 ? now(c) : 0;
     for (conn *k = c->conns, *after; k != NULL; k = after) {
         after = k->next;
-        if (k->state != CONN_IDLE || k->pinned || strcmp(k->key, key) != 0) {
+        if (k->state != CONN_IDLE || k->pinned || k->h2 || strcmp(k->key, key) != 0) {
             continue;
         }
         if ((max_age > 0 && t - k->created >= max_age) || (check && !still_open(k))) {
@@ -702,6 +814,29 @@ static conn *find_idle(hx_client *c, const char *key, int64_t max_age, bool chec
     return NULL;
 }
 
+static bool h2_usable(conn *k);
+static void h2_attach(conn *k, struct hx_req *q);
+static void h2_start(conn *k);
+
+static conn *find_h2(hx_client *c, const char *key, bool *pending) {
+    for (conn *k = c->conns; k != NULL; k = k->next) {
+        if (strcmp(k->key, key) != 0) {
+            continue;
+        }
+        if (h2_usable(k)) {
+            return k;
+        }
+        if (k->may_h2 && !k->h2 && !k->closing &&
+            (k->state == CONN_CONNECTING || k->state == CONN_TUNNEL || k->state == CONN_HANDSHAKE)) {
+            *pending = true;
+            return k;
+        }
+    }
+    return NULL;
+}
+
+static void start(hx_client *c, const hx_request *r, struct hx_req *q);
+
 hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     struct hx_req *q = calloc(1, sizeof(struct hx_req));
     if (q == NULL) {
@@ -709,6 +844,19 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     }
     q->client = c;
     q->user = user;
+    start(c, r, q);
+    process_dirty(c);
+    return q;
+}
+
+static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
+    hx_request plain;
+    if (r->h2 && (r->upload || !r->tls)) {
+        plain = *r;
+        plain.h2 = false;
+        r = &plain;
+    }
+    q->h2_offer = r->h2;
     q->head = strcmp(r->method, "HEAD") == 0;
     q->decode = r->decode;
     q->max_age = r->max_age_ns;
@@ -729,7 +877,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
         q->tls = hx_tls_ctx_for(&c->tls, r, &error);
         if (q->tls == NULL) {
             finish(q, error, 0, false);
-            return q;
+            return;
         }
         q->tls_cache = r->tls_cache;
         if (r->proxy_host != NULL) {
@@ -737,7 +885,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
             q->proxy_port = r->proxy_port;
             if (r->proxy_auth != NULL && (q->proxy_auth = strdup(r->proxy_auth)) == NULL) {
                 finish(q, HX_ERR_NOMEM, 0, false);
-                return q;
+                return;
             }
         }
         snprintf(q->key, sizeof(q->key), "%llu/%s:%u/%llu/%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port,
@@ -753,18 +901,33 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     int rc = hx_h1_write_request(&q->request, &h);
     if (rc != 0) {
         finish(q, rc == HX_EINVAL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
-        return q;
+        return;
+    }
+    if (q->h2_offer && !q->fresh) {
+        bool pending = false;
+        conn *h = find_h2(c, q->key, &pending);
+        if (h != NULL && pending) {
+            q->waiting_on = h;
+            q->wait_next = h->waiters;
+            h->waiters = q;
+            return;
+        }
+        if (h != NULL) {
+            q->reused = true;
+            q->times[HX_T_DNS] = q->times[HX_T_CONNECT] = q->times[HX_T_TLS] = q->times[HX_T_START];
+            h2_attach(h, q);
+            return;
+        }
     }
     conn *k = q->fresh ? NULL : find_idle(c, q->key, q->max_age, q->upload);
     if (k != NULL) {
         q->reused = true;
         q->times[HX_T_DNS] = q->times[HX_T_CONNECT] = q->times[HX_T_TLS] = q->times[HX_T_START];
         begin(k, q);
-        return q;
+        return;
     }
     q->connect_timeout = r->connect_timeout_ns;
     connect_new(c, q);
-    return q;
 }
 
 static void connect_new(hx_client *c, struct hx_req *q) {
@@ -827,6 +990,15 @@ void hx_request_pause(hx_req *q, bool paused) {
     }
     q->paused = paused;
     conn *k = q->conn;
+    if (k != NULL && k->h2) {
+        if (!paused && q->unconsumed > 0 && !q->stream_closed) {
+            nghttp2_session_consume(k->ng, q->stream_id, q->unconsumed);
+            q->unconsumed = 0;
+            mark_dirty(k);
+            process_dirty(q->client);
+        }
+        return;
+    }
     if (k != NULL && k->req == q && k->state == CONN_BUSY) {
         watch(k, reading(k) | (k->watching & HX_WRITE));
         if (!paused && k->ssl != NULL && SSL_pending(k->ssl) > 0) {
@@ -844,6 +1016,7 @@ void hx_request_cancel(hx_req *q) {
         return;
     }
     finish(q, HX_ERR_CANCELLED, 0, true);
+    process_dirty(q->client);
 }
 
 int hx_tls_on_session(SSL *ssl, SSL_SESSION *session) {
@@ -862,6 +1035,19 @@ static void handshake(conn *k) {
         struct hx_req *q = k->req;
         q->times[HX_T_TLS] = now(k->client);
         k->connect_deadline = 0;
+        const unsigned char *proto = NULL;
+        unsigned int proto_len = 0;
+        SSL_get0_alpn_selected(k->ssl, &proto, &proto_len);
+        if (proto_len == 2 && memcmp(proto, "h2", 2) == 0) {
+            h2_start(k);
+            return;
+        }
+        k->may_h2 = false;
+        while (k->waiters != NULL) {
+            struct hx_req *w = k->waiters;
+            unwait(w);
+            connect_new(k->client, w);
+        }
         k->req = NULL;
         begin(k, q);
         return;
@@ -1057,6 +1243,461 @@ static int flush_decoded(conn *k, struct hx_req *q) {
     return 0;
 }
 
+static struct hx_req *stream_req(nghttp2_session *ng, int32_t id) {
+    struct hx_req *q = nghttp2_session_get_stream_user_data(ng, id);
+    return q != NULL && !q->done ? q : NULL;
+}
+
+static bool is_name(const uint8_t *name, size_t len, const char *want) {
+    return len == strlen(want) && memcmp(name, want, len) == 0;
+}
+
+static int h2_on_header(nghttp2_session *ng, const nghttp2_frame *frame, const uint8_t *name, size_t namelen,
+                        const uint8_t *value, size_t valuelen, uint8_t flags, void *user) {
+    if (frame->hd.type != NGHTTP2_HEADERS) {
+        return 0;
+    }
+    struct hx_req *q = stream_req(ng, frame->hd.stream_id);
+    if (q == NULL || q->headers_seen) {
+        return 0;
+    }
+    bool ok;
+    if (is_name(name, namelen, ":status")) {
+        if (q->times[HX_T_FIRST_BYTE] == 0) {
+            q->times[HX_T_FIRST_BYTE] = now(((conn *)user)->client);
+        }
+        char line[32];
+        q->h2_status = valuelen == 3 ? (value[0] - '0') * 100 + (value[1] - '0') * 10 + (value[2] - '0') : 0;
+        int n = snprintf(line, sizeof(line), "HTTP/2 %d \r\n", q->h2_status);
+        q->h2_head.len = 0;
+        ok = hx_buf_append(&q->h2_head, line, (size_t)n);
+    } else {
+        ok = hx_buf_append(&q->h2_head, (const char *)name, namelen) && hx_buf_append(&q->h2_head, ": ", 2) &&
+             hx_buf_append(&q->h2_head, (const char *)value, valuelen) && hx_buf_append(&q->h2_head, "\r\n", 2);
+    }
+    if (!ok) {
+        q->h2_error = HX_ERR_NOMEM;
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+    return 0;
+}
+
+static void h2_headers_done(conn *k, struct hx_req *q) {
+    if (q->h2_status >= 100 && q->h2_status < 200) {
+        q->h2_head.len = 0;
+        q->h2_status = 0;
+        return;
+    }
+    if (!hx_buf_append(&q->h2_head, "\r\n", 2)) {
+        q->h2_error = HX_ERR_NOMEM;
+        nghttp2_submit_rst_stream(k->ng, NGHTTP2_FLAG_NONE, q->stream_id, NGHTTP2_INTERNAL_ERROR);
+        return;
+    }
+    q->headers_seen = true;
+    if (q->decode && q->h2_status != 204 && q->h2_status != 304 && !q->head) {
+        size_t len = 0;
+        const char *value = find_header(q->h2_head.data, q->h2_head.len, "content-encoding", &len);
+        if (value != NULL) {
+            q->dec = calloc(1, sizeof(hx_decoder));
+            int rc = q->dec != NULL ? hx_decoder_start(q->dec, value, len) : -2;
+            if (rc == 0) {
+                hx_decoder_free(q->dec);
+                free(q->dec);
+                q->dec = NULL;
+            } else if (rc < 0) {
+                q->dec_bad = true;
+            }
+        }
+    }
+    queued *e = enqueue(k->client, q, HX_EV_HEADERS);
+    if (e == NULL) {
+        q->h2_error = HX_ERR_NOMEM;
+        nghttp2_submit_rst_stream(k->ng, NGHTTP2_FLAG_NONE, q->stream_id, NGHTTP2_INTERNAL_ERROR);
+        return;
+    }
+    e->ev.data = q->h2_head.data;
+    e->ev.len = q->h2_head.len;
+    e->ev.status = q->h2_status;
+    e->ev.version = 20;
+}
+
+static int h2_on_frame(nghttp2_session *ng, const nghttp2_frame *frame, void *user) {
+    conn *k = user;
+    if (frame->hd.type == NGHTTP2_HEADERS && (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS)) {
+        struct hx_req *q = stream_req(ng, frame->hd.stream_id);
+        if (q != NULL && !q->headers_seen) {
+            h2_headers_done(k, q);
+        }
+    } else if (frame->hd.type == NGHTTP2_DATA && frame->data.padlen > 0) {
+        nghttp2_session_consume(ng, frame->hd.stream_id, frame->data.padlen);
+    } else if (frame->hd.type == NGHTTP2_GOAWAY) {
+        k->closing = true;
+    }
+    return 0;
+}
+
+static void h2_fail_stream(conn *k, struct hx_req *q, hx_error error) {
+    q->h2_error = error;
+    nghttp2_submit_rst_stream(k->ng, NGHTTP2_FLAG_NONE, q->stream_id, NGHTTP2_CANCEL);
+}
+
+static int h2_on_data(nghttp2_session *ng, uint8_t flags, int32_t id, const uint8_t *data, size_t len, void *user) {
+    conn *k = user;
+    struct hx_req *q = stream_req(ng, id);
+    if (q == NULL || q->h2_error != HX_OK) {
+        nghttp2_session_consume(ng, id, len);
+        return 0;
+    }
+    q->received += len;
+    if (q->paused) {
+        q->unconsumed += len;
+    } else {
+        nghttp2_session_consume(ng, id, len);
+    }
+    if (q->dec_bad) {
+        h2_fail_stream(k, q, HX_ERR_UNKNOWN_ENCODING);
+        return 0;
+    }
+    if (q->dec != NULL) {
+        if (!q->touched) {
+            q->touched = true;
+            q->dec_out.len = 0;
+            q->touched_next = k->touched;
+            k->touched = q;
+        }
+        if (hx_decoder_feed(q->dec, (const char *)data, len, &q->dec_out) == -1) {
+            h2_fail_stream(k, q, HX_ERR_DECODE);
+        }
+        return 0;
+    }
+    queued *e = enqueue(k->client, q, HX_EV_BODY);
+    if (e == NULL) {
+        h2_fail_stream(k, q, HX_ERR_NOMEM);
+        return 0;
+    }
+    e->ev.data = (const char *)data;
+    e->ev.len = len;
+    e->ev.status = q->h2_status;
+    e->ev.version = 20;
+    e->pin = k;
+    k->queued++;
+    k->pinned = true;
+    return 0;
+}
+
+static void h2_flush_decoded(conn *k, struct hx_req *q) {
+    q->touched = false;
+    if (q->done || q->dec_out.len == 0) {
+        return;
+    }
+    queued *e = enqueue(k->client, q, HX_EV_BODY);
+    if (e == NULL) {
+        h2_fail_stream(k, q, HX_ERR_NOMEM);
+        return;
+    }
+    e->ev.data = q->dec_out.data;
+    e->ev.len = q->dec_out.len;
+    e->ev.status = q->h2_status;
+    e->ev.version = 20;
+    e->pin = k;
+    k->queued++;
+    k->pinned = true;
+}
+
+static int h2_on_close(nghttp2_session *ng, int32_t id, uint32_t code, void *user) {
+    conn *k = user;
+    struct hx_req *q = stream_req(ng, id);
+    if (q == NULL) {
+        return 0;
+    }
+    nghttp2_session_set_stream_user_data(ng, id, NULL);
+    q->stream_closed = true;
+    if (q->touched) {
+        h2_flush_decoded(k, q);
+    }
+    hx_error error = q->h2_error != HX_OK                          ? q->h2_error
+                     : code == NGHTTP2_NO_ERROR && q->headers_seen ? HX_OK
+                     : code == NGHTTP2_NO_ERROR                    ? HX_ERR_PROTOCOL
+                                                                   : HX_ERR_RECEIVE;
+    if (code == NGHTTP2_REFUSED_STREAM && !q->headers_seen && !q->retried) {
+        h2_detach(k, q);
+        q->retried = true;
+        q->reused = false;
+        connect_new(k->client, q);
+        return 0;
+    }
+    finish(q, error, 0, false);
+    return 0;
+}
+
+static nghttp2_ssize h2_read_body(nghttp2_session *ng, int32_t id, uint8_t *buf, size_t len, uint32_t *flags,
+                                  nghttp2_data_source *source, void *user) {
+    struct hx_req *q = source->ptr;
+    size_t left = q->request.len - q->body_off;
+    size_t n = left < len ? left : len;
+    memcpy(buf, q->request.data + q->body_off, n);
+    q->body_off += n;
+    q->sent += n;
+    if (q->body_off == q->request.len) {
+        *flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+    return (nghttp2_ssize)n;
+}
+
+static bool hop_header(const char *name, size_t len) {
+    static const char *const hops[] = {"connection",        "keep-alive", "proxy-connection",
+                                       "transfer-encoding", "upgrade",    "host"};
+    for (size_t i = 0; i < sizeof(hops) / sizeof(hops[0]); i++) {
+        if (len == strlen(hops[i]) && strncasecmp(name, hops[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void h2_attach(conn *k, struct hx_req *q) {
+    char *text = q->request.data;
+    size_t len = q->request.len;
+    const char *end = NULL;
+    for (size_t i = 3; i < len; i++) {
+        if (text[i] == '\n' && text[i - 1] == '\r' && text[i - 2] == '\n' && text[i - 3] == '\r') {
+            end = text + i + 1;
+            break;
+        }
+    }
+    const char *sp1 = memchr(text, ' ', len), *eol = memchr(text, '\r', len);
+    const char *sp2 = sp1 != NULL && eol != NULL ? memchr(sp1 + 1, ' ', (size_t)(eol - sp1 - 1)) : NULL;
+    size_t lines = 0;
+    for (const char *p = text; end != NULL && p < end; p++) {
+        lines += *p == '\n';
+    }
+    nghttp2_nv *nva = end != NULL && sp2 != NULL ? calloc(lines + 4, sizeof(nghttp2_nv)) : NULL;
+    char *names = nva != NULL ? malloc((size_t)(end - text)) : NULL;
+    if (names == NULL) {
+        free(nva);
+        q->conn = NULL;
+        finish(q, end == NULL || sp2 == NULL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
+        return;
+    }
+    size_t n = 0;
+    nva[n++] = (nghttp2_nv){(uint8_t *)":method", (uint8_t *)text, 7, (size_t)(sp1 - text), 0};
+    nva[n++] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)"https", 7, 5, 0};
+    size_t authority_at = n++;
+    nva[authority_at] = (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)q->host, 10, strlen(q->host), 0};
+    nva[n++] = (nghttp2_nv){(uint8_t *)":path", (uint8_t *)sp1 + 1, 5, (size_t)(sp2 - sp1 - 1), 0};
+    for (const char *line = eol + 2; line < end - 2;) {
+        const char *stop = memchr(line, '\r', (size_t)(end - line));
+        const char *colon = memchr(line, ':', (size_t)(stop - line));
+        if (colon != NULL) {
+            size_t nl = (size_t)(colon - line);
+            const char *v = colon + 1;
+            while (v < stop && (*v == ' ' || *v == '\t')) {
+                v++;
+            }
+            char *lname = names + (line - text);
+            for (size_t i = 0; i < nl; i++) {
+                char ch = line[i];
+                lname[i] = ch >= 'A' && ch <= 'Z' ? (char)(ch - 'A' + 'a') : ch;
+            }
+            if (nl == 4 && strncasecmp(line, "host", 4) == 0) {
+                nva[authority_at].value = (uint8_t *)v;
+                nva[authority_at].valuelen = (size_t)(stop - v);
+            } else if (!hop_header(line, nl) && !(nl == 2 && strncasecmp(line, "te", 2) == 0 &&
+                                                  !((size_t)(stop - v) == 8 && strncasecmp(v, "trailers", 8) == 0))) {
+                nva[n++] = (nghttp2_nv){(uint8_t *)lname, (uint8_t *)v, nl, (size_t)(stop - v), 0};
+            }
+        }
+        line = stop + 2;
+    }
+    q->body_off = (size_t)(end - text);
+    nghttp2_data_provider2 body = {.source.ptr = q, .read_callback = h2_read_body};
+    int32_t id = nghttp2_submit_request2(k->ng, NULL, nva, n, q->body_off < len ? &body : NULL, q);
+    free(nva);
+    free(names);
+    if (id < 0) {
+        q->conn = NULL;
+        finish(q, HX_ERR_PROTOCOL, 0, false);
+        return;
+    }
+    q->stream_id = id;
+    q->conn = k;
+    q->s_prev = NULL;
+    q->s_next = k->stream_list;
+    if (k->stream_list != NULL) {
+        k->stream_list->s_prev = q;
+    }
+    k->stream_list = q;
+    k->streams++;
+    if (q->close_after) {
+        k->close_after = true;
+    }
+    if (k->state == CONN_IDLE) {
+        k->client->idle--;
+        k->state = CONN_BUSY;
+    }
+    mark_dirty(k);
+}
+
+static void h2_start(conn *k) {
+    hx_client *c = k->client;
+    struct hx_req *q = k->req;
+    k->req = NULL;
+    if (nghttp2_session_client_new2(&k->ng, c->h2_callbacks, k, c->h2_option) != 0) {
+        k->ng = NULL;
+        k->req = q;
+        fail(k, HX_ERR_NOMEM, 0);
+        return;
+    }
+    nghttp2_settings_entry settings[] = {{NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
+                                         {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 1 << 20}};
+    nghttp2_submit_settings(k->ng, NGHTTP2_FLAG_NONE, settings, 2);
+    nghttp2_session_set_local_window_size(k->ng, NGHTTP2_FLAG_NONE, 0, 1 << 26);
+    k->h2 = true;
+    k->state = CONN_BUSY;
+    watch(k, HX_READ);
+    h2_attach(k, q);
+    while (k->waiters != NULL) {
+        struct hx_req *w = k->waiters;
+        unwait(w);
+        w->reused = true;
+        w->times[HX_T_DNS] = w->times[HX_T_CONNECT] = w->times[HX_T_TLS] = w->times[HX_T_START];
+        h2_attach(k, w);
+    }
+    mark_dirty(k);
+}
+
+static bool h2_usable(conn *k) {
+    return k->h2 && k->ng != NULL && !k->closing && (k->state == CONN_BUSY || k->state == CONN_IDLE) &&
+           nghttp2_session_check_request_allowed(k->ng) &&
+           k->streams < nghttp2_session_get_remote_settings(k->ng, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
+}
+
+static void h2_receive(conn *k, ssize_t n) {
+    if (n <= 0) {
+        if (k->streams == 0 && n == 0) {
+            conn_close(k);
+        } else {
+            fail(k, HX_ERR_RECEIVE, n < 0 ? errno : 0);
+        }
+        return;
+    }
+    k->in_ng = true;
+    nghttp2_ssize rv = nghttp2_session_mem_recv2(k->ng, (const uint8_t *)k->rbuf, (size_t)n);
+    k->in_ng = false;
+    while (k->touched != NULL) {
+        struct hx_req *q = k->touched;
+        k->touched = q->touched_next;
+        h2_flush_decoded(k, q);
+    }
+    if (rv < 0) {
+        fail(k, HX_ERR_PROTOCOL, 0);
+        return;
+    }
+    mark_dirty(k);
+}
+
+static void h2_flush(conn *k) {
+    hx_client *c = k->client;
+    for (;;) {
+        if (k->out_sent == k->out.len) {
+            k->out.len = k->out_sent = 0;
+            k->in_ng = true;
+            while (k->out.len < 65536) {
+                const uint8_t *data;
+                nghttp2_ssize m = nghttp2_session_mem_send2(k->ng, &data);
+                if (m < 0) {
+                    k->in_ng = false;
+                    fail(k, HX_ERR_PROTOCOL, 0);
+                    return;
+                }
+                if (m == 0) {
+                    break;
+                }
+                if (!hx_buf_append(&k->out, (const char *)data, (size_t)m)) {
+                    k->in_ng = false;
+                    fail(k, HX_ERR_NOMEM, 0);
+                    return;
+                }
+            }
+            k->in_ng = false;
+            if (k->out.len == 0) {
+                break;
+            }
+        }
+        ssize_t n = conn_write(k, k->out.data + k->out_sent, k->out.len - k->out_sent);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            watch(k, HX_READ | HX_WRITE);
+            return;
+        }
+        if (n < 0) {
+            fail(k, HX_ERR_SEND, errno);
+            return;
+        }
+        k->out_sent += (size_t)n;
+    }
+    watch(k, HX_READ);
+    int64_t t = now(c);
+    for (struct hx_req *q = k->stream_list; q != NULL; q = q->s_next) {
+        if (q->times[HX_T_FIRST_SENT] == 0) {
+            q->times[HX_T_FIRST_SENT] = t;
+        }
+        if (q->times[HX_T_LAST_SENT] == 0 && q->body_off >= q->request.len) {
+            q->times[HX_T_LAST_SENT] = t;
+        }
+    }
+}
+
+static void h2_settle(conn *k) {
+    hx_client *c = k->client;
+    if (k->streams > 0 || k->state != CONN_BUSY) {
+        return;
+    }
+    if (k->closing || k->close_after || !nghttp2_session_check_request_allowed(k->ng) ||
+        (c->cfg.max_idle > 0 && c->idle >= c->cfg.max_idle)) {
+        conn_close(k);
+        return;
+    }
+    k->state = CONN_IDLE;
+    c->idle++;
+    k->idle_since = now(c);
+    schedule(c, k->idle_timeout > 0 ? k->idle_since + k->idle_timeout : 0);
+}
+
+static void process_dirty(hx_client *c) {
+    while (c->dirty != NULL) {
+        conn *k = c->dirty;
+        c->dirty = k->dirty_next;
+        k->dirty = false;
+        conn *outer = c->receiving;
+        c->receiving = k;
+        if (k->state != CONN_CLOSED && k->h2) {
+            h2_flush(k);
+        }
+        if (k->state != CONN_CLOSED && k->h2) {
+            h2_settle(k);
+        }
+        c->receiving = outer;
+        if (k->state == CONN_CLOSED && !k->pinned && k->queued == 0 && !k->dirty && outer != k) {
+            conn_free(k);
+        }
+    }
+}
+
+static int h2_init(hx_client *c) {
+    if (nghttp2_session_callbacks_new(&c->h2_callbacks) != 0 || nghttp2_option_new(&c->h2_option) != 0) {
+        return -1;
+    }
+    nghttp2_session_callbacks_set_on_header_callback(c->h2_callbacks, h2_on_header);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(c->h2_callbacks, h2_on_frame);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(c->h2_callbacks, h2_on_data);
+    nghttp2_session_callbacks_set_on_stream_close_callback(c->h2_callbacks, h2_on_close);
+    nghttp2_option_set_no_auto_window_update(c->h2_option, 1);
+    return 0;
+}
+
 static void receive(conn *k) {
     hx_client *c = k->client;
     ssize_t n;
@@ -1064,6 +1705,10 @@ static void receive(conn *k) {
         n = conn_read(k);
     } while (n < 0 && errno == EINTR);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return;
+    }
+    if (k->h2) {
+        h2_receive(k, n);
         return;
     }
     struct hx_req *q = k->req;
@@ -1157,7 +1802,7 @@ static void receive_ready(conn *k) {
     conn *outer = c->receiving;
     c->receiving = k;
     receive(k);
-    while (k->state == CONN_BUSY && reading(k) && SSL_pending(k->ssl) > 0) {
+    while ((k->state == CONN_BUSY || (k->h2 && k->state == CONN_IDLE)) && reading(k) && SSL_pending(k->ssl) > 0) {
         if (k->pinned) {
             k->want_read = true;
             break;
@@ -1170,7 +1815,14 @@ static void receive_ready(conn *k) {
     }
 }
 
+static void on_socket(hx_client *c, hx_socket s, int events);
+
 void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
+    on_socket(c, s, events);
+    process_dirty(c);
+}
+
+static void on_socket(hx_client *c, hx_socket s, int events) {
     if (c->dns != NULL && s == hx_dns_fd(c->dns)) {
         resolved(c);
         return;
@@ -1193,7 +1845,9 @@ void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
         tunnel(k);
         return;
     }
-    if ((events & HX_WRITE) && k->state == CONN_BUSY && k->req != NULL) {
+    if ((events & HX_WRITE) && k->h2 && k->state != CONN_CLOSED) {
+        h2_flush(k);
+    } else if ((events & HX_WRITE) && k->state == CONN_BUSY && k->req != NULL) {
         send_some(k);
     }
     if ((events & HX_READ) && k->state != CONN_CLOSED) {
@@ -1234,6 +1888,7 @@ void hx_client_on_timer(hx_client *c) {
         }
     }
     schedule(c, next);
+    process_dirty(c);
 }
 
 static bool release_later(hx_client *c, conn *k) {
@@ -1266,6 +1921,7 @@ int hx_client_events(hx_client *c, hx_event *out, int max) {
         memmove(c->released, c->released + released, (c->released_len - released) * sizeof(conn *));
     }
     c->released_len -= released;
+    process_dirty(c);
     int count = 0;
     while (count < max && c->queue_pos < c->queue_len) {
         queued *e = &c->queue[c->queue_pos++];
@@ -1309,6 +1965,12 @@ hx_client *hx_client_new(const hx_config *cfg, hx_io io) {
         c->cfg.read_size = 16384;
     }
     c->io = io;
+    if (h2_init(c) != 0) {
+        nghttp2_session_callbacks_del(c->h2_callbacks);
+        nghttp2_option_del(c->h2_option);
+        free(c);
+        return NULL;
+    }
     return c;
 }
 
@@ -1338,6 +2000,7 @@ void hx_client_free(hx_client *c) {
         k->pinned = false;
         k->queued = 0;
         k->req = NULL;
+        k->waiters = NULL;
         conn_close(k);
     }
     for (size_t i = c->queue_pos; i < c->queue_len; i++) {
@@ -1351,6 +2014,8 @@ void hx_client_free(hx_client *c) {
         }
     }
     hx_tls_free(&c->tls);
+    nghttp2_session_callbacks_del(c->h2_callbacks);
+    nghttp2_option_del(c->h2_option);
     free(c->queue);
     free(c->released);
     free(c->by_fd);

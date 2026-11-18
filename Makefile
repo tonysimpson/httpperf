@@ -24,11 +24,12 @@ HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parame
 
 hx-test:
 	mkdir -p build/hx
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_h1
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_client
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_decode
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_cookie
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_tls
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h1
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_client
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_decode
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_cookie
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_tls
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h2.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h2
 	for name in tls tls-other; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
 		-keyout build/hx/$$name-key.pem -out build/hx/$$name-cert.pem 2>/dev/null; done
@@ -37,6 +38,7 @@ hx-test:
 	build/hx/test_decode
 	build/hx/test_cookie
 	build/hx/test_tls
+	build/hx/test_h2
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest

@@ -53,6 +53,7 @@ typedef struct {
     const char *cert_file;
     const char *key_file;
     uint64_t tls_cache;
+    bool h2;
     const char *proxy_host;
     uint16_t proxy_port;
     const char *proxy_auth;
