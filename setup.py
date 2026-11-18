@@ -1,6 +1,20 @@
 import os
+import shlex
 
 from setuptools import Extension, setup
+
+
+def has_http3():
+    dirs = [a[2:] for a in shlex.split(os.environ.get("LDFLAGS", "")) if a.startswith("-L")]
+    dirs += ["/usr/local/lib", "/usr/local/lib64"]
+    return any(os.path.exists(os.path.join(d, "libngtcp2_crypto_boringssl.a")) for d in dirs)
+
+
+hx_libraries = ["z", "ssl", "crypto", "nghttp2"]
+hx_macros = []
+if has_http3():
+    hx_libraries = ["ngtcp2_crypto_boringssl", "ngtcp2", "nghttp3"] + hx_libraries
+    hx_macros = [("HX_H3", "1")]
 
 compile_args = [
     "-Wall",
@@ -36,13 +50,15 @@ setup(
                 "hx/src/decode.c",
                 "hx/src/dns.c",
                 "hx/src/h1.c",
+                "hx/src/h3.c",
                 "hx/src/tls.c",
                 "hx/src/ws.c",
                 "hx/vendor/llhttp/llhttp.c",
                 "hx/vendor/llhttp/api.c",
                 "hx/vendor/llhttp/http.c",
             ],
-            libraries=["z", "ssl", "crypto", "nghttp2"],
+            libraries=hx_libraries,
+            define_macros=hx_macros,
             extra_compile_args=compile_args,
         ),
     ]

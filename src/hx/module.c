@@ -199,6 +199,7 @@ struct Request {
     size_t ca_pem_len;
     uint64_t tls_cache;
     bool h2;
+    bool h3;
     bool websocket, ws_open, ws_bad;
     hx_ws_writer ws_out;
     hx_ws_reader ws_in;
@@ -249,6 +250,7 @@ struct Session {
     char *no_proxy;
     uint64_t tls_cache;
     bool h2;
+    bool h3;
     Stats stats;
 };
 
@@ -820,8 +822,8 @@ again:
                     stats_add(loop, r, stat_cancelled, 1);
                 } else if (e->error != HX_OK) {
                     stats_add(loop, r, stat_errors, 1);
-                } else if (e->version == 10 || e->version == 11 || e->version == 20) {
-                    int v = e->version == 20 ? 2 : e->version - 10;
+                } else if (e->version == 10 || e->version == 11 || e->version == 20 || e->version == 30) {
+                    int v = e->version >= 20 ? e->version / 10 : e->version - 10;
                     atomic_fetch_add_explicit(&loop->stats.http_versions[v], 1, memory_order_relaxed);
                     atomic_fetch_add_explicit(&r->session_stats->http_versions[v], 1, memory_order_relaxed);
                     if (r->host_counts != NULL) {
@@ -1111,8 +1113,8 @@ static void dispatch_later(EventLoop *loop, Limiter *l) {
 
 static void slot_mode(EventLoop *loop, Request *r, int version) {
     Slot *h = r->slot;
-    bool multiplexed = version == 20;
-    if (h == NULL || (version != 10 && version != 11 && version != 20) || h->multiplexed == multiplexed) {
+    bool multiplexed = version == 20 || version == 30;
+    if (h == NULL || (version != 10 && version != 11 && !multiplexed) || h->multiplexed == multiplexed) {
         return;
     }
     Limiter *l = r->limiter;
@@ -1266,6 +1268,7 @@ static void begin_request(EventLoop *loop, Request *r) {
         .key_file = r->key_file,
         .tls_cache = r->tls_cache,
         .h2 = r->h2,
+        .h3 = r->h3,
     };
     stats_add(loop, r, stat_running, 1);
     r->hx = hx_request_start(loop->client, &q, r);
@@ -1352,12 +1355,12 @@ static void on_stop(aeEventLoop *ae, int fd, void *data, int mask) {
 
 static PyObject *stats_dict(Stats *s, PyObject *open) {
 #define LOAD(field) atomic_load_explicit(&s->field, memory_order_relaxed)
-    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:N,s:i,s:{s:l,s:l,s:l,s:i},s:l,s:l,s:l,s:i}", "requests", LOAD(requests),
+    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:N,s:i,s:{s:l,s:l,s:l,s:l},s:l,s:l,s:l,s:i}", "requests", LOAD(requests),
                          "errors", LOAD(errors), "cancelled", LOAD(cancelled), "connections", LOAD(connections),
                          "connections_open", open, "tls_handshakes", 0, "http_versions", "HTTP/1.0",
                          LOAD(http_versions[0]), "HTTP/1.1", LOAD(http_versions[1]), "HTTP/2", LOAD(http_versions[2]),
-                         "HTTP/3", 0, "bytes_sent", LOAD(bytes_sent), "bytes_received", LOAD(bytes_received), "running",
-                         LOAD(running), "queued", LOAD(queued));
+                         "HTTP/3", LOAD(http_versions[3]), "bytes_sent", LOAD(bytes_sent), "bytes_received",
+                         LOAD(bytes_received), "running", LOAD(running), "queued", LOAD(queued));
 #undef LOAD
 }
 
@@ -2025,6 +2028,10 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         PyErr_Format(PyExc_ValueError, "http_version must be 'HTTP/3', 'HTTP/2' or 'HTTP/1.1', not '%s'", http_version);
         return NULL;
     }
+    if (strcmp(http_version, "HTTP/3") == 0 && !hx_http3_available()) {
+        PyErr_SetString(PyExc_ValueError, "this build of hx has no HTTP/3");
+        return NULL;
+    }
     Session *self = (Session *)type->tp_alloc(type, 0);
     if (self == NULL) {
         return NULL;
@@ -2039,6 +2046,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->max_connection_age = max_connection_age;
     self->tls_cache = strcmp(tls, "session") == 0 ? atomic_fetch_add(&tls_caches, 1) + 1 : 0;
     self->h2 = strcmp(http_version, "HTTP/1.1") != 0;
+    self->h3 = strcmp(http_version, "HTTP/3") == 0;
     pthread_mutex_init(&self->jar_lock, NULL);
     self->jar = hx_jar_new();
     if (self->jar == NULL || read_proxy(self) == -1) {
@@ -2612,6 +2620,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     r->loop = loop;
     r->tls_cache = self->tls_cache;
     r->h2 = self->h2;
+    r->h3 = self->h3;
     r->send_cookies = !has_cookie;
     r->path = copy(r->target, strcspn(r->target, "?#"));
     int proxy = r->path != NULL ? use_proxy(self, r) : -1;
@@ -2870,6 +2879,9 @@ static PyObject *Response_get_http_version(Response *self, PyObject *args) {
     }
     if (self->version == 20) {
         return PyUnicode_FromString("HTTP/2");
+    }
+    if (self->version == 30) {
+        return PyUnicode_FromString("HTTP/3");
     }
     Py_RETURN_NONE;
 }

@@ -54,6 +54,7 @@ typedef struct {
     const char *key_file;
     uint64_t tls_cache;
     bool h2;
+    bool h3;
     bool upgrade;
     const char *proxy_host;
     uint16_t proxy_port;
@@ -116,6 +117,7 @@ typedef struct {
 typedef struct hx_client hx_client;
 typedef struct hx_req hx_req;
 
+bool hx_http3_available(void);
 hx_client *hx_client_new(const hx_config *cfg, hx_io io);
 void hx_client_on_socket(hx_client *c, hx_socket s, int events);
 void hx_client_on_timer(hx_client *c);

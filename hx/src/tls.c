@@ -1,5 +1,7 @@
 #include "tls.h"
 
+#include "h3.h"
+
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -17,8 +19,8 @@ static bool same(const char *a, const char *b) { return a == b || (a != NULL && 
 static char *dup_or_null(const char *s) { return s != NULL ? strdup(s) : NULL; }
 
 static bool matches(const hx_tls_ctx *x, const hx_request *r) {
-    return x->verify == r->verify && x->h2 == r->h2 && same(x->ca_file, r->ca_file) && same(x->ca_path, r->ca_path) &&
-           same(x->cert_file, r->cert_file) && same(x->key_file, r->key_file) &&
+    return x->verify == r->verify && x->h2 == r->h2 && x->h3 == r->h3 && same(x->ca_file, r->ca_file) &&
+           same(x->ca_path, r->ca_path) && same(x->cert_file, r->cert_file) && same(x->key_file, r->key_file) &&
            (x->ca_pem != NULL) == (r->ca_pem != NULL) &&
            (r->ca_pem == NULL || (x->ca_pem_len == r->ca_pem_len && memcmp(x->ca_pem, r->ca_pem, r->ca_pem_len) == 0));
 }
@@ -39,21 +41,31 @@ static bool load_pem(SSL_CTX *ctx, const char *pem, size_t len) {
     return true;
 }
 
-static SSL_CTX *make_ctx(const hx_request *r, hx_error *error) {
+static SSL_CTX *make_ctx(const hx_request *r, bool quic, hx_error *error) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (ctx == NULL) {
         *error = HX_ERR_NOMEM;
         return NULL;
     }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
-    SSL_CTX_sess_set_new_cb(ctx, hx_tls_on_session);
-    static const unsigned char h1[] = "\x08http/1.1", both[] = "\x02h2\x08http/1.1";
-    if (r->h2) {
-        SSL_CTX_set_alpn_protos(ctx, both, sizeof(both) - 1);
+    static const unsigned char h1[] = "\x08http/1.1", both[] = "\x02h2\x08http/1.1", h3[] = "\x02h3";
+    if (quic) {
+        SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+        SSL_CTX_set_alpn_protos(ctx, h3, sizeof(h3) - 1);
+        if (hx_h3_configure(ctx) != 0) {
+            SSL_CTX_free(ctx);
+            *error = HX_ERR_NOMEM;
+            return NULL;
+        }
     } else {
-        SSL_CTX_set_alpn_protos(ctx, h1, sizeof(h1) - 1);
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+        SSL_CTX_sess_set_new_cb(ctx, hx_tls_on_session);
+        if (r->h2) {
+            SSL_CTX_set_alpn_protos(ctx, both, sizeof(both) - 1);
+        } else {
+            SSL_CTX_set_alpn_protos(ctx, h1, sizeof(h1) - 1);
+        }
     }
     SSL_CTX_set_verify(ctx, r->verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
     bool ok = true;
@@ -96,9 +108,17 @@ hx_tls_ctx *hx_tls_ctx_for(hx_tls *t, const hx_request *r, hx_error *error) {
         *error = HX_ERR_NOMEM;
         return NULL;
     }
-    x->ctx = make_ctx(r, error);
+    x->ctx = make_ctx(r, false, error);
+    if (x->ctx != NULL && r->h3) {
+        x->quic = make_ctx(r, true, error);
+        if (x->quic == NULL) {
+            SSL_CTX_free(x->ctx);
+            x->ctx = NULL;
+        }
+    }
     x->verify = r->verify;
     x->h2 = r->h2;
+    x->h3 = r->h3;
     x->ca_file = dup_or_null(r->ca_file);
     x->ca_path = dup_or_null(r->ca_path);
     x->cert_file = dup_or_null(r->cert_file);
@@ -127,12 +147,11 @@ static bool is_ip(const char *host) {
     return strchr(host, ':') != NULL || inet_pton(AF_INET, host, buf) == 1;
 }
 
-SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn) {
-    SSL *ssl = SSL_new(x->ctx);
+static SSL *new_ssl(SSL_CTX *ctx, const hx_tls_ctx *x, const char *host) {
+    SSL *ssl = SSL_new(ctx);
     if (ssl == NULL) {
         return NULL;
     }
-    SSL_set_app_data(ssl, conn);
     bool ip = is_ip(host);
     if (!ip) {
         SSL_set_tlsext_host_name(ssl, host);
@@ -146,6 +165,17 @@ SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_
             X509_VERIFY_PARAM_set1_host(param, host, 0);
         }
     }
+    return ssl;
+}
+
+SSL *hx_tls_new_quic(hx_tls_ctx *x, const char *host) { return x->quic != NULL ? new_ssl(x->quic, x, host) : NULL; }
+
+SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn) {
+    SSL *ssl = new_ssl(x->ctx, x, host);
+    if (ssl == NULL) {
+        return NULL;
+    }
+    SSL_set_app_data(ssl, conn);
     for (hx_tls_session *s = t->sessions; s != NULL; s = s->next) {
         if (strcmp(s->key, session_key) == 0) {
             SSL_set_session(ssl, s->session);
@@ -194,6 +224,7 @@ void hx_tls_free(hx_tls *t) {
         hx_tls_ctx *x = t->ctxs;
         t->ctxs = x->next;
         SSL_CTX_free(x->ctx);
+        SSL_CTX_free(x->quic);
         free(x->ca_file);
         free(x->ca_path);
         free(x->cert_file);

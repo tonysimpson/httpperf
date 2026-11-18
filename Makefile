@@ -2,7 +2,7 @@ PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 C_SOURCES := src/httpperf.c src/parse_headers.h src/hx/module.c $(wildcard hx/include/*.h hx/src/*.[ch] hx/tests/*.c)
-HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h1.c hx/src/tls.c hx/src/ws.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
+HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h1.c hx/src/h3.c hx/src/tls.c hx/src/ws.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
@@ -12,7 +12,10 @@ DEPS_DIR := $(abspath $(DEPS))
 DEPS_BUILT := $(DEPS_DIR)/.built
 DEPS_CFLAGS := -I$(DEPS_DIR)/include
 DEPS_LDFLAGS := -L$(DEPS_DIR)/lib -Wl,-rpath,$(DEPS_DIR)/lib
+HX_H3_CFLAGS := -DHX_H3
+HX_H3_LIBS := -lngtcp2_crypto_boringssl -lngtcp2 -lnghttp3
 endif
+HX_LIBS := $(HX_H3_LIBS) -lz -lssl -lcrypto -lnghttp2
 
 .PHONY: venv deps test hx-test ci-local lint lint-fix clean distclean release
 
@@ -35,18 +38,20 @@ $(INSTALLED): setup.py pyproject.toml $(DEPS_BUILT) $(wildcard src/*.c src/*.h s
 	.tools/bin/pip install uv
 
 HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -pthread \
-	$(DEPS_CFLAGS) $(DEPS_LDFLAGS)
+	$(DEPS_CFLAGS) $(HX_H3_CFLAGS) $(DEPS_LDFLAGS)
 
 hx-test: $(DEPS_BUILT)
 	mkdir -p build/hx
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h1
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_client
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_decode
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_cookie
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_tls
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_ws.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_ws
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h2.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h2
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_h1
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_client
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_decode
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_cookie
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_tls
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_ws.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_ws
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h2.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_h2
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_buf.c -o build/hx/test_buf
+	$(if $(HX_H3_LIBS),$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h3.c hx/tests/h3_server.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_h3)
+	$(if $(HX_H3_LIBS),$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h3_server.c hx/tests/h3_server.c $(HX_LIBS) -o build/hx/test_h3_server)
 	for name in tls tls-other; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
 		-keyout build/hx/$$name-key.pem -out build/hx/$$name-cert.pem 2>/dev/null; done
@@ -58,6 +63,8 @@ hx-test: $(DEPS_BUILT)
 	build/hx/test_h2
 	build/hx/test_ws
 	build/hx/test_buf
+	$(if $(HX_H3_LIBS),build/hx/test_h3_server)
+	$(if $(HX_H3_LIBS),build/hx/test_h3)
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest
