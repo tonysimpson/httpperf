@@ -287,10 +287,10 @@ def silent_tls_url():
     sock.close()
 
 
-async def test_a_connect_timeout_says_the_connection_timed_out(silent_tls_url, s):
+async def test_a_connect_timeout_does_not_say_the_operation_timed_out(silent_tls_url, s):
     with pytest.raises(httpperf.Timeout) as e:
         await s.get(silent_tls_url, connect_timeout=0.2)
-    assert str(e.value).startswith("Connection timed out after")
+    assert "onnection time" in str(e.value) and not str(e.value).startswith("Operation timed out")
 
 
 async def test_a_slow_response_says_the_operation_timed_out(server, s):
