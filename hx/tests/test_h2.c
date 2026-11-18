@@ -36,6 +36,8 @@ static SSL_CTX *server_ctx;
 static int server_connections;
 static int serving;
 static __thread int32_t hang_up;
+static int refuse_next_connection;
+static __thread bool refusing;
 
 typedef struct {
     char path[64];
@@ -75,6 +77,12 @@ static int on_header(nghttp2_session *ng, const nghttp2_frame *frame, const uint
 
 static int on_frame(nghttp2_session *ng, const nghttp2_frame *frame, void *user) {
     stream *s = nghttp2_session_get_stream_user_data(ng, frame->hd.stream_id);
+    if (s != NULL && frame->hd.type == NGHTTP2_HEADERS && strcmp(s->path, "/refuse") == 0 &&
+        (refusing || __atomic_exchange_n(&refuse_next_connection, 0, __ATOMIC_SEQ_CST))) {
+        refusing = true;
+        nghttp2_submit_rst_stream(ng, NGHTTP2_FLAG_NONE, frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
+        return 0;
+    }
     if (s != NULL && frame->hd.type == NGHTTP2_HEADERS && strcmp(s->path, "/hang-up") == 0) {
         nghttp2_nv status = {(uint8_t *)":status", (uint8_t *)"200", 7, 3, 0};
         nghttp2_submit_headers(ng, NGHTTP2_FLAG_NONE, frame->hd.stream_id, NULL, &status, 1, NULL);
@@ -142,6 +150,7 @@ static void *serve_one(void *arg) {
     nghttp2_session_server_new(&ng, cb, NULL);
     nghttp2_session_callbacks_del(cb);
     nghttp2_submit_settings(ng, NGHTTP2_FLAG_NONE, NULL, 0);
+    refusing = false;
     if (SSL_accept(ssl) == 1) {
         __atomic_add_fetch(&server_connections, 1, __ATOMIC_SEQ_CST);
         for (;;) {
@@ -369,6 +378,22 @@ static void test_requests_started_together_share_one_connection(void) {
     finish_client(c);
 }
 
+static void test_refused_requests_retry_together_on_one_new_connection(void) {
+    hx_client *c = client(0);
+    int before = __atomic_load_n(&server_connections, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&refuse_next_connection, 1, __ATOMIC_SEQ_CST);
+    outcome o[3] = {0};
+    hx_request r = get("/refuse");
+    for (int i = 0; i < 3; i++) {
+        hx_request_start(c, &r, &o[i]);
+    }
+    run(c, 3, 3000);
+    CHECK(o[0].last.error == HX_OK && o[1].last.error == HX_OK && o[2].last.error == HX_OK);
+    CHECK(o[0].last.connection_id == o[1].last.connection_id && o[1].last.connection_id == o[2].last.connection_id);
+    CHECK(__atomic_load_n(&server_connections, __ATOMIC_SEQ_CST) == before + 2);
+    finish_client(c);
+}
+
 static void test_the_next_request_reuses_the_connection(void) {
     hx_client *c = client(0);
     outcome first = fetch(c, get("/"));
@@ -473,6 +498,7 @@ int main(void) {
     start_server();
     test_a_request_offering_h2_uses_it();
     test_requests_started_together_share_one_connection();
+    test_refused_requests_retry_together_on_one_new_connection();
     test_the_next_request_reuses_the_connection();
     test_a_body_bigger_than_the_read_buffer_arrives_whole();
     test_cancelling_one_stream_leaves_the_others();

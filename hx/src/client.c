@@ -889,9 +889,9 @@ static bool h2_usable(conn *k);
 static void h2_attach(conn *k, struct hx_req *q);
 static void h2_start(conn *k);
 
-static conn *find_h2(hx_client *c, const char *key, bool *pending) {
+static conn *find_h2(hx_client *c, const char *key, const conn *avoid, bool *pending) {
     for (conn *k = c->conns; k != NULL; k = k->next) {
-        if (strcmp(k->key, key) != 0) {
+        if (k == avoid || strcmp(k->key, key) != 0) {
             continue;
         }
         if (h2_usable(k)) {
@@ -907,6 +907,7 @@ static conn *find_h2(hx_client *c, const char *key, bool *pending) {
 }
 
 static void start(hx_client *c, const hx_request *r, struct hx_req *q);
+static void place(hx_client *c, struct hx_req *q, const conn *avoid);
 
 hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     struct hx_req *q = calloc(1, sizeof(struct hx_req));
@@ -992,9 +993,14 @@ static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
         finish(q, rc == HX_EINVAL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
         return;
     }
+    q->connect_timeout = r->connect_timeout_ns;
+    place(c, q, NULL);
+}
+
+static void place(hx_client *c, struct hx_req *q, const conn *avoid) {
     if (q->h2_offer && !q->fresh) {
         bool pending = false;
-        conn *h = find_h2(c, q->key, &pending);
+        conn *h = find_h2(c, q->key, avoid, &pending);
         if (h != NULL && pending) {
             q->waiting_on = h;
             q->wait_next = h->waiters;
@@ -1015,7 +1021,6 @@ static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
         begin(k, q);
         return;
     }
-    q->connect_timeout = r->connect_timeout_ns;
     connect_new(c, q);
 }
 
@@ -1553,7 +1558,7 @@ static int h2_on_close(nghttp2_session *ng, int32_t id, uint32_t code, void *use
         q->deferred = false;
         q->retried = true;
         q->reused = false;
-        connect_new(k->client, q);
+        place(k->client, q, k);
         return 0;
     }
     finish(q, error, 0, false);
