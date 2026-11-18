@@ -1,10 +1,13 @@
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -359,6 +362,31 @@ static void test_an_untrusted_certificate_fails_verification(void) {
     finish_client(c);
 }
 
+static void test_a_server_that_never_answers_times_out_connecting(void) {
+    int silent = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof(a);
+    bind(silent, (struct sockaddr *)&a, sizeof(a));
+    getsockname(silent, (struct sockaddr *)&a, &len);
+    hx_client *c = client(0);
+    hx_request r = get("/");
+    r.port = ntohs(a.sin_port);
+    r.connect_timeout_ns = 100000000;
+    outcome o = fetch(c, r);
+    CHECK(o.done == 1 && o.last.error == HX_ERR_CONNECT_TIMEOUT);
+    finish_client(c);
+    close(silent);
+}
+
+static void test_a_slow_response_times_out_after_connecting(void) {
+    hx_client *c = client(0);
+    hx_request r = get("/slow");
+    r.timeout_ns = 100000000;
+    outcome o = fetch(c, r);
+    CHECK(o.done == 1 && o.last.error == HX_ERR_TIMEOUT);
+    finish_client(c);
+}
+
 static void test_nothing_listening_fails_the_request(void) {
     hx_client *c = client(0);
     hx_request r = get("/");
@@ -398,6 +426,8 @@ int main(void) {
     test_a_server_hanging_up_fails_the_request();
     test_an_untrusted_certificate_fails_verification();
     test_nothing_listening_fails_the_request();
+    test_a_server_that_never_answers_times_out_connecting();
+    test_a_slow_response_times_out_after_connecting();
     h3_server_stop();
     printf(failures ? "%d failed\n" : "all passed\n", failures);
     return failures != 0;

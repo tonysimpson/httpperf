@@ -470,6 +470,26 @@ static void test_a_slow_response_times_out(void) {
     finish_client(c);
 }
 
+static void test_a_tls_handshake_that_never_finishes_times_out_connecting(void) {
+    int silent = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof(a);
+    bind(silent, (struct sockaddr *)&a, sizeof(a));
+    listen(silent, 4);
+    getsockname(silent, (struct sockaddr *)&a, &len);
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/");
+    r.port = ntohs(a.sin_port);
+    r.tls = true;
+    r.connect_timeout_ns = 50 * 1000000;
+    hx_request_start(c, &r, &o);
+    run(c, &o, 1, 2000);
+    CHECK(o.done == 1 && o.last.error == HX_ERR_CONNECT_TIMEOUT);
+    finish_client(c);
+    close(silent);
+}
+
 static void test_a_cancel_gives_exactly_one_done(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -777,6 +797,7 @@ int main(void) {
     test_a_cancel_during_a_lookup_gives_exactly_one_done();
     test_a_lookup_is_cached();
     test_a_slow_response_times_out();
+    test_a_tls_handshake_that_never_finishes_times_out_connecting();
     test_a_cancel_gives_exactly_one_done();
     test_a_big_body_arrives_whole();
     test_a_gzip_body_is_decoded_when_asked();

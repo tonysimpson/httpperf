@@ -1,6 +1,7 @@
 import copy
 import datetime
 import json
+import socket
 import time
 
 import pytest
@@ -275,6 +276,27 @@ async def test_a_timeout_has_curls_timeout_code(server, s):
     with pytest.raises(httpperf.Timeout) as e:
         await s.get(server.url + "/slow", timeout=0.2)
     assert e.value.code == httpperf.CURLE_OPERATION_TIMEDOUT
+
+
+@pytest.fixture
+def silent_tls_url():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(4)
+    yield "https://127.0.0.1:%d/" % sock.getsockname()[1]
+    sock.close()
+
+
+async def test_a_connect_timeout_says_the_connection_timed_out(silent_tls_url, s):
+    with pytest.raises(httpperf.Timeout) as e:
+        await s.get(silent_tls_url, connect_timeout=0.2)
+    assert str(e.value).startswith("Connection timed out after")
+
+
+async def test_a_slow_response_says_the_operation_timed_out(server, s):
+    with pytest.raises(httpperf.Timeout) as e:
+        await s.get(server.url + "/slow", timeout=0.2)
+    assert str(e.value).startswith("Operation timed out after")
 
 
 async def test_a_refused_connection_is_not_a_timeout(s):

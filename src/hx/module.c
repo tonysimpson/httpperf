@@ -1612,6 +1612,7 @@ static int error_code(hx_error e) {
     case HX_ERR_UNKNOWN_ENCODING:
         return E_BAD_CONTENT_ENCODING;
     case HX_ERR_TIMEOUT:
+    case HX_ERR_CONNECT_TIMEOUT:
         return E_OPERATION_TIMEDOUT;
     case HX_ERR_CANCELLED:
         return E_ABORTED_BY_CALLBACK;
@@ -1651,6 +1652,10 @@ static void error_text(const Request *r, char *message, size_t size) {
         break;
     case HX_ERR_TIMEOUT:
         snprintf(message, size, "Operation timed out after %lld milliseconds",
+                 (long long)((e->times[HX_T_DONE] - e->times[HX_T_START]) / 1000000));
+        break;
+    case HX_ERR_CONNECT_TIMEOUT:
+        snprintf(message, size, "Connection timed out after %lld milliseconds",
                  (long long)((e->times[HX_T_DONE] - e->times[HX_T_START]) / 1000000));
         break;
     case HX_ERR_SEND:

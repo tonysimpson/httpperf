@@ -412,6 +412,9 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
     hx_client *c = q->client;
     q->done = true;
     q->times[HX_T_DONE] = now(c);
+    if (error == HX_ERR_TIMEOUT && q->times[HX_T_TLS] == 0) {
+        error = HX_ERR_CONNECT_TIMEOUT;
+    }
     if (q->lookup != NULL) {
         struct hx_req **p = &q->lookup->waiting;
         while (*p != NULL && *p != q) {

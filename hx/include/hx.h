@@ -82,6 +82,7 @@ typedef enum {
     HX_ERR_TLS_CERT,
     HX_ERR_TLS_CA,
     HX_ERR_TUNNEL,
+    HX_ERR_CONNECT_TIMEOUT,
 } hx_error;
 
 enum {
