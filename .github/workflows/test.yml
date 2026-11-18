@@ -12,9 +12,9 @@ jobs:
     runs-on: ubuntu-24.04
     container: quay.io/pypa/manylinux_2_34_x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: /opt/curl
           key: curl-manylinux_2_34-${{ hashFiles('tools/build-libcurl.sh') }}
@@ -30,13 +30,13 @@ jobs:
       matrix:
         python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.14t", "3.15", "3.15t"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache/restore@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/cache/restore@v6.1.0
         with:
           path: /opt/curl
           key: curl-manylinux_2_34-${{ hashFiles('tools/build-libcurl.sh') }}
           fail-on-cache-miss: true
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.3.3
       - run: dnf install -y openssl gcc-toolset-14-libasan-devel gcc-toolset-14-libubsan-devel
       - run: /opt/curl/bin/curl --version
       - run: make test DEPS= PY_VERSION=${{ matrix.python }}
@@ -53,8 +53,8 @@ jobs:
   system-curl:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev
       - run: make test DEPS= PY_VERSION=3.13
       - run: make hx-test DEPS=
@@ -62,8 +62,8 @@ jobs:
   system-ubuntu-26:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
       - run: >-
           sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev
           libngtcp2-dev libngtcp2-crypto-ossl-dev libnghttp3-dev
@@ -74,7 +74,7 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev
       - run: make lint DEPS=
