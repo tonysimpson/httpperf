@@ -17,7 +17,11 @@
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
+#ifdef HX_H3_OSSL
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#else
 #include <ngtcp2/ngtcp2_crypto_boringssl.h>
+#endif
 #include <nghttp3/nghttp3.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
@@ -48,6 +52,9 @@ struct h3_conn {
     nghttp3_conn *http;
     SSL *ssl;
     ngtcp2_crypto_conn_ref ref;
+#ifdef HX_H3_OSSL
+    ngtcp2_crypto_ossl_ctx *ossl;
+#endif
     struct sockaddr_storage peer;
     socklen_t peer_len;
     ngtcp2_ccerr error;
@@ -133,6 +140,9 @@ static void free_conn(h3_conn *c) {
     if (c->quic != NULL) {
         ngtcp2_conn_del(c->quic);
     }
+#ifdef HX_H3_OSSL
+    ngtcp2_crypto_ossl_ctx_del(c->ossl);
+#endif
     SSL_free(c->ssl);
     while (c->streams != NULL) {
         h3_stream *s = c->streams;
@@ -501,7 +511,13 @@ static h3_conn *new_conn(const ngtcp2_pkt_hd *hd, struct sockaddr_storage *peer,
     c->ssl = SSL_new(srv.ctx);
     SSL_set_app_data(c->ssl, &c->ref);
     SSL_set_accept_state(c->ssl);
+#ifdef HX_H3_OSSL
+    ngtcp2_crypto_ossl_ctx_new(&c->ossl, c->ssl);
+    ngtcp2_crypto_ossl_configure_server_session(c->ssl);
+    ngtcp2_conn_set_tls_native_handle(c->quic, c->ossl);
+#else
     ngtcp2_conn_set_tls_native_handle(c->quic, c->ssl);
+#endif
     associate(&hd->dcid, c);
     associate(&scid, c);
     c->next = srv.conns;
@@ -759,8 +775,12 @@ static int choose_h3(SSL *ssl, const unsigned char **out, unsigned char *outlen,
 
 static SSL_CTX *make_context(const char *cert, const char *key) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
-    if (ctx == NULL || ngtcp2_crypto_boringssl_configure_server_context(ctx) != 0 ||
-        SSL_CTX_use_certificate_chain_file(ctx, cert) != 1 ||
+#ifdef HX_H3_OSSL
+    int configured = ngtcp2_crypto_ossl_init();
+#else
+    int configured = ctx != NULL ? ngtcp2_crypto_boringssl_configure_server_context(ctx) : -1;
+#endif
+    if (ctx == NULL || configured != 0 || SSL_CTX_use_certificate_chain_file(ctx, cert) != 1 ||
         SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1 || SSL_CTX_check_private_key(ctx) != 1) {
         SSL_CTX_free(ctx);
         return NULL;

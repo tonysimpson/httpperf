@@ -17,6 +17,11 @@ HX_LIB_DIRS := $(patsubst -L%,%,$(filter -L%,$(LDFLAGS))) /usr/local/lib /usr/lo
 ifneq ($(DEPS)$(wildcard $(addsuffix /libngtcp2_crypto_boringssl.a,$(HX_LIB_DIRS))),)
 HX_H3_CFLAGS := -DHX_H3
 HX_H3_LIBS := -lngtcp2_crypto_boringssl -lngtcp2 -lnghttp3
+else ifeq ($(shell printf 'int hx_h3_available(void);\nint main(void) { return !hx_h3_available(); }\n' | \
+	$(CC) $(CFLAGS) -DHX_H3 -DHX_H3_OSSL hx/src/h3.c -x c - -x none $(LDFLAGS) -lngtcp2_crypto_ossl -lngtcp2 -lnghttp3 \
+	-lssl -lcrypto -o /dev/null 2>/dev/null && echo yes),yes)
+HX_H3_CFLAGS := -DHX_H3 -DHX_H3_OSSL
+HX_H3_LIBS := -lngtcp2_crypto_ossl -lngtcp2 -lnghttp3
 endif
 HX_LIBS := $(HX_H3_LIBS) -lz -lssl -lcrypto -lnghttp2
 

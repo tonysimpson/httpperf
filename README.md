@@ -51,7 +51,7 @@ HTTPPERF_BACKEND=hx python my_load_test.py
 
 hx is experimental. It passes httpperf's test suite, but it is young and has not been tested in the field the way libcurl has over decades, so expect bugs. Use the default, `HTTPPERF_BACKEND=curl`, for results you depend on. If the two backends behave differently, please report it.
 
-hx supports HTTP/1.1, HTTP/2 and HTTP/3, the last only in the wheels or when built against ngtcp2 for AWS-LC or BoringSSL. Elsewhere `http_version="HTTP/3"` raises `ValueError` on hx.
+hx supports HTTP/1.1, HTTP/2 and HTTP/3, the last in the wheels, and in source builds that find ngtcp2 and nghttp3 with either ngtcp2's AWS-LC/BoringSSL crypto library or its OpenSSL one (which needs OpenSSL 3.5 or later). Elsewhere `http_version="HTTP/3"` raises `ValueError` on hx.
 
 ## Quick start
 
@@ -423,7 +423,7 @@ Each target first creates `.venv` with uv, if needed, and installs httpperf in e
 
 Both backends build against the same libraries the wheels bundle: AWS-LC, nghttp2, nghttp3, ngtcp2 and libcurl, which the first `make` builds into `.deps` with `tools/build-libcurl.sh` (a few minutes; it needs cmake, a C++ compiler and zlib's headers). They're rebuilt only when that script changes. `DEPS=` builds against the system's libraries instead, as CI does.
 
-There are two backends, each its own extension module with the same API: `_httpperf` on curl, the default, and `_httpperf_hx` on [hx](hx/README.md), the start of a replacement for curl. So far hx does HTTP/1.1 over TCP or TLS, HTTP/2 over TLS and HTTP/3 over QUIC, with streamed responses and uploads, WebSockets, cookies, connection limits, per-host stats and HTTP proxies from the environment. HTTP/3 needs ngtcp2 built for AWS-LC or BoringSSL, as in the wheels and `.deps`; without it, `http_version="HTTP/3"` raises `ValueError` on hx too. `HTTPPERF_BACKEND=hx` picks it when httpperf is imported. `make test` runs the suite on both. `make hx-test` runs hx's own C tests.
+There are two backends, each its own extension module with the same API: `_httpperf` on curl, the default, and `_httpperf_hx` on [hx](hx/README.md), the start of a replacement for curl. So far hx does HTTP/1.1 over TCP or TLS, HTTP/2 over TLS and HTTP/3 over QUIC, with streamed responses and uploads, WebSockets, cookies, connection limits, per-host stats and HTTP proxies from the environment. HTTP/3 needs ngtcp2's crypto library for AWS-LC or BoringSSL, as in the wheels and `.deps`, or for OpenSSL 3.5 or later; the build tries to compile and link it, and without it `http_version="HTTP/3"` raises `ValueError` on hx too. `HTTPPERF_BACKEND=hx` picks it when httpperf is imported. `make test` runs the suite on both. `make hx-test` runs hx's own C tests.
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 

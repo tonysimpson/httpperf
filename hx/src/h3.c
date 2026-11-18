@@ -6,11 +6,20 @@
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #include <openssl/rand.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+
+#ifdef HX_H3_OSSL
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#if OPENSSL_VERSION_NUMBER < 0x30500000L || defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+#error "ngtcp2's OpenSSL helper needs OpenSSL 3.5 or later"
+#endif
+#else
+#include <ngtcp2/ngtcp2_crypto_boringssl.h>
+#endif
 
 #define PACKET_CAP 65536
 
@@ -35,6 +44,9 @@ typedef struct h3s {
 struct hx_h3 {
     int fd;
     SSL *ssl;
+#ifdef HX_H3_OSSL
+    ngtcp2_crypto_ossl_ctx *ossl;
+#endif
     ngtcp2_crypto_conn_ref ref;
     ngtcp2_conn *conn;
     nghttp3_conn *h3;
@@ -297,7 +309,19 @@ static const ngtcp2_callbacks quic_callbacks = {
 
 bool hx_h3_available(void) { return true; }
 
+#ifdef HX_H3_OSSL
+static int ossl_ready = -1;
+static pthread_once_t ossl_once = PTHREAD_ONCE_INIT;
+
+static void ossl_init(void) { ossl_ready = ngtcp2_crypto_ossl_init(); }
+
+int hx_h3_configure(SSL_CTX *ctx) {
+    pthread_once(&ossl_once, ossl_init);
+    return ossl_ready;
+}
+#else
 int hx_h3_configure(SSL_CTX *ctx) { return ngtcp2_crypto_boringssl_configure_client_context(ctx); }
+#endif
 
 static ngtcp2_path path_of(hx_h3 *h) {
     return (ngtcp2_path){
@@ -340,12 +364,23 @@ hx_h3 *hx_h3_new(int fd, SSL *ssl, const hx_h3_handler *handler, void *user, int
         free(h);
         return NULL;
     }
-    h->ssl = ssl;
     h->ref.get_conn = get_conn;
     h->ref.user_data = h;
     SSL_set_app_data(ssl, &h->ref);
     SSL_set_connect_state(ssl);
+#ifdef HX_H3_OSSL
+    if (ngtcp2_crypto_ossl_ctx_new(&h->ossl, ssl) != 0 || ngtcp2_crypto_ossl_configure_client_session(ssl) != 0) {
+        ngtcp2_crypto_ossl_ctx_del(h->ossl);
+        ngtcp2_conn_del(h->conn);
+        SSL_set_app_data(ssl, NULL);
+        free(h);
+        return NULL;
+    }
+    ngtcp2_conn_set_tls_native_handle(h->conn, h->ossl);
+#else
     ngtcp2_conn_set_tls_native_handle(h->conn, ssl);
+#endif
+    h->ssl = ssl;
     return h;
 }
 
@@ -613,6 +648,9 @@ void hx_h3_free(hx_h3 *h) {
     }
     nghttp3_conn_del(h->h3);
     ngtcp2_conn_del(h->conn);
+#ifdef HX_H3_OSSL
+    ngtcp2_crypto_ossl_ctx_del(h->ossl);
+#endif
     if (h->ssl != NULL) {
         SSL_set_app_data(h->ssl, NULL);
         SSL_free(h->ssl);
