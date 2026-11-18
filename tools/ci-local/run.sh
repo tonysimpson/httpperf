@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs the CI test jobs locally with Podman: the manylinux_2_34 image and the bundled curl for each
 # Python version, "system" for Ubuntu 24.04's libcurl (CI's system-curl job, Python 3.13), and "system26" for
-# Ubuntu 26.04's libraries, with HTTP/3 in hx over OpenSSL (CI's system-ubuntu-26 job, hx only).
+# Ubuntu 26.04's libraries, with HTTP/3 in hx over OpenSSL (CI's system-ubuntu-26 job).
 # Usage: tools/ci-local/run.sh [python version or system ...]; PYTEST_ARGS and JOBS (default 4) are optional.
 set -eu
 
@@ -12,13 +12,13 @@ if [ "${1:-}" = "--one" ]; then
     if [ "$2" = system ]; then
         set -- "$1" "$2" httpperf-ci-system 3.13 "" "" hx-test
     elif [ "$2" = system26 ]; then
-        set -- "$1" "$2" httpperf-ci-system26 3.13 "" "" hx-test hx-only
+        set -- "$1" "$2" httpperf-ci-system26 3.13 "" "" hx-test http3
     else
         set -- "$1" "$2" httpperf-ci "$2" -I/opt/curl/include "-L/opt/curl/lib -Wl,-rpath,/opt/curl/lib" \
             "$([ "$2" = 3.13 ] && echo hx-test)"
     fi
     if podman run --rm -v "$PWD:/src:ro,Z" -v httpperf-ci-uv:/root/.cache/uv \
-        -e PY_VERSION="$4" -e PYTEST_ARGS="${PYTEST_ARGS:-}" -e CFLAGS="$5" -e LDFLAGS="$6" -e HX_TEST="$7" -e HX_ONLY="${8:-}" \
+        -e PY_VERSION="$4" -e PYTEST_ARGS="${PYTEST_ARGS:-}" -e CFLAGS="$5" -e LDFLAGS="$6" -e HX_TEST="$7" -e HX_HTTP3="${8:-}" \
         "$3" sh -c '
             set -e
             mkdir /work
@@ -28,12 +28,10 @@ if [ "${1:-}" = "--one" ]; then
             make venv DEPS= PY_VERSION=$PY_VERSION > /dev/null
             if [ -n "$HX_TEST" ]; then make hx-test DEPS= > /tmp/hx-c.log 2>&1 || { cat /tmp/hx-c.log; exit 1; }; fi
             HTTPPERF_BACKEND=hx .venv/bin/python -m pytest -q -p no:cacheprovider $PYTEST_ARGS > /tmp/hx.log || { cat /tmp/hx.log; exit 1; }
-            if [ -n "$HX_ONLY" ]; then
+            if [ -n "$HX_HTTP3" ]; then
                 HTTPPERF_BACKEND=hx .venv/bin/python -c "import httpperf; httpperf.Session(http_version=\"HTTP/3\")"
-                tail -n 1 /tmp/hx.log
-            else
-                .venv/bin/python -m pytest -p no:cacheprovider $PYTEST_ARGS
             fi
+            .venv/bin/python -m pytest -p no:cacheprovider $PYTEST_ARGS
         ' > "$LOGS/$2.log" 2>&1; then
         echo "$2: $(tail -n 1 "$LOGS/$2.log" | tr -d '=')"
     else
