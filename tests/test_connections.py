@@ -52,6 +52,16 @@ def unused_port():
     return port
 
 
+HELD = []
+
+
+def refusing_url(host):
+    sock = socket.socket()
+    sock.bind((host, 0))
+    HELD.append(sock)
+    return "http://%s:%d" % (host, sock.getsockname()[1])
+
+
 @pytest.fixture
 def silent_url():
     sock = socket.socket()
@@ -270,7 +280,7 @@ def proxy_environment(monkeypatch):
     return monkeypatch
 
 
-DEAD_PROXY = "http://127.0.0.1:%d" % unused_port()
+DEAD_PROXY = refusing_url("127.0.0.1")
 
 
 async def went_through(wire, url):
@@ -325,7 +335,7 @@ async def test_many_new_connections_while_responses_arrive(server):
             assert await new_connections_while_responses_arrive(engine, server.url) == [200] * 350
 
 
-SECOND_DEAD_PROXY = "http://127.0.0.2:%d" % unused_port()
+SECOND_DEAD_PROXY = refusing_url("127.0.0.2")
 
 
 async def proxy_port_tried(url):
