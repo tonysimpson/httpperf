@@ -37,9 +37,14 @@ jobs:
           key: curl-manylinux_2_34-${{ hashFiles('tools/build-libcurl.sh') }}
           fail-on-cache-miss: true
       - uses: astral-sh/setup-uv@v6
-      - run: dnf install -y openssl
+      - run: dnf install -y openssl gcc-toolset-14-libasan-devel gcc-toolset-14-libubsan-devel
       - run: /opt/curl/bin/curl --version
       - run: make test DEPS= PY_VERSION=${{ matrix.python }}
+        env:
+          CFLAGS: -I/opt/curl/include
+          LDFLAGS: -L/opt/curl/lib -Wl,-rpath,/opt/curl/lib
+      - if: matrix.python == '3.13'
+        run: make hx-test DEPS=
         env:
           CFLAGS: -I/opt/curl/include
           LDFLAGS: -L/opt/curl/lib -Wl,-rpath,/opt/curl/lib

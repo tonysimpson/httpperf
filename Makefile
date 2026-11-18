@@ -12,6 +12,9 @@ DEPS_DIR := $(abspath $(DEPS))
 DEPS_BUILT := $(DEPS_DIR)/.built
 DEPS_CFLAGS := -I$(DEPS_DIR)/include
 DEPS_LDFLAGS := -L$(DEPS_DIR)/lib -Wl,-rpath,$(DEPS_DIR)/lib
+endif
+HX_LIB_DIRS := $(patsubst -L%,%,$(filter -L%,$(LDFLAGS))) /usr/local/lib /usr/local/lib64
+ifneq ($(DEPS)$(wildcard $(addsuffix /libngtcp2_crypto_boringssl.a,$(HX_LIB_DIRS))),)
 HX_H3_CFLAGS := -DHX_H3
 HX_H3_LIBS := -lngtcp2_crypto_boringssl -lngtcp2 -lnghttp3
 endif
@@ -38,7 +41,7 @@ $(INSTALLED): setup.py pyproject.toml $(DEPS_BUILT) $(wildcard src/*.c src/*.h s
 	.tools/bin/pip install uv
 
 HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -pthread \
-	$(DEPS_CFLAGS) $(HX_H3_CFLAGS) $(DEPS_LDFLAGS)
+	$(DEPS_CFLAGS) $(HX_H3_CFLAGS) $(CFLAGS) $(DEPS_LDFLAGS) $(LDFLAGS)
 
 hx-test: $(DEPS_BUILT)
 	mkdir -p build/hx
@@ -51,7 +54,6 @@ hx-test: $(DEPS_BUILT)
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h2.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_h2
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_buf.c -o build/hx/test_buf
 	$(if $(HX_H3_LIBS),$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h3.c hx/tests/h3_server.c $(HX_CORE) $(HX_LIBS) -o build/hx/test_h3)
-	$(if $(HX_H3_LIBS),$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h3_server.c hx/tests/h3_server.c $(HX_LIBS) -o build/hx/test_h3_server)
 	for name in tls tls-other; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
 		-keyout build/hx/$$name-key.pem -out build/hx/$$name-cert.pem 2>/dev/null; done
@@ -63,7 +65,6 @@ hx-test: $(DEPS_BUILT)
 	build/hx/test_h2
 	build/hx/test_ws
 	build/hx/test_buf
-	$(if $(HX_H3_LIBS),build/hx/test_h3_server)
 	$(if $(HX_H3_LIBS),build/hx/test_h3)
 
 test: $(INSTALLED)
