@@ -176,6 +176,7 @@ struct Request {
     bool delivered;
     int head_status, head_version;
     bool send_cookies;
+    bool bad_scheme;
     char *path;
 };
 
@@ -523,6 +524,7 @@ static void complete(EventLoop *loop, Request *r) {
 
 static bool dispatch_pending(EventLoop *loop);
 static int error_code(hx_error e);
+static int request_code(const Request *r) { return r->bad_scheme ? E_UNSUPPORTED_PROTOCOL : error_code(r->done.error); }
 static void error_text(const Request *r, char *message, size_t size);
 
 static void stream_append(EventLoop *loop, Request *r, const char *data, size_t len) {
@@ -560,7 +562,7 @@ static void stream_finish(EventLoop *loop, Request *r) {
     s->done = r->done;
     s->size_download = (long long)r->body_bytes;
     s->size_upload = r->upload != NULL ? r->upload->total : (long long)r->body_len;
-    s->error_code = r->done.error != HX_OK ? error_code(r->done.error) : 0;
+    s->error_code = r->done.error != HX_OK ? request_code(r) : 0;
     memcpy(s->error, message, sizeof(message));
     if (s->paused) {
         s->paused_ns += clock_ns() - s->paused_since;
@@ -1001,6 +1003,17 @@ static void start(EventLoop *loop, Request *r) {
     }
     loop->live = r;
     r->started = true;
+    if (r->bad_scheme) {
+        r->done.error = HX_ERR_INVALID;
+        r->finished = true;
+        stats_add(loop, r, stat_requests, 1);
+        stats_add(loop, r, stat_errors, 1);
+        if (r->upload != NULL) {
+            upload_done(loop, r);
+        }
+        complete(loop, r);
+        return;
+    }
     if (loop->host_stats) {
         r->host_counts = host_stats_for(&loop->hosts, r);
     }
@@ -1405,6 +1418,10 @@ static int error_code(hx_error e) {
 
 static void error_text(const Request *r, char *message, size_t size) {
     const hx_event *e = &r->done;
+    if (r->bad_scheme) {
+        snprintf(message, size, "Protocol \"%s\" not supported", r->host);
+        return;
+    }
     switch (e->error) {
     case HX_ERR_DNS:
         snprintf(message, size, "Could not resolve host: %s", r->host);
@@ -1447,7 +1464,7 @@ static void error_text(const Request *r, char *message, size_t size) {
 static PyObject *error_tuple(Request *r) {
     char message[512];
     error_text(r, message, sizeof(message));
-    return Py_BuildValue("(is)", error_code(r->done.error), message);
+    return Py_BuildValue("(is)", request_code(r), message);
 }
 
 static double seconds(const hx_event *e, int point) {
@@ -1798,7 +1815,14 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
         return E_UNSUPPORTED_PROTOCOL;
     }
     if (strncasecmp(url, "http://", 7) != 0) {
-        return E_UNSUPPORTED_PROTOCOL;
+        size_t n = strspn(url, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-");
+        if (n == 0 || url[n] != ':') {
+            return E_URL_MALFORMAT;
+        }
+        r->bad_scheme = true;
+        r->host = copy(url, n);
+        r->target = strdup("/");
+        return r->host != NULL && r->target != NULL ? 0 : E_OUT_OF_MEMORY;
     }
     const char *authority = url + 7;
     const char *end = authority + strcspn(authority, "/?#");
