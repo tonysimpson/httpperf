@@ -11,6 +11,7 @@
 
 #include "../../hx/include/hx.h"
 #include "../../hx/src/buf.h"
+#include "../../hx/src/cookie.h"
 #include "../ae/ae.h"
 #include "../parse_headers.h"
 
@@ -160,6 +161,8 @@ struct Request {
     int64_t upload_size;
     bool delivered;
     int head_status, head_version;
+    bool send_cookies;
+    char *path;
 };
 
 struct EventLoop {
@@ -197,6 +200,8 @@ struct Session {
     long max_connection_age;
     Limiter *limiter;
     Pool *pool;
+    hx_jar *jar;
+    pthread_mutex_t jar_lock;
     Stats stats;
 };
 
@@ -271,6 +276,7 @@ static void request_free(Request *r) {
     free(r->host);
     free(r->authority);
     free(r->target);
+    free(r->path);
     free(r->method);
     free_strings(r->headers, r->header_count);
     free(r->body);
@@ -548,6 +554,31 @@ static void upload_done(EventLoop *loop, Request *r) {
     }
 }
 
+static void store_cookies(Request *r, const char *block, size_t len) {
+    Session *session = r->session;
+    const char *end = block + len;
+    bool locked = false;
+    int64_t now = (int64_t)time(NULL);
+    for (const char *line = memchr(block, '\n', len); line != NULL && ++line < end;) {
+        const char *eol = memchr(line, '\r', (size_t)(end - line));
+        if (eol == NULL || eol == line) {
+            break;
+        }
+        if (eol - line > 11 && strncasecmp(line, "set-cookie:", 11) == 0) {
+            if (!locked) {
+                pthread_mutex_lock(&session->jar_lock);
+                locked = true;
+            }
+            const char *v = line + 11;
+            hx_jar_set_cookie(session->jar, v, (size_t)(eol - v), r->host, r->path, false, now);
+        }
+        line = memchr(eol, '\n', (size_t)(end - eol));
+    }
+    if (locked) {
+        pthread_mutex_unlock(&session->jar_lock);
+    }
+}
+
 static void handle_events(EventLoop *loop) {
     hx_event events[64];
     int count;
@@ -562,6 +593,9 @@ again:
             if (e->type == HX_EV_HEADERS) {
                 r->header.len = 0;
                 hx_buf_append(&r->header, e->data, e->len);
+                if (r->session != NULL) {
+                    store_cookies(r, e->data, e->len);
+                }
                 if (r->stream != NULL) {
                     r->head_status = e->status;
                     r->head_version = e->version;
@@ -894,7 +928,28 @@ static void start(EventLoop *loop, Request *r) {
     begin_request(loop, r);
 }
 
+static void add_cookie_header(Request *r) {
+    Session *session = r->session;
+    if (!r->send_cookies || session == NULL) {
+        return;
+    }
+    hx_buf line = {0};
+    pthread_mutex_lock(&session->jar_lock);
+    bool any = hx_jar_count(session->jar) > 0 && hx_buf_append_str(&line, "Cookie: ") &&
+               hx_jar_header(session->jar, r->host, r->path, false, (int64_t)time(NULL), &line);
+    pthread_mutex_unlock(&session->jar_lock);
+    char **grown =
+        any && hx_buf_append(&line, "", 1) ? realloc(r->headers, (r->header_count + 1) * sizeof(char *)) : NULL;
+    if (grown == NULL) {
+        hx_buf_free(&line);
+        return;
+    }
+    r->headers = grown;
+    r->headers[r->header_count++] = line.data;
+}
+
 static void begin_request(EventLoop *loop, Request *r) {
+    add_cookie_header(r);
     hx_request q = {
         .method = r->method,
         .host = r->host,
@@ -1505,6 +1560,12 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->fresh = none;
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;
+    pthread_mutex_init(&self->jar_lock, NULL);
+    self->jar = hx_jar_new();
+    if (self->jar == NULL) {
+        Py_DECREF(self);
+        return PyErr_NoMemory();
+    }
     if (own) {
         self->pool = calloc(1, sizeof(Pool));
         if (self->pool == NULL) {
@@ -1527,6 +1588,10 @@ static void close_pool(Session *self);
 
 static void Session_dealloc(Session *self) {
     close_pool(self);
+    if (self->jar != NULL) {
+        hx_jar_free(self->jar);
+        pthread_mutex_destroy(&self->jar_lock);
+    }
     limiter_decref(self->limiter);
     Py_XDECREF(self->loop);
     Py_TYPE(self)->tp_free((PyObject *)self);
@@ -1716,7 +1781,28 @@ static bool names(const char *header, const char *name) {
     return strncasecmp(header, name, n) == 0 && (header[n] == ':' || header[n] == ';');
 }
 
-static int add_headers(Request *r, PyObject *headers, bool *has_accept, bool *has_encoding) {
+static int add_cookies(Session *self, PyObject *cookies) {
+    if (cookies == Py_None) {
+        return 0;
+    }
+    int64_t now = (int64_t)time(NULL);
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(cookies); i++) {
+        PyObject *item = PyTuple_GET_ITEM(cookies, i);
+        const char *line = PyUnicode_CheckExact(item) ? PyUnicode_AsUTF8(item) : NULL;
+        if (line == NULL) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_ValueError, "cookies should be a tuple of strings or None");
+            }
+            return -1;
+        }
+        pthread_mutex_lock(&self->jar_lock);
+        hx_jar_add_line(self->jar, line, now);
+        pthread_mutex_unlock(&self->jar_lock);
+    }
+    return 0;
+}
+
+static int add_headers(Request *r, PyObject *headers, bool *has_accept, bool *has_encoding, bool *has_cookie) {
     if (headers == Py_None) {
         return 0;
     }
@@ -1738,6 +1824,9 @@ static int add_headers(Request *r, PyObject *headers, bool *has_accept, bool *ha
         }
         if (names(header, "accept-encoding")) {
             *has_encoding = true;
+        }
+        if (names(header, "cookie")) {
+            *has_cookie = true;
         }
         size_t len = strlen(header);
         const char *colon = strchr(header, ':');
@@ -1802,8 +1891,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         PyErr_SetString(PyExc_NotImplementedError, "WebSockets aren't on the hx backend yet");
         return NULL;
     }
-    if (cookies != Py_None) {
-        PyErr_SetString(PyExc_NotImplementedError, "cookies aren't on the hx backend yet");
+    if (cookies != Py_None && !PyTuple_CheckExact(cookies)) {
+        PyErr_SetString(PyExc_ValueError, "cookies should be a tuple of strings or None");
         return NULL;
     }
     int64_t timeout_ns, connect_timeout_ns;
@@ -1832,8 +1921,9 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     atomic_init(&r->refs, 1);
     char *user = NULL, *password = NULL;
     int code = parse_url(r, url, &user, &password);
-    bool has_accept = false, has_encoding = false;
-    if (code == -1 || add_headers(r, headers, &has_accept, &has_encoding) == -1) {
+    bool has_accept = false, has_encoding = false, has_cookie = false;
+    if (code == -1 || add_headers(r, headers, &has_accept, &has_encoding, &has_cookie) == -1 ||
+        add_cookies(self, cookies) == -1) {
         free(user);
         free(password);
         request_free(r);
@@ -1882,6 +1972,12 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         return PyErr_NoMemory();
     }
     r->loop = loop;
+    r->send_cookies = !has_cookie;
+    r->path = copy(r->target, strcspn(r->target, "?#"));
+    if (r->path == NULL) {
+        request_free(r);
+        return PyErr_NoMemory();
+    }
     r->discard_body = discard_body;
     r->fresh = self->fresh;
     r->close_after = self->fresh || self->idle_timeout == 0;
@@ -2011,9 +2107,59 @@ static PyObject *Session_close(Session *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-static PyObject *Session_get_cookielist(Session *self, PyObject *args) { return PyList_New(0); }
+static PyObject *Session_get_cookielist(Session *self, PyObject *args) {
+    hx_buf text = {0};
+    pthread_mutex_lock(&self->jar_lock);
+    bool ok = hx_jar_lines(self->jar, (int64_t)time(NULL), &text);
+    pthread_mutex_unlock(&self->jar_lock);
+    PyObject *list = ok ? PyList_New(0) : PyErr_NoMemory();
+    for (size_t at = 0; list != NULL && at < text.len;) {
+        const char *nl = memchr(text.data + at, '\n', text.len - at);
+        size_t n = (size_t)(nl - (text.data + at));
+        PyObject *line = PyUnicode_DecodeUTF8(text.data + at, (Py_ssize_t)n, "surrogateescape");
+        if (line == NULL || PyList_Append(list, line) == -1) {
+            Py_CLEAR(list);
+        }
+        Py_XDECREF(line);
+        at += n + 1;
+    }
+    hx_buf_free(&text);
+    return list;
+}
 
-static PyObject *Session_apply_cookielist(Session *self, PyObject *args) { Py_RETURN_NONE; }
+static PyObject *Session_apply_cookielist(Session *self, PyObject *args) {
+    PyObject *lines;
+    if (!PyArg_ParseTuple(args, "O!", &PyTuple_Type, &lines)) {
+        return NULL;
+    }
+    bool closed;
+    Py_BEGIN_CRITICAL_SECTION(self);
+    closed = self->closed;
+    Py_END_CRITICAL_SECTION();
+    if (closed) {
+        PyErr_SetString(PyExc_RuntimeError, "session is closed");
+        return NULL;
+    }
+    int64_t now = (int64_t)time(NULL);
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(lines); i++) {
+        PyObject *item = PyTuple_GET_ITEM(lines, i);
+        const char *line = PyUnicode_CheckExact(item) ? PyUnicode_AsUTF8(item) : NULL;
+        if (line == NULL) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_ValueError, "cookie lines should be strings");
+            }
+            return NULL;
+        }
+        pthread_mutex_lock(&self->jar_lock);
+        if (strcmp(line, "ALL") == 0 || strcmp(line, "SESS") == 0) {
+            hx_jar_clear(self->jar, line[0] == 'S');
+        } else if (strcmp(line, "FLUSH") != 0 && strcmp(line, "RELOAD") != 0) {
+            hx_jar_add_line(self->jar, line, now);
+        }
+        pthread_mutex_unlock(&self->jar_lock);
+    }
+    Py_RETURN_NONE;
+}
 
 static PyObject *Session_limiter_state(Session *self, PyObject *args) { return limiter_state(self->limiter); }
 

@@ -1,16 +1,5 @@
 # Tests the hx backend doesn't pass yet, skipped when HTTPPERF_BACKEND=hx.
 # HTTPPERF_HX_ALL=1 runs them anyway; remove a line once its test passes.
-tests/test_api.py::test_add_cookie_list
-tests/test_api.py::test_a_request_with_options[auth-expected3]
-tests/test_api.py::test_a_request_with_options[cookies-expected2]
-tests/test_api.py::test_a_request_with_options[data-body]
-tests/test_api.py::test_a_request_with_options[header_list-expected0]
-tests/test_api.py::test_a_request_with_options[headers-expected1]
-tests/test_api.py::test_arguments_are_not_modified
-tests/test_api.py::test_cookie_list_and_cookies_are_both_sent
-tests/test_api.py::test_set_and_added_cookies_are_sent
-tests/test_api.py::test_the_request_records_its_cookie_list
-tests/test_api.py::test_the_session_has_every_responses_cookies
 tests/test_cli.py::test_insecure_skips_the_certificate_check
 tests/test_connections.py::test_an_https_request_tunnels_through_the_proxy
 tests/test_connections.py::test_a_proxied_request_uses_the_absolute_url
@@ -18,26 +7,11 @@ tests/test_connections.py::test_a_schemes_proxy_beats_all_proxy[https]
 tests/test_connections.py::test_proxy_credentials_come_from_the_proxy_url
 tests/test_connections.py::test_proxy_environment[environment1-True]
 tests/test_connections.py::test_proxy_environment[environment3-True]
-tests/test_cookie_bugs.py::test_an_invalid_cookie_does_not_stop_the_rest
-tests/test_cookie_bugs.py::test_cookie_values_are_sent_back_unchanged
-tests/test_cookie_bugs.py::test_deleting_then_setting_a_cookie_keeps_the_new_value
-tests/test_cookie_bugs.py::test_two_set_cookies_with_a_quoted_equals_are_both_kept
-tests/test_engine.py::test_a_session_needs_no_loop_until_its_first_request
 tests/test_host_stats.py::test_errors_are_counted_per_host
 tests/test_host_stats.py::test_every_host_is_kept
 tests/test_host_stats.py::test_host_stats_are_off_by_default
 tests/test_host_stats.py::test_requests_are_counted_per_host
 tests/test_host_stats.py::test_spellings_of_a_host_share_its_counts
-tests/test_httpbin.py::test_a_closed_sessions_cookies_cannot_be_changed
-tests/test_httpbin.py::test_added_cookies_are_sent
-tests/test_httpbin.py::test_a_session_keeps_its_cookies_after_handles_are_reused
-tests/test_httpbin.py::test_erase_session_cookies_keeps_lasting_ones
-tests/test_httpbin.py::test_request_cookies_are_sent
-tests/test_httpbin.py::test_request_cookies_join_the_sessions
-tests/test_httpbin.py::test_the_session_keeps_cookies
-tests/test_httpbin.py::test_the_session_lists_its_cookies
-tests/test_httpbin.py::test_the_session_works_after_an_unencodable_string[options2]
-tests/test_httpbin.py::test_unencodable_strings_raise[options2]
 tests/test_http_versions.py::test_a_failed_request_does_not_stop_multiplexing
 tests/test_http_versions.py::test_a_multiplexed_host_takes_one_limiter_slot[HTTP/2]
 tests/test_http_versions.py::test_a_multiplexed_host_takes_one_limiter_slot[HTTP/3]
@@ -58,17 +32,10 @@ tests/test_http_versions.py::test_responses_report_their_version[HTTP/1.1]
 tests/test_http_versions.py::test_responses_report_their_version[HTTP/2]
 tests/test_http_versions.py::test_responses_report_their_version[HTTP/3]
 tests/test_http_versions.py::test_the_limiter_follows_a_host_back_to_http1
-tests/test_leaks.py::test_session_per_request_does_not_leak[none-stream]
-tests/test_leaks.py::test_session_per_request_does_not_leak[none-upload]
-tests/test_leaks.py::test_session_per_request_does_not_leak[session-stream]
-tests/test_leaks.py::test_session_per_request_does_not_leak[session-upload]
-tests/test_leaks.py::test_session_per_request_does_not_leak[shared-stream]
-tests/test_leaks.py::test_session_per_request_does_not_leak[shared-upload]
 tests/test_limiter.py::test_busy_host_records_are_kept
 tests/test_limiter.py::test_host_keys_of_unusual_urls
 tests/test_limiter.py::test_idle_host_records_are_freed
 tests/test_redirects.py::test_a_location_with_another_scheme_is_an_error
-tests/test_redirects.py::test_cookies_set_by_a_redirect_are_sent_on_the_next_hop
 tests/test_tls.py::test_a_certificate_must_be_a_pair
 tests/test_tls.py::test_a_request_can_verify_against_ca_certificates_as_bytes
 tests/test_tls.py::test_a_request_certificate_overrides_the_sessions
@@ -86,4 +53,3 @@ tests/test_tls.py::test_verify[*-options4-True]
 tests/test_tls.py::test_verify[*-options5-True]
 tests/test_tls.py::test_verify[True-options3-False]
 tests/test_tls.py::test_verify_with_ssl_cert_dir
-tests/test_urls.py::test_cookies_are_sent_to_a_url_with_credentials

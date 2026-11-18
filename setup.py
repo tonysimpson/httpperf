@@ -32,6 +32,7 @@ setup(
                 "src/ae/ae.c",
                 "src/ae/zmalloc.c",
                 "hx/src/client.c",
+                "hx/src/cookie.c",
                 "hx/src/decode.c",
                 "hx/src/dns.c",
                 "hx/src/h1.c",
