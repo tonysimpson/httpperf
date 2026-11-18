@@ -231,6 +231,7 @@ struct EventLoop {
     size_t buffer_size;
     Limiter *limiter;
     Limiter *pending;
+    PyObject *flush_loop;
 };
 
 struct Session {
@@ -1418,6 +1419,7 @@ static void free_cancels(Request *r) {
 }
 
 static void EventLoop_dealloc(EventLoop *self) {
+    Py_CLEAR(self->flush_loop);
     while (self->abandoned != NULL) {
         Request *r = self->abandoned;
         self->abandoned = r->next;
@@ -1578,6 +1580,19 @@ static PyObject *EventLoop_host_stats(EventLoop *self, PyObject *args) {
 static PyObject *EventLoop_limiter_state(EventLoop *self, PyObject *args) { return limiter_state(self->limiter); }
 
 static PyObject *EventLoop_get_out_fd(EventLoop *self, PyObject *args) { return PyLong_FromLong(self->out[0]); }
+
+static PyObject *EventLoop_flush(EventLoop *self, PyObject *args) {
+    Py_BEGIN_CRITICAL_SECTION(self);
+    Py_CLEAR(self->flush_loop);
+    Py_END_CRITICAL_SECTION();
+    pthread_mutex_lock(&self->lock);
+    bool any = self->incoming != NULL;
+    pthread_mutex_unlock(&self->lock);
+    if (any) {
+        poke(self->wake[1]);
+    }
+    Py_RETURN_NONE;
+}
 
 static int error_code(hx_error e) {
     switch (e) {
@@ -1860,6 +1875,8 @@ static PyMethodDef EventLoop_methods[] = {
     {"host_stats", (PyCFunction)EventLoop_host_stats, METH_NOARGS, "The engine's counts for each host"},
     {"get_out_fd", (PyCFunction)EventLoop_get_out_fd, METH_NOARGS, "Get the outbound file descriptor"},
     {"get_completed", (PyCFunction)EventLoop_get_completed, METH_NOARGS, "Get the error, response and future"},
+    {"_flush", (PyCFunction)EventLoop_flush, METH_NOARGS,
+     "Wake the event loop for requests queued since the last wake"},
     {NULL}};
 
 static PyTypeObject EventLoopType = {
@@ -2462,6 +2479,35 @@ static int parse_timeout(PyObject *value, const char *name, int64_t *ns) {
 
 static void upload_capsule_free(PyObject *capsule);
 
+static PyObject *str_get_loop, *str_call_soon, *str_flush;
+
+static bool schedule_flush(EventLoop *loop, PyObject *future) {
+    PyObject *aio = PyObject_CallMethodObjArgs(future, str_get_loop, NULL);
+    if (aio == NULL) {
+        PyErr_Clear();
+        return false;
+    }
+    bool scheduled;
+    Py_BEGIN_CRITICAL_SECTION(loop);
+    scheduled = loop->flush_loop == aio;
+    if (!scheduled) {
+        PyObject *flush = PyObject_GetAttr((PyObject *)loop, str_flush);
+        PyObject *handle = flush != NULL ? PyObject_CallMethodObjArgs(aio, str_call_soon, flush, NULL) : NULL;
+        Py_XDECREF(flush);
+        if (handle != NULL) {
+            Py_DECREF(handle);
+            Py_INCREF(aio);
+            Py_XSETREF(loop->flush_loop, aio);
+            scheduled = true;
+        } else {
+            PyErr_Clear();
+        }
+    }
+    Py_END_CRITICAL_SECTION();
+    Py_DECREF(aio);
+    return scheduled;
+}
+
 static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) {
     PyObject *future, *headers, *auth, *cookies;
     const char *method, *url;
@@ -2633,7 +2679,9 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     bool was_empty = inbox_empty(loop);
     push(&loop->incoming, &loop->incoming_tail, r);
     pthread_mutex_unlock(&loop->lock);
-    if (was_empty) {
+    bool idle = was_empty && atomic_load_explicit(&loop->stats.running, memory_order_relaxed) == 0 &&
+                atomic_load_explicit(&loop->stats.queued, memory_order_relaxed) == 0;
+    if (idle || (!schedule_flush(loop, future) && was_empty)) {
         poke(loop->wake[1]);
     }
     return capsule != NULL ? Py_BuildValue("(NN)", handle, capsule) : handle;
@@ -3153,7 +3201,11 @@ static PyMethodDef module_methods[] = {
 static struct PyModuleDef hx_module = {PyModuleDef_HEAD_INIT, "httpperf._httpperf_hx", NULL, -1, module_methods};
 
 PyMODINIT_FUNC PyInit__httpperf_hx(void) {
-    if (PyType_Ready(&EventLoopType) < 0 || PyType_Ready(&SessionType) < 0 || PyType_Ready(&ResponseType) < 0) {
+    str_get_loop = PyUnicode_InternFromString("get_loop");
+    str_call_soon = PyUnicode_InternFromString("call_soon");
+    str_flush = PyUnicode_InternFromString("_flush");
+    if (str_get_loop == NULL || str_call_soon == NULL || str_flush == NULL || PyType_Ready(&EventLoopType) < 0 ||
+        PyType_Ready(&SessionType) < 0 || PyType_Ready(&ResponseType) < 0) {
         return NULL;
     }
     PyObject *m = PyModule_Create(&hx_module);

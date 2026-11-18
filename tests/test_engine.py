@@ -183,6 +183,24 @@ def test_responses_for_a_closed_loop_do_not_stop_responses_for_the_new_one(two_l
     assert second.run_until_complete(new_request()).status_code == 200
 
 
+def test_requests_on_a_new_loop_go_out_when_the_old_loop_stopped_mid_batch(two_loops, server):
+    first, second = two_loops
+    first.set_exception_handler(lambda loop, context: None)
+    session = httpperf.Session(engine=httpperf.Engine())
+
+    async def submit_and_stop():
+        [asyncio.ensure_future(session.get(server.url)) for _ in range(20)]
+        await asyncio.sleep(0)
+        asyncio.get_running_loop().stop()
+        await asyncio.Event().wait()
+
+    with pytest.raises(RuntimeError):
+        first.run_until_complete(submit_and_stop())
+    first.close()
+    response = second.run_until_complete(asyncio.wait_for(session.get(server.url), 5))
+    assert response.status_code == 200
+
+
 def test_a_closed_engine_refuses_requests():
     engine = httpperf.Engine()
     session = httpperf.Session(engine=engine)
