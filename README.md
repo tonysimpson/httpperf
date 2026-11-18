@@ -26,10 +26,10 @@ pip install httpperf
 
 Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15 and free-threaded 3.14 and 3.15 (`python3.14t`, `python3.15t`), with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 and HTTP/3.
 
-Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs its development headers and a C compiler. That libcurl decides whether HTTP/3 is available: `curl -V` lists `HTTP3` under Features when it does.
+Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs a C compiler and the development headers for libcurl, OpenSSL, nghttp2 and zlib. That libcurl decides whether HTTP/3 is available: `curl -V` lists `HTTP3` under Features when it does.
 
 ```sh
-sudo apt install libcurl4-openssl-dev   # Debian/Ubuntu
+sudo apt install libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev   # Debian/Ubuntu
 pip install httpperf
 ```
 
@@ -40,6 +40,18 @@ CFLAGS=-I$PREFIX/include LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib" pip inst
 ```
 
 A session with `http_version="HTTP/3"` raises `ValueError` if the libcurl in use lacks HTTP/3.
+
+### The experimental hx backend
+
+httpperf also includes a second backend, hx, a new HTTP client written for httpperf to replace libcurl in time. It has the same API. To use it, set `HTTPPERF_BACKEND=hx` before httpperf is imported:
+
+```sh
+HTTPPERF_BACKEND=hx python my_load_test.py
+```
+
+hx is experimental. It passes httpperf's test suite, but it is young and has not been tested in the field the way libcurl has over decades, so expect bugs. Use the default, `HTTPPERF_BACKEND=curl`, for results you depend on. If the two backends behave differently, please report it.
+
+hx supports HTTP/1.1, HTTP/2 and HTTP/3, the last only in the wheels or when built against ngtcp2 for AWS-LC or BoringSSL. Elsewhere `http_version="HTTP/3"` raises `ValueError` on hx.
 
 ## Quick start
 
