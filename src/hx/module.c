@@ -61,7 +61,8 @@ typedef struct Slot {
     long active;
     long waiting;
     Request *head, *tail;
-    struct Slot *next;
+    struct Slot *next, *prev;
+    int64_t last_used;
     struct Slot *ready_prev, *ready_next;
     bool ready;
 } Slot;
@@ -83,7 +84,7 @@ typedef struct Limiter {
     pthread_mutex_t lock;
     long max_host, max_total;
     long connections;
-    Slot *slots;
+    Slot *slots, *slots_tail;
     Slot *ready_head, *ready_tail;
     bool dispatching;
     bool pending;
@@ -810,22 +811,70 @@ static void limiter_decref(Limiter *l) {
     free(l);
 }
 
+static _Atomic int64_t host_idle_ns = 60 * 1000000000LL;
+
+static void slot_unlink(Limiter *l, Slot *h) {
+    if (h->prev != NULL) {
+        h->prev->next = h->next;
+    } else {
+        l->slots = h->next;
+    }
+    if (h->next != NULL) {
+        h->next->prev = h->prev;
+    } else {
+        l->slots_tail = h->prev;
+    }
+    h->prev = h->next = NULL;
+}
+
+static void slot_push_front(Limiter *l, Slot *h) {
+    h->next = l->slots;
+    if (l->slots != NULL) {
+        l->slots->prev = h;
+    } else {
+        l->slots_tail = h;
+    }
+    l->slots = h;
+}
+
+static void slot_prune(Limiter *l, int64_t t) {
+    for (int i = 0; i < 2; i++) {
+        Slot *h = l->slots_tail;
+        if (h == NULL || h->active > 0 || h->waiting > 0 || t - h->last_used <= host_idle_ns) {
+            return;
+        }
+        pthread_mutex_lock(&l->lock);
+        slot_unlink(l, h);
+        pthread_mutex_unlock(&l->lock);
+        free(h);
+    }
+}
+
 static Slot *slot_for(Limiter *l, const Request *r) {
     char key[300];
     host_key(r, key, sizeof(key));
-    for (Slot *h = l->slots; h != NULL; h = h->next) {
-        if (strcmp(h->key, key) == 0) {
-            return h;
-        }
+    int64_t t = clock_ns();
+    slot_prune(l, t);
+    Slot *h = l->slots;
+    while (h != NULL && strcmp(h->key, key) != 0) {
+        h = h->next;
     }
-    Slot *h = calloc(1, sizeof(Slot));
-    if (h != NULL) {
+    if (h == NULL) {
+        h = calloc(1, sizeof(Slot));
+        if (h == NULL) {
+            return NULL;
+        }
         memcpy(h->key, key, sizeof(key));
         pthread_mutex_lock(&l->lock);
-        h->next = l->slots;
-        l->slots = h;
+        slot_push_front(l, h);
+        pthread_mutex_unlock(&l->lock);
+    } else if (h != l->slots) {
+        pthread_mutex_lock(&l->lock);
+        slot_unlink(l, h);
+        slot_push_front(l, h);
         pthread_mutex_unlock(&l->lock);
     }
+    h->last_used = t;
     return h;
 }
 
@@ -2670,6 +2719,15 @@ static PyObject *module_upload_wait(PyObject *module, PyObject *args) {
     return PyBool_FromLong(wait);
 }
 
+static PyObject *module_set_host_idle_seconds(PyObject *self, PyObject *arg) {
+    double seconds = PyFloat_AsDouble(arg);
+    if (seconds == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    host_idle_ns = (int64_t)(seconds * 1e9);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"default_ca_file", module_default_ca_file, METH_NOARGS, "The built-in CA bundle path, or None"},
     {"parse_headers", module_parse_headers, METH_O, "The (name, value) pairs of the final header block"},
@@ -2677,6 +2735,7 @@ static PyMethodDef module_methods[] = {
      "Copy what fits of the bytes into an upload; None once it's over"},
     {"upload_finish", module_upload_finish, METH_O, "Mark the end of an upload's body"},
     {"upload_wait", module_upload_wait, METH_VARARGS, "Resolve the future when an upload has room"},
+    {"_set_host_idle_seconds", module_set_host_idle_seconds, METH_O, "How long idle host records are kept, for tests"},
     {NULL}};
 
 static struct PyModuleDef hx_module = {PyModuleDef_HEAD_INIT, "httpperf._httpperf_hx", NULL, -1, module_methods};
