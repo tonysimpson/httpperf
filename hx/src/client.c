@@ -971,13 +971,13 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
 
 static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
     hx_request plain;
-    if (r->h2 && (r->upgrade || !r->tls)) {
+    if (r->http != HX_HTTP1 && (r->upgrade || !r->tls)) {
         plain = *r;
-        plain.h2 = false;
+        plain.http = HX_HTTP1;
         r = &plain;
     }
-    q->h3_offer = r->h3 && r->tls && !r->upgrade && r->proxy_host == NULL && hx_h3_available();
-    q->h2_offer = r->h2 && !q->h3_offer;
+    q->h3_offer = r->http == HX_HTTP3 && r->proxy_host == NULL && hx_h3_available();
+    q->h2_offer = r->http != HX_HTTP1 && !q->h3_offer;
     q->stream_id = -1;
     q->head = strcmp(r->method, "HEAD") == 0;
     q->decode = r->decode;

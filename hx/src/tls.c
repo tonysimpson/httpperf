@@ -20,7 +20,7 @@ static bool same(const char *a, const char *b) { return a == b || (a != NULL && 
 static char *dup_or_null(const char *s) { return s != NULL ? strdup(s) : NULL; }
 
 static bool matches(const hx_tls_ctx *x, const hx_request *r) {
-    return x->verify == r->verify && x->h2 == r->h2 && x->h3 == r->h3 && same(x->ca_file, r->ca_file) &&
+    return x->verify == r->verify && x->http == r->http && same(x->ca_file, r->ca_file) &&
            same(x->ca_path, r->ca_path) && same(x->cert_file, r->cert_file) && same(x->key_file, r->key_file) &&
            (x->ca_pem != NULL) == (r->ca_pem != NULL) &&
            (r->ca_pem == NULL || (x->ca_pem_len == r->ca_pem_len && memcmp(x->ca_pem, r->ca_pem, r->ca_pem_len) == 0));
@@ -64,7 +64,7 @@ static SSL_CTX *make_ctx(const hx_request *r, bool quic, hx_error *error) {
         SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
         SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
         SSL_CTX_sess_set_new_cb(ctx, hx_tls_on_session);
-        if (r->h2) {
+        if (r->http != HX_HTTP1) {
             SSL_CTX_set_alpn_protos(ctx, both, sizeof(both) - 1);
         } else {
             SSL_CTX_set_alpn_protos(ctx, h1, sizeof(h1) - 1);
@@ -112,7 +112,7 @@ hx_tls_ctx *hx_tls_ctx_for(hx_tls *t, const hx_request *r, hx_error *error) {
         return NULL;
     }
     x->ctx = make_ctx(r, false, error);
-    if (x->ctx != NULL && r->h3) {
+    if (x->ctx != NULL && r->http == HX_HTTP3) {
         x->quic = make_ctx(r, true, error);
         if (x->quic == NULL) {
             SSL_CTX_free(x->ctx);
@@ -120,8 +120,7 @@ hx_tls_ctx *hx_tls_ctx_for(hx_tls *t, const hx_request *r, hx_error *error) {
         }
     }
     x->verify = r->verify;
-    x->h2 = r->h2;
-    x->h3 = r->h3;
+    x->http = r->http;
     x->ca_file = dup_or_null(r->ca_file);
     x->ca_path = dup_or_null(r->ca_path);
     x->cert_file = dup_or_null(r->cert_file);

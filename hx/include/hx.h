@@ -24,6 +24,8 @@ typedef struct {
     int64_t dns_ttl_ns;
 } hx_config;
 
+typedef enum { HX_HTTP1 = 0, HX_HTTP2, HX_HTTP3 } hx_http;
+
 typedef struct {
     const char *method;
     const char *host;
@@ -53,8 +55,7 @@ typedef struct {
     const char *cert_file;
     const char *key_file;
     uint64_t tls_cache;
-    bool h2;
-    bool h3;
+    hx_http http;
     bool upgrade;
     const char *proxy_host;
     uint16_t proxy_port;

@@ -13,8 +13,7 @@ typedef struct hx_tls_ctx {
     SSL_CTX *quic;
     uint64_t id;
     bool verify;
-    bool h2;
-    bool h3;
+    hx_http http;
     char *ca_file, *ca_path, *ca_pem, *cert_file, *key_file;
     size_t ca_pem_len;
     struct hx_tls_ctx *next;

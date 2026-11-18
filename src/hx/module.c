@@ -198,8 +198,7 @@ struct Request {
     char *ca_file, *ca_path, *ca_pem, *cert_file, *key_file;
     size_t ca_pem_len;
     uint64_t tls_cache;
-    bool h2;
-    bool h3;
+    hx_http http;
     bool websocket, ws_open, ws_bad;
     hx_ws_writer ws_out;
     hx_ws_reader ws_in;
@@ -249,8 +248,7 @@ struct Session {
     Proxy proxy, https_proxy;
     char *no_proxy;
     uint64_t tls_cache;
-    bool h2;
-    bool h3;
+    hx_http http;
     Stats stats;
 };
 
@@ -1267,8 +1265,7 @@ static void begin_request(EventLoop *loop, Request *r) {
         .cert_file = r->cert_file,
         .key_file = r->key_file,
         .tls_cache = r->tls_cache,
-        .h2 = r->h2,
-        .h3 = r->h3,
+        .http = r->http,
     };
     stats_add(loop, r, stat_running, 1);
     r->hx = hx_request_start(loop->client, &q, r);
@@ -2045,8 +2042,9 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;
     self->tls_cache = strcmp(tls, "session") == 0 ? atomic_fetch_add(&tls_caches, 1) + 1 : 0;
-    self->h2 = strcmp(http_version, "HTTP/1.1") != 0;
-    self->h3 = strcmp(http_version, "HTTP/3") == 0;
+    self->http = strcmp(http_version, "HTTP/3") == 0   ? HX_HTTP3
+                 : strcmp(http_version, "HTTP/2") == 0 ? HX_HTTP2
+                                                       : HX_HTTP1;
     pthread_mutex_init(&self->jar_lock, NULL);
     self->jar = hx_jar_new();
     if (self->jar == NULL || read_proxy(self) == -1) {
@@ -2619,8 +2617,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     }
     r->loop = loop;
     r->tls_cache = self->tls_cache;
-    r->h2 = self->h2;
-    r->h3 = self->h3;
+    r->http = self->http;
     r->send_cookies = !has_cookie;
     r->path = copy(r->target, strcspn(r->target, "?#"));
     int proxy = r->path != NULL ? use_proxy(self, r) : -1;

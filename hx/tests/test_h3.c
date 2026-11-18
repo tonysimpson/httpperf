@@ -132,7 +132,7 @@ static hx_request get(const char *target) {
                         .tls = true,
                         .verify = true,
                         .ca_file = CERT,
-                        .h3 = true};
+                        .http = HX_HTTP3};
 }
 
 static outcome fetch(hx_client *c, hx_request r) {
