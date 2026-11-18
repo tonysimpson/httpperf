@@ -1046,6 +1046,9 @@ static void body_written(struct hx_req *q) {
 
 static void drop_sent(struct hx_req *q) {
     q->held_dropped = true;
+    if (q->held_off == 0) {
+        return;
+    }
     memmove(q->held.data, q->held.data + q->held_off, q->held.len - q->held_off);
     q->held.len -= q->held_off;
     q->held_off = 0;
