@@ -1,2 +1,0 @@
-# Tests the hx backend doesn't pass yet, skipped when HTTPPERF_BACKEND=hx.
-# HTTPPERF_HX_ALL=1 runs them anyway; remove a line once its test passes.

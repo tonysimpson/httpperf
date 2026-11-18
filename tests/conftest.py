@@ -1,8 +1,6 @@
 import asyncio
 import http.server
 import inspect
-import os
-import re
 import select
 import socket
 import sys
@@ -12,7 +10,6 @@ import pytest
 from helpers import BIG
 
 import httpperf
-from httpperf import _backend
 
 
 class TestHTTPServer(http.server.ThreadingHTTPServer):
@@ -191,18 +188,6 @@ def s():
     session = httpperf.Session()
     yield session
     session.close()
-
-
-def pytest_collection_modifyitems(config, items):
-    if _backend.name == "curl" or os.environ.get("HTTPPERF_HX_ALL"):
-        return
-    with open(os.path.join(os.path.dirname(__file__), "hx_todo.txt")) as f:
-        todo = {line.strip() for line in f if line.strip() and not line.startswith("#")}
-    patterns = [re.compile(".*".join(map(re.escape, t.split("*")))) for t in todo if "*" in t]
-    skip = pytest.mark.skip(reason="not on the hx backend yet")
-    for item in items:
-        if item.nodeid in todo or any(p.fullmatch(item.nodeid) for p in patterns):
-            item.add_marker(skip)
 
 
 @pytest.hookimpl(tryfirst=True)
