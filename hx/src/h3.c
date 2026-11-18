@@ -21,6 +21,22 @@
 #include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #endif
 
+#if NGTCP2_VERSION_NUM >= 0x011700
+#define conn_expiry ngtcp2_conn_get_expiry2
+#define conn_streams_left ngtcp2_conn_get_streams_bidi_left2
+#define conn_closing ngtcp2_conn_in_closing_period2
+#define conn_draining ngtcp2_conn_in_draining_period2
+typedef ngtcp2_stateless_reset_token reset_token;
+#define TOKEN_DATA(t) ((t)->data)
+#else
+#define conn_expiry ngtcp2_conn_get_expiry
+#define conn_streams_left ngtcp2_conn_get_streams_bidi_left
+#define conn_closing ngtcp2_conn_in_closing_period
+#define conn_draining ngtcp2_conn_in_draining_period
+typedef uint8_t reset_token;
+#define TOKEN_DATA(t) (t)
+#endif
+
 #define PACKET_CAP 65536
 
 typedef struct block {
@@ -72,8 +88,8 @@ static void rand_cb(uint8_t *dest, size_t len, const ngtcp2_rand_ctx *ctx) {
     }
 }
 
-static int new_cid(ngtcp2_conn *conn, ngtcp2_cid *cid, ngtcp2_stateless_reset_token *token, size_t len, void *user) {
-    if (RAND_bytes(cid->data, (int)len) != 1 || RAND_bytes(token->data, sizeof(token->data)) != 1) {
+static int new_cid(ngtcp2_conn *conn, ngtcp2_cid *cid, reset_token *token, size_t len, void *user) {
+    if (RAND_bytes(cid->data, (int)len) != 1 || RAND_bytes(TOKEN_DATA(token), NGTCP2_STATELESS_RESET_TOKENLEN) != 1) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     cid->datalen = len;
@@ -303,8 +319,13 @@ static const ngtcp2_callbacks quic_callbacks = {
     .stream_stop_sending = on_quic_stop_sending,
     .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
     .recv_rx_key = on_rx_key,
+#if NGTCP2_VERSION_NUM >= 0x011700
     .get_new_connection_id2 = new_cid,
     .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
+#else
+    .get_new_connection_id = new_cid,
+    .get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb,
+#endif
 };
 
 bool hx_h3_available(void) { return true; }
@@ -493,7 +514,7 @@ int hx_h3_write(hx_h3 *h, int64_t now, int *sys_errno) {
 }
 
 int64_t hx_h3_expiry(const hx_h3 *h) {
-    ngtcp2_tstamp t = ngtcp2_conn_get_expiry2(h->conn);
+    ngtcp2_tstamp t = conn_expiry(h->conn);
     return t == UINT64_MAX || t > INT64_MAX ? 0 : (int64_t)t;
 }
 
@@ -507,8 +528,16 @@ bool hx_h3_ready(const hx_h3 *h) { return h->ready && h->h3 != NULL; }
 bool hx_h3_goaway(const hx_h3 *h) { return h->goaway; }
 
 bool hx_h3_can_open(const hx_h3 *h) {
-    return hx_h3_ready(h) && !h->goaway && ngtcp2_conn_get_streams_bidi_left2(h->conn) > 0 &&
-           !ngtcp2_conn_in_closing_period2(h->conn) && !ngtcp2_conn_in_draining_period2(h->conn);
+    return hx_h3_ready(h) && !h->goaway && conn_streams_left(h->conn) > 0 && !conn_closing(h->conn) &&
+           !conn_draining(h->conn);
+}
+
+static h3s *find_stream(hx_h3 *h, int64_t id) {
+    h3s *s = h->streams;
+    while (s != NULL && s->id != id) {
+        s = s->next;
+    }
+    return s;
 }
 
 static nghttp3_ssize read_body(nghttp3_conn *conn, int64_t id, nghttp3_vec *vec, size_t veccnt, uint32_t *pflags,
@@ -579,7 +608,7 @@ int64_t hx_h3_open(hx_h3 *h, const nghttp2_nv *nva, size_t n, bool body, void *s
 }
 
 int hx_h3_send(hx_h3 *h, int64_t id, const char *data, size_t len, bool end) {
-    h3s *s = nghttp3_conn_get_stream_user_data(h->h3, id);
+    h3s *s = find_stream(h, id);
     if (s == NULL || s->end) {
         return -1;
     }
@@ -615,7 +644,7 @@ void hx_h3_consume(hx_h3 *h, int64_t id, size_t n) { extend(h, id, n); }
 void hx_h3_reset(hx_h3 *h, int64_t id) { ngtcp2_conn_shutdown_stream(h->conn, 0, id, NGHTTP3_H3_INTERNAL_ERROR); }
 
 void hx_h3_cancel(hx_h3 *h, int64_t id) {
-    h3s *s = h->h3 != NULL ? nghttp3_conn_get_stream_user_data(h->h3, id) : NULL;
+    h3s *s = find_stream(h, id);
     if (s != NULL) {
         s->user = NULL;
     }
@@ -625,7 +654,7 @@ void hx_h3_cancel(hx_h3 *h, int64_t id) {
 SSL *hx_h3_ssl(const hx_h3 *h) { return h->ssl; }
 
 void hx_h3_close(hx_h3 *h, int64_t now) {
-    if (ngtcp2_conn_in_closing_period2(h->conn) || ngtcp2_conn_in_draining_period2(h->conn)) {
+    if (conn_closing(h->conn) || conn_draining(h->conn)) {
         return;
     }
     ngtcp2_ccerr err;

@@ -303,7 +303,7 @@ static int setup_http(h3_conn *c) {
     if (c->http != NULL) {
         return 0;
     }
-    if (ngtcp2_conn_get_streams_uni_left2(c->quic) < 3) {
+    if (ngtcp2_conn_get_streams_uni_left(c->quic) < 3) {
         return -1;
     }
     nghttp3_callbacks callbacks = {
@@ -325,7 +325,7 @@ static int setup_http(h3_conn *c) {
     if (nghttp3_conn_server_new(&c->http, &callbacks, &settings, nghttp3_mem_default(), c) != 0) {
         return -1;
     }
-    const ngtcp2_transport_params *params = ngtcp2_conn_get_local_transport_params2(c->quic);
+    const ngtcp2_transport_params *params = ngtcp2_conn_get_local_transport_params(c->quic);
     nghttp3_conn_set_max_client_streams_bidi(c->http, params->initial_max_streams_bidi);
     int64_t control, encoder, decoder;
     if (ngtcp2_conn_open_uni_stream(c->quic, &control, NULL) != 0 ||
@@ -368,20 +368,16 @@ static int on_acked_stream_data_offset(ngtcp2_conn *quic, int64_t id, uint64_t o
     return 0;
 }
 
-static int on_stream_close(ngtcp2_conn *quic, uint32_t flags, int64_t id, uint64_t rx_code, uint64_t tx_code,
-                           void *user, void *stream_user) {
+static int on_stream_close(ngtcp2_conn *quic, uint32_t flags, int64_t id, uint64_t code, void *user,
+                           void *stream_user) {
     h3_conn *c = user;
     if (c->http == NULL) {
         return 0;
     }
-    uint32_t http_flags = NGHTTP3_STREAM_CLOSE_FLAG_NONE;
-    if (flags & NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET) {
-        http_flags |= NGHTTP3_STREAM_CLOSE_FLAG_RX_APP_ERROR_CODE_SET;
+    if (!(flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET)) {
+        code = NGHTTP3_H3_NO_ERROR;
     }
-    if (flags & NGTCP2_STREAM_CLOSE2_FLAG_TX_APP_ERROR_CODE_SET) {
-        http_flags |= NGHTTP3_STREAM_CLOSE_FLAG_TX_APP_ERROR_CODE_SET;
-    }
-    int rv = nghttp3_conn_close_stream2(c->http, http_flags, id, rx_code, tx_code);
+    int rv = nghttp3_conn_close_stream(c->http, id, code);
     if (rv != 0 && rv != NGHTTP3_ERR_STREAM_NOT_FOUND) {
         ngtcp2_ccerr_set_application_error(&c->error, nghttp3_err_infer_quic_app_error_code(rv), NULL, 0);
         return NGTCP2_ERR_CALLBACK_FAILURE;
@@ -427,13 +423,12 @@ static int on_recv_tx_key(ngtcp2_conn *quic, ngtcp2_encryption_level level, void
 
 static void quic_rand(uint8_t *dest, size_t len, const ngtcp2_rand_ctx *ctx) { RAND_bytes(dest, len); }
 
-static int on_get_new_connection_id(ngtcp2_conn *quic, ngtcp2_cid *cid, ngtcp2_stateless_reset_token *token, size_t len,
-                                    void *user) {
+static int on_get_new_connection_id(ngtcp2_conn *quic, ngtcp2_cid *cid, uint8_t *token, size_t len, void *user) {
     if (RAND_bytes(cid->data, len) != 1) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     cid->datalen = len;
-    if (ngtcp2_crypto_generate_stateless_reset_token(token->data, srv.secret, sizeof(srv.secret), cid) != 0) {
+    if (ngtcp2_crypto_generate_stateless_reset_token(token, srv.secret, sizeof(srv.secret), cid) != 0) {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     associate(cid, user);
@@ -467,9 +462,9 @@ static const ngtcp2_callbacks quic_callbacks = {
     .stream_stop_sending = on_stream_stop_sending,
     .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
     .recv_tx_key = on_recv_tx_key,
-    .get_new_connection_id2 = on_get_new_connection_id,
-    .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
-    .stream_close2 = on_stream_close,
+    .get_new_connection_id = on_get_new_connection_id,
+    .get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb,
+    .stream_close = on_stream_close,
 };
 
 static ngtcp2_path path_to(struct sockaddr_storage *peer, socklen_t peer_len) {
@@ -533,8 +528,8 @@ static void start_closing(h3_conn *c, ngtcp2_tstamp ts) {
     if (c->close_deadline != 0 || c->dead) {
         return;
     }
-    c->close_deadline = ts + 3 * ngtcp2_conn_get_pto2(c->quic);
-    if (ngtcp2_conn_in_draining_period2(c->quic)) {
+    c->close_deadline = ts + 3 * ngtcp2_conn_get_pto(c->quic);
+    if (ngtcp2_conn_in_draining_period(c->quic)) {
         return;
     }
     ngtcp2_path_storage ps;
@@ -561,7 +556,7 @@ static void fail(h3_conn *c, int rv, ngtcp2_tstamp ts) {
     }
     if (c->error.error_code == 0) {
         if (rv == NGTCP2_ERR_CRYPTO) {
-            ngtcp2_ccerr_set_tls_alert(&c->error, ngtcp2_conn_get_tls_alert2(c->quic), NULL, 0);
+            ngtcp2_ccerr_set_tls_alert(&c->error, ngtcp2_conn_get_tls_alert(c->quic), NULL, 0);
         } else {
             ngtcp2_ccerr_set_liberr(&c->error, rv, NULL, 0);
         }
@@ -578,7 +573,7 @@ static int write_packets(h3_conn *c, ngtcp2_tstamp ts) {
         int fin = 0;
         nghttp3_vec vec[16];
         nghttp3_ssize count = 0;
-        if (c->http != NULL && ngtcp2_conn_get_max_data_left2(c->quic) > 0) {
+        if (c->http != NULL && ngtcp2_conn_get_max_data_left(c->quic) > 0) {
             count = nghttp3_conn_writev_stream(c->http, &id, &fin, vec, 16);
             if (count < 0) {
                 ngtcp2_ccerr_set_application_error(&c->error, nghttp3_err_infer_quic_app_error_code((int)count), NULL,
@@ -649,7 +644,7 @@ static void service(h3_conn *c, ngtcp2_tstamp ts) {
         return;
     }
     int rv = 0;
-    if (ngtcp2_conn_get_expiry2(c->quic) <= ts) {
+    if (ngtcp2_conn_get_expiry(c->quic) <= ts) {
         rv = ngtcp2_conn_handle_expiry(c->quic, ts);
     }
     if (rv == 0 && c->http != NULL) {
@@ -726,7 +721,7 @@ static int next_timeout_ms(void) {
     ngtcp2_tstamp ts = now();
     ngtcp2_tstamp next = ts + NGTCP2_SECONDS;
     for (h3_conn *c = srv.conns; c != NULL; c = c->next) {
-        ngtcp2_tstamp when = c->close_deadline != 0 ? c->close_deadline : ngtcp2_conn_get_expiry2(c->quic);
+        ngtcp2_tstamp when = c->close_deadline != 0 ? c->close_deadline : ngtcp2_conn_get_expiry(c->quic);
         if (when < next) {
             next = when;
         }
