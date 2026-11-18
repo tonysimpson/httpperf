@@ -756,8 +756,8 @@ static conn *conn_open(hx_client *c, struct hx_req *q, const struct addrinfo *ai
     k->may_h2 = q->h2_offer;
     k->h3 = q->h3_offer;
     if (q->tls != NULL) {
-        snprintf(k->session_key, sizeof(k->session_key), "%llu/%s:%u/%llu", (unsigned long long)q->tls_cache, q->host,
-                 q->port, (unsigned long long)q->tls->id);
+        snprintf(k->session_key, sizeof(k->session_key), "%llu/%s:%u/%llu%s", (unsigned long long)q->tls_cache, q->host,
+                 q->port, (unsigned long long)q->tls->id, q->h3_offer ? "/h3" : "");
     }
     hx_h1_init(&k->h1, false);
     if (connect_next(k) == -1) {
@@ -1252,7 +1252,7 @@ void hx_request_cancel(hx_req *q) {
 }
 
 int hx_tls_on_session(SSL *ssl, SSL_SESSION *session) {
-    conn *k = SSL_get_app_data(ssl);
+    conn *k = hx_tls_conn(ssl);
     if (k == NULL || k->state == CONN_CLOSED) {
         return 0;
     }
@@ -2037,7 +2037,7 @@ static const hx_h3_handler h3_handler = {h3_on_header, h3_on_headers_done, h3_on
 
 static void h3_begin(conn *k) {
     struct hx_req *q = k->req;
-    SSL *ssl = hx_tls_new_quic(k->tls, q->host);
+    SSL *ssl = hx_tls_new_quic(&k->client->tls, k->tls, q->host, k->session_key, k);
     k->quic = ssl != NULL ? hx_h3_new(k->fd, ssl, &h3_handler, k, now(k->client), q->connect_timeout) : NULL;
     if (k->quic == NULL) {
         SSL_free(ssl);

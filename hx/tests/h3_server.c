@@ -182,6 +182,8 @@ static int respond(h3_stream *s) {
     } else if (strcmp(s->path, "/count") == 0) {
         snprintf(s->text, sizeof(s->text), "%zu", s->received);
         s->body = s->text;
+    } else if (strcmp(s->path, "/resumed") == 0) {
+        s->body = SSL_session_reused(s->owner->ssl) ? "1" : "0";
     } else {
         status = "404";
         s->body = "not found";

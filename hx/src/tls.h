@@ -35,7 +35,8 @@ typedef struct {
 
 hx_tls_ctx *hx_tls_ctx_for(hx_tls *t, const hx_request *r, hx_error *error);
 SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn);
-SSL *hx_tls_new_quic(hx_tls_ctx *x, const char *host);
+SSL *hx_tls_new_quic(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn);
+void *hx_tls_conn(const SSL *ssl);
 void hx_tls_save(hx_tls *t, const char *key, SSL_SESSION *s);
 void hx_tls_free(hx_tls *t);
 

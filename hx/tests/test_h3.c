@@ -224,6 +224,34 @@ static void test_a_body_bigger_than_the_read_buffer_arrives_whole(void) {
     finish_client(c);
 }
 
+static void test_a_new_connection_resumes_the_tls_session(void) {
+    hx_client *c = client(0);
+    fetch(c, get("/"));
+    hx_request r = get("/resumed");
+    r.fresh_connection = true;
+    outcome o = fetch(c, r);
+    CHECK(o.last.error == HX_OK && !o.last.reused && o.body_len == 1 && o.body[0] == '1');
+    finish_client(c);
+}
+
+static void test_the_first_connection_does_not_resume(void) {
+    hx_client *c = client(0);
+    outcome o = fetch(c, get("/resumed"));
+    CHECK(o.last.error == HX_OK && o.body_len == 1 && o.body[0] == '0');
+    finish_client(c);
+}
+
+static void test_another_tls_cache_does_not_resume(void) {
+    hx_client *c = client(0);
+    fetch(c, get("/"));
+    hx_request r = get("/resumed");
+    r.fresh_connection = true;
+    r.tls_cache = 1;
+    outcome o = fetch(c, r);
+    CHECK(o.last.error == HX_OK && o.body_len == 1 && o.body[0] == '0');
+    finish_client(c);
+}
+
 static void test_a_slow_response_still_arrives(void) {
     hx_client *c = client(0);
     outcome o = fetch(c, get("/slow"));
@@ -354,6 +382,9 @@ int main(void) {
     test_refused_requests_retry_together_on_one_new_connection();
     test_the_next_request_reuses_the_connection();
     test_a_body_bigger_than_the_read_buffer_arrives_whole();
+    test_a_new_connection_resumes_the_tls_session();
+    test_the_first_connection_does_not_resume();
+    test_another_tls_cache_does_not_resume();
     test_a_slow_response_still_arrives();
     test_cancelling_one_stream_leaves_the_others();
     test_freeing_the_client_during_the_handshake_is_safe();

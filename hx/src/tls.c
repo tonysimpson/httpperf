@@ -6,6 +6,7 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,8 @@ static SSL_CTX *make_ctx(const hx_request *r, bool quic, hx_error *error) {
     static const unsigned char h1[] = "\x08http/1.1", both[] = "\x02h2\x08http/1.1", h3[] = "\x02h3";
     if (quic) {
         SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+        SSL_CTX_sess_set_new_cb(ctx, hx_tls_on_session);
         SSL_CTX_set_alpn_protos(ctx, h3, sizeof(h3) - 1);
         if (hx_h3_configure(ctx) != 0) {
             SSL_CTX_free(ctx);
@@ -168,14 +171,20 @@ static SSL *new_ssl(SSL_CTX *ctx, const hx_tls_ctx *x, const char *host) {
     return ssl;
 }
 
-SSL *hx_tls_new_quic(hx_tls_ctx *x, const char *host) { return x->quic != NULL ? new_ssl(x->quic, x, host) : NULL; }
+static int conn_index = -1;
+static pthread_once_t conn_once = PTHREAD_ONCE_INIT;
 
-SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn) {
-    SSL *ssl = new_ssl(x->ctx, x, host);
+static void make_conn_index(void) { conn_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL); }
+
+void *hx_tls_conn(const SSL *ssl) { return conn_index >= 0 ? SSL_get_ex_data(ssl, conn_index) : NULL; }
+
+static SSL *resuming(hx_tls *t, SSL_CTX *ctx, hx_tls_ctx *x, const char *host, const char *session_key, void *conn) {
+    pthread_once(&conn_once, make_conn_index);
+    SSL *ssl = conn_index >= 0 ? new_ssl(ctx, x, host) : NULL;
     if (ssl == NULL) {
         return NULL;
     }
-    SSL_set_app_data(ssl, conn);
+    SSL_set_ex_data(ssl, conn_index, conn);
     for (hx_tls_session *s = t->sessions; s != NULL; s = s->next) {
         if (strcmp(s->key, session_key) == 0) {
             SSL_set_session(ssl, s->session);
@@ -183,6 +192,14 @@ SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_
         }
     }
     return ssl;
+}
+
+SSL *hx_tls_new(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn) {
+    return resuming(t, x->ctx, x, host, session_key, conn);
+}
+
+SSL *hx_tls_new_quic(hx_tls *t, hx_tls_ctx *x, const char *host, const char *session_key, void *conn) {
+    return x->quic != NULL ? resuming(t, x->quic, x, host, session_key, conn) : NULL;
 }
 
 void hx_tls_save(hx_tls *t, const char *key, SSL_SESSION *session) {
