@@ -409,6 +409,8 @@ make distclean          # also remove .venv
 
 Each target first creates `.venv` with uv, if needed, and installs httpperf in editable mode with the dev tools. It reinstalls when `setup.py`, `pyproject.toml` or the C sources change, so C edits are rebuilt automatically. `make venv` does only that step.
 
+Both backends build against the same libraries the wheels bundle: AWS-LC, nghttp2, nghttp3, ngtcp2 and libcurl, which the first `make` builds into `.deps` with `tools/build-libcurl.sh` (a few minutes; it needs cmake, a C++ compiler and zlib's headers). They're rebuilt only when that script changes. `DEPS=` builds against the system's libraries instead, as CI does.
+
 There are two backends, each its own extension module with the same API: `_httpperf` on curl, the default, and `_httpperf_hx` on [hx](hx/README.md), the start of a replacement for curl. So far hx does HTTP/1.1 over TCP or TLS and HTTP/2 over TLS, with streamed responses and uploads, WebSockets, cookies, connection limits, per-host stats and HTTP proxies from the environment. It has no HTTP/3 yet. `HTTPPERF_BACKEND=hx` picks it when httpperf is imported. `make test` runs the suite on both; on `hx`, the tests listed in `tests/hx_todo.txt` are skipped (`HTTPPERF_HX_ALL=1` runs them anyway). `make hx-test` runs hx's own C tests.
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.

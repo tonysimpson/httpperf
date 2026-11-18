@@ -1,8 +1,10 @@
 #!/bin/sh
-# Builds AWS-LC, nghttp2, nghttp3, ngtcp2 and libcurl into $PREFIX (default /usr/local) inside the cibuildwheel containers.
+# Builds AWS-LC, nghttp2, nghttp3, ngtcp2 and libcurl into $PREFIX (default /usr/local): in the cibuildwheel and CI
+# containers, and into .deps for local builds (see the Makefile). JOBS sets the parallel build jobs.
 set -eux
 
 PREFIX=${PREFIX:-/usr/local}
+JOBS=${JOBS:-$(nproc)}
 
 AWSLC_VERSION=5.12.0
 AWSLC_SHA256=52c7f98ffd296d267cc015ad4653d1ffae399db65b14421da4f5f7efc44becd2
@@ -17,7 +19,7 @@ CURL_SHA256=e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49
 
 if command -v apk >/dev/null; then
     apk add --no-cache zlib-dev xz patch
-else
+elif command -v dnf >/dev/null; then
     dnf install -y zlib-devel xz patch
 fi
 
@@ -38,25 +40,25 @@ cmake -S "aws-lc-$AWSLC_VERSION" -B aws-lc-build -DCMAKE_BUILD_TYPE=Release -DCM
     -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF -DBUILD_TOOL=OFF \
     -DDISABLE_GO=ON -DDISABLE_PERL=ON \
     -DENABLE_PRE_SONAME_BUILD=OFF -DENABLE_SYMBOL_VERSIONING=ON -DSYMBOL_VERSION_NAMESPACE=HTTPPERF
-cmake --build aws-lc-build -j"$(nproc)"
+cmake --build aws-lc-build -j"$JOBS"
 cmake --install aws-lc-build
 
 tar xf nghttp2.tar.xz
 (cd "nghttp2-$NGHTTP2_VERSION" &&
     ./configure --prefix="$PREFIX" --enable-lib-only --disable-static &&
-    make -j"$(nproc)" && make install)
+    make -j"$JOBS" && make install)
 
 tar xf nghttp3.tar.xz
 (cd "nghttp3-$NGHTTP3_VERSION" &&
     ./configure --prefix="$PREFIX" --enable-lib-only --disable-static &&
-    make -j"$(nproc)" && make install)
+    make -j"$JOBS" && make install)
 
 tar xf ngtcp2.tar.xz
 (cd "ngtcp2-$NGTCP2_VERSION" &&
     ./configure --prefix="$PREFIX" --enable-lib-only --disable-static --with-boringssl \
         CFLAGS="${CFLAGS:--g -O2} -fPIC" CXXFLAGS="${CXXFLAGS:--g -O2} -fPIC" \
         BORINGSSL_CFLAGS="-I$PREFIX/include" BORINGSSL_LIBS="-L$PREFIX/lib -lssl -lcrypto" &&
-    make -j"$(nproc)" && make install)
+    make -j"$JOBS" && make install)
 
 tar xf curl.tar.gz
 # Backport of curl commit e234f3789 ("ws: mask outgoing payload in chunks", 2026-10-22, curl/curl#23567):
@@ -167,9 +169,9 @@ PATCH
         --without-libpsl --without-libidn2 --without-brotli --without-zstd \
         --without-ca-bundle --without-ca-path \
         --disable-ldap --disable-docs &&
-    make -j"$(nproc)" && make install)
+    make -j"$JOBS" && make install)
 
-if [ -d /etc/ld.so.conf.d ]; then
+if [ -w /etc/ld.so.conf.d ]; then
     echo "$PREFIX/lib" > /etc/ld.so.conf.d/httpperf-curl.conf
     ldconfig
 fi

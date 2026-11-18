@@ -6,23 +6,38 @@ HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
+DEPS ?= .deps
+ifneq ($(DEPS),)
+DEPS_DIR := $(abspath $(DEPS))
+DEPS_BUILT := $(DEPS_DIR)/.built
+DEPS_CFLAGS := -I$(DEPS_DIR)/include
+DEPS_LDFLAGS := -L$(DEPS_DIR)/lib -Wl,-rpath,$(DEPS_DIR)/lib
+endif
 
-.PHONY: venv test hx-test ci-local lint lint-fix clean distclean release
+.PHONY: venv deps test hx-test ci-local lint lint-fix clean distclean release
 
 venv: $(INSTALLED)
 
-$(INSTALLED): setup.py pyproject.toml $(wildcard src/*.c src/*.h src/hx/*.c hx/src/*.[ch] hx/include/*.h src/ae/*.c src/ae/*.h) | $(UV)
+deps: $(DEPS_BUILT)
+
+$(DEPS_BUILT): tools/build-libcurl.sh
+	PREFIX=$(DEPS_DIR) sh tools/build-libcurl.sh
+	touch $@
+
+$(INSTALLED): setup.py pyproject.toml $(DEPS_BUILT) $(wildcard src/*.c src/*.h src/hx/*.c hx/src/*.[ch] hx/include/*.h src/ae/*.c src/ae/*.h) | $(UV)
 	test -x $(VENV)/bin/python || $(UV) venv -p $(PY_VERSION) $(VENV)
-	$(UV) pip install --python $(VENV)/bin/python $(GROUPS) --reinstall-package httpperf -e .
+	CFLAGS="$(DEPS_CFLAGS) $$CFLAGS" LDFLAGS="$(DEPS_LDFLAGS) $$LDFLAGS" \
+		$(UV) pip install --python $(VENV)/bin/python $(GROUPS) --reinstall-package httpperf -e .
 	touch $@
 
 .tools/bin/uv:
 	python3 -m venv .tools
 	.tools/bin/pip install uv
 
-HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -pthread
+HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -pthread \
+	$(DEPS_CFLAGS) $(DEPS_LDFLAGS)
 
-hx-test:
+hx-test: $(DEPS_BUILT)
 	mkdir -p build/hx
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h1
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_client

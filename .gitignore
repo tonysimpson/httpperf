@@ -13,6 +13,9 @@ wheels/
 *.so
 *.o
 
+# Locally built TLS, HTTP/2, HTTP/3 and curl libraries
+.deps/
+
 # Virtual environments
 .venv*/
 venv/

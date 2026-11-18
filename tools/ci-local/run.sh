@@ -18,11 +18,11 @@ if [ "${1:-}" = "--one" ]; then
         "$3" sh -c '
             set -e
             mkdir /work
-            tar -C /src --exclude="./.venv*" --exclude=./.tools --exclude=./.ci-local --exclude=./build \
+            tar -C /src --exclude="./.venv*" --exclude=./.tools --exclude=./.ci-local --exclude=./.deps --exclude=./build \
                 --exclude="*.so" --exclude=__pycache__ -cf - . | tar -C /work -xf -
             cd /work
-            make venv PY_VERSION=$PY_VERSION > /dev/null
-            if [ -n "$HX_TEST" ]; then CFLAGS= LDFLAGS= make hx-test > /tmp/hx-c.log 2>&1 || { cat /tmp/hx-c.log; exit 1; }; fi
+            make venv DEPS= PY_VERSION=$PY_VERSION > /dev/null
+            if [ -n "$HX_TEST" ]; then CFLAGS= LDFLAGS= make hx-test DEPS= > /tmp/hx-c.log 2>&1 || { cat /tmp/hx-c.log; exit 1; }; fi
             HTTPPERF_BACKEND=hx .venv/bin/python -m pytest -q -p no:cacheprovider $PYTEST_ARGS > /tmp/hx.log || { cat /tmp/hx.log; exit 1; }
             .venv/bin/python -m pytest -p no:cacheprovider $PYTEST_ARGS
         ' > "$LOGS/$2.log" 2>&1; then

@@ -39,7 +39,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: dnf install -y openssl
       - run: /opt/curl/bin/curl --version
-      - run: make test PY_VERSION=${{ matrix.python }}
+      - run: make test DEPS= PY_VERSION=${{ matrix.python }}
         env:
           CFLAGS: -I/opt/curl/include
           LDFLAGS: -L/opt/curl/lib -Wl,-rpath,/opt/curl/lib
@@ -51,8 +51,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev
-      - run: make test PY_VERSION=3.13
-      - run: make hx-test
+      - run: make test DEPS= PY_VERSION=3.13
+      - run: make hx-test DEPS=
 
   lint:
     runs-on: ubuntu-24.04
@@ -60,4 +60,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev
-      - run: make lint
+      - run: make lint DEPS=
