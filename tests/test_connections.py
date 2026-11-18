@@ -273,29 +273,26 @@ def proxy_environment(monkeypatch):
 DEAD_PROXY = "http://127.0.0.1:%d" % unused_port()
 
 
-async def went_through_dead_proxy(url):
+async def went_through(wire, url):
     async with httpperf.Session() as s:
-        try:
-            await s.get(url)
-        except httpperf.RequestError as e:
-            return DEAD_PROXY.rsplit(":", 1)[1] in str(e)
-    return False
+        await s.get(url)
+    return len(wire.requests) > 0
 
 
 @pytest.mark.parametrize(
     "environment, proxied",
     [
         ({}, False),
-        ({"http_proxy": DEAD_PROXY}, True),
-        ({"http_proxy": DEAD_PROXY, "NO_PROXY": "127.0.0.1"}, False),
-        ({"ALL_PROXY": DEAD_PROXY}, True),
-        ({"HTTP_PROXY": DEAD_PROXY}, False),
+        ({"http_proxy": "PROXY"}, True),
+        ({"http_proxy": "PROXY", "NO_PROXY": "127.0.0.1"}, False),
+        ({"ALL_PROXY": "PROXY"}, True),
+        ({"HTTP_PROXY": "PROXY"}, False),
     ],
 )
-async def test_proxy_environment(url, proxy_environment, environment, proxied):
+async def test_proxy_environment(url, wire, proxy_environment, environment, proxied):
     for name, value in environment.items():
-        proxy_environment.setenv(name, value)
-    assert await went_through_dead_proxy(url) == proxied
+        proxy_environment.setenv(name, value.replace("PROXY", wire.url))
+    assert await went_through(wire, url) == proxied
 
 
 async def test_a_session_keeps_the_proxy_environment_it_was_made_with(url, proxy_environment):
@@ -346,10 +343,10 @@ async def test_a_schemes_proxy_beats_all_proxy(proxy_environment, scheme):
 
 
 @pytest.mark.parametrize("no_proxy", ["127.0.0.1", "*", "localhost,127.0.0.1", " 127.0.0.1 "])
-async def test_no_proxy_forms(url, proxy_environment, no_proxy):
-    proxy_environment.setenv("http_proxy", DEAD_PROXY)
+async def test_no_proxy_forms(url, wire, proxy_environment, no_proxy):
+    proxy_environment.setenv("http_proxy", wire.url)
     proxy_environment.setenv("no_proxy", no_proxy)
-    assert not await went_through_dead_proxy(url)
+    assert not await went_through(wire, url)
 
 
 @pytest.mark.parametrize("no_proxy", ["example.invalid", ".invalid", "invalid"])
