@@ -442,7 +442,7 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
             k->state = CONN_IDLE;
             c->idle++;
             idle_add(k);
-            k->idle_since = now(c);
+            k->idle_since = q->times[HX_T_DONE];
             k->idle_timeout = q->idle_timeout;
             schedule(c, k->idle_timeout > 0 ? k->idle_since + k->idle_timeout : 0);
             watch(k, HX_READ);
@@ -563,6 +563,8 @@ static void send_some(conn *k) {
         k->out.len = k->out_sent = 0;
         return;
     }
+    int writes = 0;
+    int64_t first = 0;
     while (k->out_sent < k->out.len) {
         ssize_t n = conn_write(k, k->out.data + k->out_sent, k->out.len - k->out_sent);
         if (n < 0) {
@@ -583,8 +585,9 @@ static void send_some(conn *k) {
             return;
         }
         if (q->times[HX_T_FIRST_SENT] == 0) {
-            q->times[HX_T_FIRST_SENT] = now(k->client);
+            q->times[HX_T_FIRST_SENT] = first = now(k->client);
         }
+        writes++;
         k->out_sent += (size_t)n;
         q->sent += (uint64_t)n;
     }
@@ -593,7 +596,7 @@ static void send_some(conn *k) {
     }
     watch(k, reading(k));
     if (!q->upload || q->body_done) {
-        q->times[HX_T_LAST_SENT] = now(k->client);
+        q->times[HX_T_LAST_SENT] = writes == 1 && first != 0 ? first : now(k->client);
     } else if (!q->asked) {
         q->asked = true;
         enqueue(k->client, q, HX_EV_SEND_READY);
