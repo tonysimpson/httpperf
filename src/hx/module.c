@@ -145,6 +145,8 @@ struct Request {
     char *target;
     char *method;
     uint16_t port;
+    char *proxy_host;
+    uint16_t proxy_port;
     char **headers;
     size_t header_count;
     char *body;
@@ -220,6 +222,9 @@ struct Session {
     Pool *pool;
     hx_jar *jar;
     pthread_mutex_t jar_lock;
+    char *proxy_host, *proxy_auth, *no_proxy;
+    uint16_t proxy_port;
+    bool proxy_unsupported;
     Stats stats;
 };
 
@@ -293,6 +298,7 @@ static void request_free(Request *r) {
     free(r->url);
     free(r->host);
     free(r->authority);
+    free(r->proxy_host);
     free(r->target);
     free(r->path);
     free(r->method);
@@ -1104,8 +1110,8 @@ static void begin_request(EventLoop *loop, Request *r) {
     add_cookie_header(r);
     hx_request q = {
         .method = r->method,
-        .host = r->host,
-        .port = r->port,
+        .host = r->proxy_host != NULL ? r->proxy_host : r->host,
+        .port = r->proxy_host != NULL ? r->proxy_port : r->port,
         .authority = r->authority,
         .target = r->target,
         .headers = (const char *const *)r->headers,
@@ -1473,10 +1479,12 @@ static void error_text(const Request *r, char *message, size_t size) {
     }
     switch (e->error) {
     case HX_ERR_DNS:
-        snprintf(message, size, "Could not resolve host: %s", r->host);
+        snprintf(message, size, r->proxy_host != NULL ? "Could not resolve proxy: %s" : "Could not resolve host: %s",
+                 r->proxy_host != NULL ? r->proxy_host : r->host);
         break;
     case HX_ERR_CONNECT:
-        snprintf(message, size, "Failed to connect to %s port %u: %s", r->host, r->port,
+        snprintf(message, size, "Failed to connect to %s port %u: %s", r->proxy_host != NULL ? r->proxy_host : r->host,
+                 r->proxy_host != NULL ? r->proxy_port : r->port,
                  e->sys_errno ? strerror(e->sys_errno) : "Couldn't connect to server");
         break;
     case HX_ERR_TIMEOUT:
@@ -1691,6 +1699,84 @@ static PyTypeObject EventLoopType = {
     .tp_new = EventLoop_new,
 };
 
+static char *env_value(const char *lower, const char *upper) {
+    const char *v = getenv(lower);
+    if ((v == NULL || *v == '\0') && upper != NULL) {
+        v = getenv(upper);
+    }
+    return v != NULL && *v != '\0' ? strdup(v) : NULL;
+}
+
+static bool no_proxy_for(const char *list, const char *host) {
+    size_t hl = strlen(host);
+    for (const char *p = list; p != NULL && *p;) {
+        const char *comma = strchr(p, ',');
+        const char *end = comma != NULL ? comma : p + strlen(p);
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '.' || *p == '[')) {
+            p++;
+        }
+        const char *e = end;
+        while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == ']')) {
+            e--;
+        }
+        size_t n = (size_t)(e - p);
+        if ((n == 1 && *p == '*') || (n == hl && strncasecmp(p, host, n) == 0) ||
+            (n > 0 && hl > n && host[hl - n - 1] == '.' && strncasecmp(host + hl - n, p, n) == 0)) {
+            return true;
+        }
+        p = comma != NULL ? comma + 1 : NULL;
+    }
+    return false;
+}
+
+static int parse_url(Request *r, const char *url, char **user, char **password);
+static char *basic_auth(const char *user, const char *password);
+
+static int read_proxy(Session *self) {
+    char *url = env_value("http_proxy", NULL);
+    if (url == NULL) {
+        url = env_value("all_proxy", "ALL_PROXY");
+    }
+    if (url == NULL) {
+        return 0;
+    }
+    self->no_proxy = env_value("no_proxy", "NO_PROXY");
+    char *full = strstr(url, "://") != NULL ? strdup(url) : NULL;
+    if (full == NULL && (full = malloc(strlen(url) + 8)) != NULL) {
+        sprintf(full, "http://%s", url);
+    }
+    free(url);
+    Request p = {0};
+    char *user = NULL, *password = NULL;
+    int code = full != NULL ? parse_url(&p, full, &user, &password) : E_OUT_OF_MEMORY;
+    free(full);
+    if (code == 0 && p.bad_scheme) {
+        self->proxy_unsupported = true;
+    } else if (code == 0) {
+        const char *colon = strrchr(p.authority, ':');
+        bool explicit_port = colon != NULL && strchr(colon, ']') == NULL;
+        self->proxy_host = p.host;
+        p.host = NULL;
+        self->proxy_port = explicit_port ? p.port : 1080;
+        if (user != NULL) {
+            char *header = basic_auth(user, password != NULL ? password : "");
+            self->proxy_auth = header != NULL ? malloc(strlen(header) + 7) : NULL;
+            if (self->proxy_auth != NULL) {
+                sprintf(self->proxy_auth, "Proxy-%s", header);
+            }
+            free(header);
+            code = self->proxy_auth != NULL ? 0 : E_OUT_OF_MEMORY;
+        }
+    }
+    free(user);
+    free(password);
+    free(p.host);
+    free(p.authority);
+    free(p.target);
+    free(p.url);
+    return code == E_OUT_OF_MEMORY ? -1 : 0;
+}
+
 static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     PyObject *loop;
     const char *connections, *tls, *http_version;
@@ -1745,7 +1831,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->max_connection_age = max_connection_age;
     pthread_mutex_init(&self->jar_lock, NULL);
     self->jar = hx_jar_new();
-    if (self->jar == NULL) {
+    if (self->jar == NULL || read_proxy(self) == -1) {
         Py_DECREF(self);
         return PyErr_NoMemory();
     }
@@ -1771,6 +1857,9 @@ static void close_pool(Session *self);
 
 static void Session_dealloc(Session *self) {
     close_pool(self);
+    free(self->proxy_host);
+    free(self->proxy_auth);
+    free(self->no_proxy);
     if (self->jar != NULL) {
         hx_jar_free(self->jar);
         pthread_mutex_destroy(&self->jar_lock);
@@ -1971,6 +2060,28 @@ static bool names(const char *header, const char *name) {
     return strncasecmp(header, name, n) == 0 && (header[n] == ':' || header[n] == ';');
 }
 
+static int use_proxy(Session *self, Request *r) {
+    if ((self->proxy_host == NULL && !self->proxy_unsupported) || r->bad_scheme ||
+        no_proxy_for(self->no_proxy, r->host)) {
+        return 0;
+    }
+    if (self->proxy_unsupported) {
+        return -2;
+    }
+    char *target = malloc(strlen(r->authority) + strlen(r->target) + 8);
+    r->proxy_host = strdup(self->proxy_host);
+    if (target == NULL || r->proxy_host == NULL ||
+        (self->proxy_auth != NULL && add_header(r, strdup(self->proxy_auth)) != 0)) {
+        free(target);
+        return -1;
+    }
+    sprintf(target, "http://%s%s", r->authority, r->target);
+    free(r->target);
+    r->target = target;
+    r->proxy_port = self->proxy_port;
+    return 0;
+}
+
 static int add_cookies(Session *self, PyObject *cookies) {
     if (cookies == Py_None) {
         return 0;
@@ -2164,8 +2275,13 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     r->loop = loop;
     r->send_cookies = !has_cookie;
     r->path = copy(r->target, strcspn(r->target, "?#"));
-    if (r->path == NULL) {
+    int proxy = r->path != NULL ? use_proxy(self, r) : -1;
+    if (proxy != 0) {
         request_free(r);
+        if (proxy == -2) {
+            PyErr_SetString(PyExc_NotImplementedError, "the hx backend only does http:// proxies so far");
+            return NULL;
+        }
         return PyErr_NoMemory();
     }
     r->discard_body = discard_body;
