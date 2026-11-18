@@ -1700,7 +1700,13 @@ static size_t header_callback(char *ptr, size_t size, size_t nmemb, void *userda
 static size_t stream_write(AcRequestData *rd, const void *prefix, size_t prefix_len, char *ptr, size_t n) {
     Stream *s = rd->stream;
     pthread_mutex_lock(&s->lock);
-    if (s->buf.len >= STREAM_BUFFER) {
+    if (s->buf.len >= STREAM_BUFFER && prefix_len > 0) {
+        s->paused = true;
+        if (s->paused_since == 0) {
+            s->paused_since = monotonic_time();
+        }
+        curl_easy_pause(rd->curl, CURLPAUSE_RECV);
+    } else if (s->buf.len >= STREAM_BUFFER) {
         s->paused = true;
         if (s->paused_since == 0) {
             s->paused_since = monotonic_time();
