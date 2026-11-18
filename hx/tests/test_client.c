@@ -626,6 +626,19 @@ static void test_a_paused_request_reads_nothing_until_resumed(void) {
     finish_client(c);
 }
 
+static void test_a_reused_connection_the_server_just_closed_is_retried_on_a_new_one(void) {
+    hx_client *c = client(0);
+    outcome first = {0}, second = {0};
+    hx_request drop = get("/drop");
+    hx_request_start(c, &drop, &first);
+    run(c, &first, 1, 2000);
+    hx_request r = get("/");
+    hx_request_start(c, &r, &second);
+    run(c, &second, 1, 2000);
+    CHECK(first.status == 200 && second.status == 200 && second.last.error == HX_OK && !second.last.reused);
+    finish_client(c);
+}
+
 static void test_times_are_in_order(void) {
     hx_client *c = client(0);
     outcome o = {0};
@@ -688,6 +701,7 @@ int main(void) {
     test_an_upload_asks_for_its_body_once_the_headers_are_sent();
     test_a_response_before_the_whole_upload_closes_the_connection();
     test_a_paused_request_reads_nothing_until_resumed();
+    test_a_reused_connection_the_server_just_closed_is_retried_on_a_new_one();
     test_times_are_in_order();
     test_many_requests_at_once();
     printf(failures ? "%d failed\n" : "all passed\n", failures);

@@ -82,6 +82,7 @@ struct hx_req {
     bool body_done;
     bool asked;
     bool paused;
+    bool retried;
     bool close_after;
     int64_t idle_timeout;
     bool done;
@@ -281,7 +282,34 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
     }
 }
 
+static void connect_new(hx_client *c, struct hx_req *q);
+
+static bool retry(conn *k, hx_error error) {
+    struct hx_req *q = k->req;
+    if (q == NULL || !q->reused || q->retried || q->received > 0 || q->upload ||
+        (error != HX_ERR_RECEIVE && error != HX_ERR_SEND)) {
+        return false;
+    }
+    hx_client *c = k->client;
+    hx_buf sent = k->out;
+    k->out = q->request;
+    k->out.len = k->out_sent = 0;
+    q->request = sent;
+    k->req = NULL;
+    q->conn = NULL;
+    conn_close(k);
+    q->retried = true;
+    q->reused = false;
+    q->sent = 0;
+    q->times[HX_T_FIRST_SENT] = q->times[HX_T_LAST_SENT] = q->times[HX_T_FIRST_BYTE] = 0;
+    connect_new(c, q);
+    return true;
+}
+
 static void fail(conn *k, hx_error error, int sys_errno) {
+    if (retry(k, error)) {
+        return;
+    }
     if (k->req != NULL) {
         finish(k->req, error, sys_errno, true);
     } else {
@@ -312,7 +340,9 @@ static void send_some(conn *k) {
         k->out_sent += (size_t)n;
         q->sent += (uint64_t)n;
     }
-    k->out.len = k->out_sent = 0;
+    if (q->upload) {
+        k->out.len = k->out_sent = 0;
+    }
     watch(k, reading(k));
     if (!q->upload || q->body_done) {
         q->times[HX_T_LAST_SENT] = now(k->client);
@@ -598,6 +628,11 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
         return q;
     }
     q->connect_timeout = r->connect_timeout_ns;
+    connect_new(c, q);
+    return q;
+}
+
+static void connect_new(hx_client *c, struct hx_req *q) {
     struct addrinfo hints = {.ai_socktype = SOCK_STREAM, .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV}, *ai = NULL;
     char port[8];
     snprintf(port, sizeof(port), "%u", q->port);
@@ -607,7 +642,6 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     } else {
         resolve(c, q);
     }
-    return q;
 }
 
 static hx_buf *body_buffer(struct hx_req *q) {
