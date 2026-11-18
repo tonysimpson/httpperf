@@ -71,9 +71,15 @@ static int start_line(hx_h1 *h) {
     }
     h->line_started = true;
     char line[32];
-    int n = snprintf(line, sizeof(line), "HTTP/%d.%d %03d ", h->parser.http_major, h->parser.http_minor,
-                     h->parser.status_code);
-    return append(h, line, (size_t)n);
+    hx_text t = hx_text_on(line, sizeof(line));
+    hx_text_str(&t, "HTTP/");
+    hx_text_uint(&t, h->parser.http_major, 0);
+    hx_text_str(&t, ".");
+    hx_text_uint(&t, h->parser.http_minor, 0);
+    hx_text_str(&t, " ");
+    hx_text_uint(&t, h->parser.status_code, 3);
+    hx_text_str(&t, " ");
+    return append(h, line, t.len);
 }
 
 static int on_message_begin(llhttp_t *p) {

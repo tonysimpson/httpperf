@@ -31,6 +31,7 @@ hx-test:
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_tls
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_ws.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_ws
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h2.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h2
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_buf.c -o build/hx/test_buf
 	for name in tls tls-other; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
 		-keyout build/hx/$$name-key.pem -out build/hx/$$name-cert.pem 2>/dev/null; done
@@ -41,6 +42,7 @@ hx-test:
 	build/hx/test_tls
 	build/hx/test_h2
 	build/hx/test_ws
+	build/hx/test_buf
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest

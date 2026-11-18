@@ -871,7 +871,8 @@ static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
     q->port = r->port;
     q->times[HX_T_START] = now(c);
     q->deadline = r->timeout_ns > 0 ? q->times[HX_T_START] + r->timeout_ns : 0;
-    snprintf(q->host, sizeof(q->host), "%s", r->host);
+    hx_text host = hx_text_on(q->host, sizeof(q->host));
+    hx_text_str(&host, r->host);
     q->idle_timeout = r->idle_timeout_ns > 0 ? r->idle_timeout_ns : c->cfg.idle_timeout_ns;
     LINK(c->reqs, q);
     schedule(c, q->deadline);
@@ -891,10 +892,22 @@ static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
                 return;
             }
         }
-        snprintf(q->key, sizeof(q->key), "%llu/%s:%u/%llu/%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port,
-                 (unsigned long long)q->tls->id, (unsigned long long)r->tls_cache, q->proxy_host, q->proxy_port);
-    } else {
-        snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
+    }
+    hx_text key = hx_text_on(q->key, sizeof(q->key));
+    hx_text_uint(&key, r->pool, 0);
+    hx_text_str(&key, "/");
+    hx_text_str(&key, r->host);
+    hx_text_str(&key, ":");
+    hx_text_uint(&key, r->port, 0);
+    if (r->tls) {
+        hx_text_str(&key, "/");
+        hx_text_uint(&key, q->tls->id, 0);
+        hx_text_str(&key, "/");
+        hx_text_uint(&key, r->tls_cache, 0);
+        hx_text_str(&key, "/");
+        hx_text_str(&key, q->proxy_host);
+        hx_text_str(&key, ":");
+        hx_text_uint(&key, q->proxy_port, 0);
     }
     hx_h1_request h = {
         r->method,
