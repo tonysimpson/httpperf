@@ -1,6 +1,5 @@
 # Tests the hx backend doesn't pass yet, skipped when HTTPPERF_BACKEND=hx.
 # HTTPPERF_HX_ALL=1 runs them anyway; remove a line once its test passes.
-tests/test_cli.py::test_insecure_skips_the_certificate_check
 tests/test_connections.py::test_an_https_request_tunnels_through_the_proxy
 tests/test_connections.py::test_a_schemes_proxy_beats_all_proxy[https]
 tests/test_http_versions.py::test_a_failed_request_does_not_stop_multiplexing
@@ -23,20 +22,3 @@ tests/test_http_versions.py::test_responses_report_their_version[HTTP/1.1]
 tests/test_http_versions.py::test_responses_report_their_version[HTTP/2]
 tests/test_http_versions.py::test_responses_report_their_version[HTTP/3]
 tests/test_http_versions.py::test_the_limiter_follows_a_host_back_to_http1
-tests/test_tls.py::test_a_certificate_must_be_a_pair
-tests/test_tls.py::test_a_request_can_verify_against_ca_certificates_as_bytes
-tests/test_tls.py::test_a_request_certificate_overrides_the_sessions
-tests/test_tls.py::test_a_session_can_verify_against_ca_certificates_as_bytes
-tests/test_tls.py::test_each_session_presents_its_own_certificate
-tests/test_tls.py::test_empty_ca_certificates_as_bytes_trust_nothing
-tests/test_tls.py::test_no_certificate_is_refused
-tests/test_tls.py::test_tls_resumption_across_sessions[session-False]
-tests/test_tls.py::test_verify[False-options0-True]
-tests/test_tls.py::test_verify[False-options1-False]
-tests/test_tls.py::test_verify[False-options2-True]
-tests/test_tls.py::test_verify_is_the_default
-tests/test_tls.py::test_verify_must_be_a_bool_or_a_path
-tests/test_tls.py::test_verify[*-options4-True]
-tests/test_tls.py::test_verify[*-options5-True]
-tests/test_tls.py::test_verify[True-options3-False]
-tests/test_tls.py::test_verify_with_ssl_cert_dir

@@ -44,6 +44,15 @@ typedef struct {
     int64_t max_age_ns;
     bool upload;
     int64_t upload_size;
+    bool tls;
+    bool verify;
+    const char *ca_file;
+    const char *ca_path;
+    const char *ca_pem;
+    size_t ca_pem_len;
+    const char *cert_file;
+    const char *key_file;
+    uint64_t tls_cache;
 } hx_request;
 
 typedef enum { HX_EV_HEADERS = 1, HX_EV_BODY, HX_EV_DONE, HX_EV_SEND_READY } hx_event_type;
@@ -61,6 +70,10 @@ typedef enum {
     HX_ERR_NOMEM,
     HX_ERR_DECODE,
     HX_ERR_UNKNOWN_ENCODING,
+    HX_ERR_TLS,
+    HX_ERR_TLS_VERIFY,
+    HX_ERR_TLS_CERT,
+    HX_ERR_TLS_CA,
 } hx_error;
 
 enum {
@@ -84,6 +97,7 @@ typedef struct {
     int version;
     hx_error error;
     int sys_errno;
+    const char *detail;
     bool reused;
     bool connection_closed;
     uint64_t connection_id;

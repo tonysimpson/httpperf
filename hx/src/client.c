@@ -3,6 +3,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <openssl/err.h>
 #include <poll.h>
 #include <stdio.h>
 #include <strings.h>
@@ -13,10 +14,11 @@
 #include "decode.h"
 #include "dns.h"
 #include "h1.h"
+#include "tls.h"
 
 #define MAX_ADDRS 8
 
-typedef enum { CONN_CONNECTING, CONN_BUSY, CONN_IDLE, CONN_CLOSED } conn_state;
+typedef enum { CONN_CONNECTING, CONN_HANDSHAKE, CONN_BUSY, CONN_IDLE, CONN_CLOSED } conn_state;
 
 typedef struct conn {
     hx_client *client;
@@ -49,6 +51,10 @@ typedef struct conn {
     hx_buf decoded;
     bool decoding;
     bool undecodable;
+    SSL *ssl;
+    hx_tls_ctx *tls;
+    char session_key[320];
+    const char *tls_detail;
     struct hx_req *req;
     struct conn *prev, *next;
 } conn;
@@ -84,6 +90,9 @@ struct hx_req {
     bool paused;
     bool retried;
     int send_errno;
+    hx_tls_ctx *tls;
+    uint64_t tls_cache;
+    const char *detail;
     bool close_after;
     int64_t idle_timeout;
     bool done;
@@ -127,6 +136,8 @@ struct hx_client {
     uint64_t next_lookup_id;
     lookup *lookups;
     cached *cache;
+    hx_tls tls;
+    conn *receiving;
 };
 
 #define LINK(head, item)           \
@@ -201,6 +212,15 @@ static void conn_close(conn *k) {
     if (k->state == CONN_IDLE) {
         c->idle--;
     }
+    if (k->ssl != NULL) {
+        if (k->tls_detail == NULL && SSL_is_init_finished(k->ssl)) {
+            ERR_clear_error();
+            SSL_shutdown(k->ssl);
+            ERR_clear_error();
+        }
+        SSL_free(k->ssl);
+        k->ssl = NULL;
+    }
     if (k->fd >= 0) {
         watch(k, 0);
         close(k->fd);
@@ -216,7 +236,7 @@ static void conn_close(conn *k) {
         k->req->conn = NULL;
         k->req = NULL;
     }
-    if (!k->pinned && k->queued == 0) {
+    if (!k->pinned && k->queued == 0 && c->receiving != k) {
         conn_free(k);
     }
 }
@@ -249,6 +269,7 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
     if (e != NULL) {
         e->ev.error = error;
         e->ev.sys_errno = sys_errno;
+        e->ev.detail = error != HX_OK ? q->detail : NULL;
         e->ev.status = k != NULL ? k->h1.status : 0;
         e->ev.version = k != NULL ? k->h1.version : 0;
         e->ev.reused = q->reused;
@@ -311,6 +332,9 @@ static void fail(conn *k, hx_error error, int sys_errno) {
     if (retry(k, error)) {
         return;
     }
+    if (k->req != NULL && k->req->detail == NULL) {
+        k->req->detail = k->tls_detail;
+    }
     if (k->req != NULL) {
         finish(k->req, error, sys_errno, true);
     } else {
@@ -320,6 +344,56 @@ static void fail(conn *k, hx_error error, int sys_errno) {
 
 static int reading(const conn *k) { return k->req != NULL && k->req->paused ? 0 : HX_READ; }
 
+static ssize_t tls_result(conn *k, int n) {
+    int err = SSL_get_error(k->ssl, n);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (err == SSL_ERROR_ZERO_RETURN) {
+        return 0;
+    }
+    unsigned long e = ERR_peek_last_error();
+    if (err == SSL_ERROR_SYSCALL && e == 0) {
+        if (errno == 0 || errno == EAGAIN) {
+            return 0;
+        }
+        return -1;
+    }
+    k->tls_detail = e != 0 ? ERR_reason_error_string(e) : NULL;
+    ERR_clear_error();
+    errno = EPROTO;
+    return -1;
+}
+
+static ssize_t conn_write(conn *k, const char *data, size_t len) {
+    if (k->ssl == NULL) {
+        return send(k->fd, data, len, MSG_NOSIGNAL);
+    }
+    ERR_clear_error();
+    errno = 0;
+    int n = SSL_write(k->ssl, data, len > INT32_MAX ? INT32_MAX : (int)len);
+    if (n > 0) {
+        return n;
+    }
+    ssize_t r = tls_result(k, n);
+    if (r == 0) {
+        errno = EPIPE;
+        return -1;
+    }
+    return r;
+}
+
+static ssize_t conn_read(conn *k) {
+    if (k->ssl == NULL) {
+        return recv(k->fd, k->rbuf, k->rcap, 0);
+    }
+    ERR_clear_error();
+    errno = 0;
+    int n = SSL_read(k->ssl, k->rbuf, k->rcap > INT32_MAX ? INT32_MAX : (int)k->rcap);
+    return n > 0 ? n : tls_result(k, n);
+}
+
 static void send_some(conn *k) {
     struct hx_req *q = k->req;
     if (q->send_errno != 0) {
@@ -327,7 +401,7 @@ static void send_some(conn *k) {
         return;
     }
     while (k->out_sent < k->out.len) {
-        ssize_t n = send(k->fd, k->out.data + k->out_sent, k->out.len - k->out_sent, MSG_NOSIGNAL);
+        ssize_t n = conn_write(k, k->out.data + k->out_sent, k->out.len - k->out_sent);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 watch(k, reading(k) | HX_WRITE);
@@ -457,6 +531,11 @@ static conn *conn_open(hx_client *c, struct hx_req *q, const struct addrinfo *ai
     k->rbuf = rbuf;
     k->rcap = c->cfg.read_size;
     memcpy(k->key, q->key, sizeof(k->key));
+    k->tls = q->tls;
+    if (q->tls != NULL) {
+        snprintf(k->session_key, sizeof(k->session_key), "%llu/%s:%u/%llu", (unsigned long long)q->tls_cache, q->host,
+                 q->port, (unsigned long long)q->tls->id);
+    }
     hx_h1_init(&k->h1, false);
     if (connect_next(k) == -1) {
         *error = HX_ERR_CONNECT;
@@ -582,8 +661,15 @@ static void resolved(hx_client *c) {
     }
 }
 
-static bool still_open(const conn *k) {
+static bool still_open(conn *k) {
     char b;
+    if (k->ssl != NULL) {
+        ERR_clear_error();
+        int n = SSL_peek(k->ssl, &b, 1);
+        bool open = n <= 0 && SSL_get_error(k->ssl, n) == SSL_ERROR_WANT_READ;
+        ERR_clear_error();
+        return open;
+    }
     return recv(k->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
 }
 
@@ -623,9 +709,21 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
     q->deadline = r->timeout_ns > 0 ? q->times[HX_T_START] + r->timeout_ns : 0;
     snprintf(q->host, sizeof(q->host), "%s", r->host);
     q->idle_timeout = r->idle_timeout_ns > 0 ? r->idle_timeout_ns : c->cfg.idle_timeout_ns;
-    snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
     LINK(c->reqs, q);
     schedule(c, q->deadline);
+    if (r->tls) {
+        hx_error error = HX_OK;
+        q->tls = hx_tls_ctx_for(&c->tls, r, &error);
+        if (q->tls == NULL) {
+            finish(q, error, 0, false);
+            return q;
+        }
+        q->tls_cache = r->tls_cache;
+        snprintf(q->key, sizeof(q->key), "%llu/%s:%u/%llu/%llu", (unsigned long long)r->pool, r->host, r->port,
+                 (unsigned long long)q->tls->id, (unsigned long long)r->tls_cache);
+    } else {
+        snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
+    }
     hx_h1_request h = {
         r->method,       r->target,
         r->authority,    r->headers,
@@ -700,6 +798,8 @@ int hx_request_end_body(hx_req *q) {
     return 0;
 }
 
+static void receive_ready(conn *k);
+
 void hx_request_pause(hx_req *q, bool paused) {
     if (q->done || q->paused == paused) {
         return;
@@ -708,6 +808,13 @@ void hx_request_pause(hx_req *q, bool paused) {
     conn *k = q->conn;
     if (k != NULL && k->req == q && k->state == CONN_BUSY) {
         watch(k, reading(k) | (k->watching & HX_WRITE));
+        if (!paused && k->ssl != NULL && SSL_pending(k->ssl) > 0) {
+            if (k->pinned) {
+                k->want_read = true;
+            } else {
+                receive_ready(k);
+            }
+        }
     }
 }
 
@@ -716,6 +823,44 @@ void hx_request_cancel(hx_req *q) {
         return;
     }
     finish(q, HX_ERR_CANCELLED, 0, true);
+}
+
+int hx_tls_on_session(SSL *ssl, SSL_SESSION *session) {
+    conn *k = SSL_get_app_data(ssl);
+    if (k == NULL || k->state == CONN_CLOSED) {
+        return 0;
+    }
+    hx_tls_save(&k->client->tls, k->session_key, session);
+    return 1;
+}
+
+static void handshake(conn *k) {
+    ERR_clear_error();
+    int rc = SSL_connect(k->ssl);
+    if (rc == 1) {
+        struct hx_req *q = k->req;
+        q->times[HX_T_TLS] = now(k->client);
+        k->connect_deadline = 0;
+        k->req = NULL;
+        begin(k, q);
+        return;
+    }
+    int err = SSL_get_error(k->ssl, rc);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        watch(k, err == SSL_ERROR_WANT_READ ? HX_READ : HX_WRITE);
+        return;
+    }
+    long verify = SSL_get_verify_result(k->ssl);
+    if (k->tls->verify && verify != X509_V_OK) {
+        k->tls_detail = X509_verify_cert_error_string(verify);
+        ERR_clear_error();
+        fail(k, HX_ERR_TLS_VERIFY, (int)verify);
+        return;
+    }
+    unsigned long e = ERR_peek_last_error();
+    k->tls_detail = e != 0 ? ERR_reason_error_string(e) : NULL;
+    ERR_clear_error();
+    fail(k, HX_ERR_TLS, err == SSL_ERROR_SYSCALL ? errno : 0);
 }
 
 static void connected(conn *k) {
@@ -739,7 +884,18 @@ static void connected(conn *k) {
         return;
     }
     struct hx_req *q = k->req;
-    q->times[HX_T_CONNECT] = q->times[HX_T_TLS] = now(k->client);
+    q->times[HX_T_CONNECT] = now(k->client);
+    if (k->tls != NULL) {
+        k->ssl = hx_tls_new(&k->client->tls, k->tls, q->host, k->session_key, k);
+        if (k->ssl == NULL || SSL_set_fd(k->ssl, k->fd) != 1) {
+            fail(k, HX_ERR_NOMEM, 0);
+            return;
+        }
+        k->state = CONN_HANDSHAKE;
+        handshake(k);
+        return;
+    }
+    q->times[HX_T_TLS] = q->times[HX_T_CONNECT];
     k->connect_deadline = 0;
     k->req = NULL;
     begin(k, q);
@@ -801,7 +957,7 @@ static void receive(conn *k) {
     hx_client *c = k->client;
     ssize_t n;
     do {
-        n = recv(k->fd, k->rbuf, k->rcap, 0);
+        n = conn_read(k);
     } while (n < 0 && errno == EINTR);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         return;
@@ -888,6 +1044,28 @@ static void receive(conn *k) {
     }
 }
 
+static void receive_ready(conn *k) {
+    if (k->ssl == NULL) {
+        receive(k);
+        return;
+    }
+    hx_client *c = k->client;
+    conn *outer = c->receiving;
+    c->receiving = k;
+    receive(k);
+    while (k->state == CONN_BUSY && reading(k) && SSL_pending(k->ssl) > 0) {
+        if (k->pinned) {
+            k->want_read = true;
+            break;
+        }
+        receive(k);
+    }
+    c->receiving = outer;
+    if (k->state == CONN_CLOSED && !k->pinned && k->queued == 0 && outer != k) {
+        conn_free(k);
+    }
+}
+
 void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
     if (c->dns != NULL && s == hx_dns_fd(c->dns)) {
         resolved(c);
@@ -903,6 +1081,10 @@ void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
         }
         return;
     }
+    if (k->state == CONN_HANDSHAKE) {
+        handshake(k);
+        return;
+    }
     if ((events & HX_WRITE) && k->state == CONN_BUSY && k->req != NULL) {
         send_some(k);
     }
@@ -910,7 +1092,7 @@ void hx_client_on_socket(hx_client *c, hx_socket s, int events) {
         if (k->pinned) {
             k->want_read = true;
         } else {
-            receive(k);
+            receive_ready(k);
         }
     }
 }
@@ -929,11 +1111,11 @@ void hx_client_on_timer(hx_client *c) {
     }
     for (conn *k = c->conns, *after; k != NULL; k = after) {
         after = k->next;
-        int64_t deadline = k->state == CONN_IDLE && k->idle_timeout > 0 ? k->idle_since + k->idle_timeout
-                           : k->state == CONN_CONNECTING                ? k->connect_deadline
-                                                                        : 0;
+        int64_t deadline = k->state == CONN_IDLE && k->idle_timeout > 0                ? k->idle_since + k->idle_timeout
+                           : k->state == CONN_CONNECTING || k->state == CONN_HANDSHAKE ? k->connect_deadline
+                                                                                       : 0;
         if (deadline > 0 && deadline <= t) {
-            if (k->state == CONN_CONNECTING) {
+            if (k->state == CONN_CONNECTING || k->state == CONN_HANDSHAKE) {
                 fail(k, HX_ERR_TIMEOUT, 0);
             } else if (!k->pinned) {
                 conn_close(k);
@@ -968,7 +1150,7 @@ int hx_client_events(hx_client *c, hx_event *out, int max) {
             conn_free(k);
         } else if (k->want_read && reading(k)) {
             k->want_read = false;
-            receive(k);
+            receive_ready(k);
         }
     }
     if (c->released_len > released) {
@@ -1062,6 +1244,7 @@ void hx_client_free(hx_client *c) {
             conn_free(c->released[i]);
         }
     }
+    hx_tls_free(&c->tls);
     free(c->queue);
     free(c->released);
     free(c->by_fd);

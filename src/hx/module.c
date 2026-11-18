@@ -31,7 +31,11 @@ enum {
     E_ABORTED_BY_CALLBACK = 42,
     E_SEND_ERROR = 55,
     E_RECV_ERROR = 56,
+    E_SSL_CONNECT_ERROR = 35,
+    E_SSL_CERTPROBLEM = 58,
+    E_PEER_FAILED_VERIFICATION = 60,
     E_BAD_CONTENT_ENCODING = 61,
+    E_SSL_CACERT_BADFILE = 77,
 };
 
 typedef struct {
@@ -180,6 +184,11 @@ struct Request {
     int head_status, head_version;
     bool send_cookies;
     bool bad_scheme;
+    bool tls;
+    bool verify;
+    char *ca_file, *ca_path, *ca_pem, *cert_file, *key_file;
+    size_t ca_pem_len;
+    uint64_t tls_cache;
     char *path;
 };
 
@@ -225,6 +234,8 @@ struct Session {
     char *proxy_host, *proxy_auth, *no_proxy;
     uint16_t proxy_port;
     bool proxy_unsupported;
+    bool https_proxy;
+    uint64_t tls_cache;
     Stats stats;
 };
 
@@ -299,6 +310,11 @@ static void request_free(Request *r) {
     free(r->host);
     free(r->authority);
     free(r->proxy_host);
+    free(r->ca_file);
+    free(r->ca_path);
+    free(r->ca_pem);
+    free(r->cert_file);
+    free(r->key_file);
     free(r->target);
     free(r->path);
     free(r->method);
@@ -411,7 +427,7 @@ static void stats_add(EventLoop *loop, Request *r, atomic_long *(*field)(Stats *
 
 static int host_key(const Request *r, char *key, size_t size) {
     bool v6 = strchr(r->host, ':') != NULL;
-    return snprintf(key, size, v6 ? "http://[%s]:%u" : "http://%s:%u", r->host, r->port);
+    return snprintf(key, size, v6 ? "%s://[%s]:%u" : "%s://%s:%u", r->tls ? "https" : "http", r->host, r->port);
 }
 
 static size_t key_hash(const char *key) {
@@ -442,7 +458,7 @@ static bool hosts_grow(HostTable *t) {
 static Stats *host_stats_for(HostTable *t, const Request *r) {
     char key[300];
     int n = host_key(r, key, sizeof(key));
-    for (int i = 7; i < n; i++) {
+    for (int i = 0; i < n; i++) {
         if (key[i] >= 'A' && key[i] <= 'Z') {
             key[i] = (char)(key[i] - 'A' + 'a');
         }
@@ -662,7 +678,7 @@ static void store_cookies(Request *r, const char *block, size_t len) {
                 locked = true;
             }
             const char *v = line + 11;
-            hx_jar_set_cookie(session->jar, v, (size_t)(eol - v), r->host, r->path, false, now);
+            hx_jar_set_cookie(session->jar, v, (size_t)(eol - v), r->host, r->path, r->tls, now);
         }
         line = memchr(eol, '\n', (size_t)(end - eol));
     }
@@ -1094,7 +1110,7 @@ static void add_cookie_header(Request *r) {
     hx_buf line = {0};
     pthread_mutex_lock(&session->jar_lock);
     bool any = hx_jar_count(session->jar) > 0 && hx_buf_append_str(&line, "Cookie: ") &&
-               hx_jar_header(session->jar, r->host, r->path, false, (int64_t)time(NULL), &line);
+               hx_jar_header(session->jar, r->host, r->path, r->tls, (int64_t)time(NULL), &line);
     pthread_mutex_unlock(&session->jar_lock);
     char **grown =
         any && hx_buf_append(&line, "", 1) ? realloc(r->headers, (r->header_count + 1) * sizeof(char *)) : NULL;
@@ -1128,6 +1144,15 @@ static void begin_request(EventLoop *loop, Request *r) {
         .max_age_ns = r->max_age_ns,
         .upload = r->upload != NULL,
         .upload_size = r->upload_size,
+        .tls = r->tls,
+        .verify = r->verify,
+        .ca_file = r->ca_file,
+        .ca_path = r->ca_path,
+        .ca_pem = r->ca_pem,
+        .ca_pem_len = r->ca_pem_len,
+        .cert_file = r->cert_file,
+        .key_file = r->key_file,
+        .tls_cache = r->tls_cache,
     };
     stats_add(loop, r, stat_running, 1);
     r->hx = hx_request_start(loop->client, &q, r);
@@ -1467,6 +1492,14 @@ static int error_code(hx_error e) {
         return E_URL_MALFORMAT;
     case HX_ERR_NOMEM:
         return E_OUT_OF_MEMORY;
+    case HX_ERR_TLS:
+        return E_SSL_CONNECT_ERROR;
+    case HX_ERR_TLS_VERIFY:
+        return E_PEER_FAILED_VERIFICATION;
+    case HX_ERR_TLS_CERT:
+        return E_SSL_CERTPROBLEM;
+    case HX_ERR_TLS_CA:
+        return E_SSL_CACERT_BADFILE;
     }
     return E_RECV_ERROR;
 }
@@ -1496,7 +1529,25 @@ static void error_text(const Request *r, char *message, size_t size) {
         break;
     case HX_ERR_RECEIVE:
         snprintf(message, size, "%s",
-                 e->sys_errno ? strerror(e->sys_errno) : "Server closed the connection before the response ended");
+                 e->detail != NULL ? e->detail
+                 : e->sys_errno    ? strerror(e->sys_errno)
+                                   : "Server closed the connection before the response ended");
+        break;
+    case HX_ERR_TLS:
+        snprintf(message, size, "TLS connect error: %s",
+                 e->detail != NULL ? e->detail
+                 : e->sys_errno    ? strerror(e->sys_errno)
+                                   : "the server closed the connection");
+        break;
+    case HX_ERR_TLS_VERIFY:
+        snprintf(message, size, "SSL certificate problem: %s", e->detail != NULL ? e->detail : "verification failed");
+        break;
+    case HX_ERR_TLS_CERT:
+        snprintf(message, size, "could not load PEM client certificate from %s", r->cert_file ? r->cert_file : "");
+        break;
+    case HX_ERR_TLS_CA:
+        snprintf(message, size, "error setting certificate verify locations: CAfile: %s CApath: %s",
+                 r->ca_file ? r->ca_file : "none", r->ca_path ? r->ca_path : "none");
         break;
     case HX_ERR_PROTOCOL:
         snprintf(message, size, "Invalid HTTP response from the server");
@@ -1733,6 +1784,13 @@ static int parse_url(Request *r, const char *url, char **user, char **password);
 static char *basic_auth(const char *user, const char *password);
 
 static int read_proxy(Session *self) {
+    char *https = env_value("https_proxy", "HTTPS_PROXY");
+    if (https == NULL) {
+        https = env_value("all_proxy", "ALL_PROXY");
+    }
+    self->https_proxy = https != NULL;
+    free(https);
+    self->no_proxy = env_value("no_proxy", "NO_PROXY");
     char *url = env_value("http_proxy", NULL);
     if (url == NULL) {
         url = env_value("all_proxy", "ALL_PROXY");
@@ -1740,7 +1798,6 @@ static int read_proxy(Session *self) {
     if (url == NULL) {
         return 0;
     }
-    self->no_proxy = env_value("no_proxy", "NO_PROXY");
     char *full = strstr(url, "://") != NULL ? strdup(url) : NULL;
     if (full == NULL && (full = malloc(strlen(url) + 8)) != NULL) {
         sprintf(full, "http://%s", url);
@@ -1750,7 +1807,7 @@ static int read_proxy(Session *self) {
     char *user = NULL, *password = NULL;
     int code = full != NULL ? parse_url(&p, full, &user, &password) : E_OUT_OF_MEMORY;
     free(full);
-    if (code == 0 && p.bad_scheme) {
+    if (code == 0 && (p.bad_scheme || p.tls)) {
         self->proxy_unsupported = true;
     } else if (code == 0) {
         const char *colon = strrchr(p.authority, ':');
@@ -1808,6 +1865,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
                                           "set limits for the shared pool on the Engine");
         return NULL;
     }
+    static _Atomic uint64_t tls_caches;
     if (strcmp(tls, "session") != 0 && strcmp(tls, "shared") != 0) {
         PyErr_Format(PyExc_ValueError, "tls must be 'shared' or 'session', not '%s'", tls);
         return NULL;
@@ -1829,6 +1887,7 @@ static PyObject *Session_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->fresh = none;
     self->idle_timeout = idle_timeout;
     self->max_connection_age = max_connection_age;
+    self->tls_cache = strcmp(tls, "session") == 0 ? atomic_fetch_add(&tls_caches, 1) + 1 : 0;
     pthread_mutex_init(&self->jar_lock, NULL);
     self->jar = hx_jar_new();
     if (self->jar == NULL || read_proxy(self) == -1) {
@@ -1949,10 +2008,8 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
             return -1;
         }
     }
-    if (strncasecmp(url, "https://", 8) == 0) {
-        return E_UNSUPPORTED_PROTOCOL;
-    }
-    if (strncasecmp(url, "http://", 7) != 0) {
+    bool tls = strncasecmp(url, "https://", 8) == 0;
+    if (!tls && strncasecmp(url, "http://", 7) != 0) {
         size_t n = strspn(url, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-");
         if (n == 0 || url[n] != ':') {
             return E_URL_MALFORMAT;
@@ -1962,7 +2019,10 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
         r->target = strdup("/");
         return r->host != NULL && r->target != NULL ? 0 : E_OUT_OF_MEMORY;
     }
-    const char *authority = url + 7;
+    r->tls = tls;
+    const char *scheme = tls ? "https://" : "http://";
+    const long default_port = tls ? 443 : 80;
+    const char *authority = url + strlen(scheme);
     const char *end = authority + strcspn(authority, "/?#");
     const char *at = NULL;
     for (const char *p = authority; p < end; p++) {
@@ -2000,7 +2060,7 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
     if (host_end == host_start) {
         return E_URL_MALFORMAT;
     }
-    long port = 80;
+    long port = default_port;
     if (port_start != NULL && port_start < end) {
         port = 0;
         for (const char *p = port_start; p < end; p++) {
@@ -2017,7 +2077,7 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
     r->host = copy(host_start, (size_t)(host_end - host_start));
     size_t written_host = (size_t)((*hostport == '[' ? host_end + 1 : host_end) - hostport);
     char authority_buf[300];
-    if (port != 80) {
+    if (port != default_port) {
         snprintf(authority_buf, sizeof(authority_buf), "%.*s:%ld", (int)written_host, hostport, port);
     } else {
         snprintf(authority_buf, sizeof(authority_buf), "%.*s", (int)written_host, hostport);
@@ -2029,11 +2089,11 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
     if (r->target != NULL) {
         snprintf(r->target, path_len + 2, "%s%.*s", slash ? "" : "/", (int)path_len, end);
     }
-    size_t url_len = 7 + (size_t)(end - hostport) + path_len + 2;
+    size_t url_len = strlen(scheme) + (size_t)(end - hostport) + path_len + 2;
     r->url = malloc(url_len);
     if (r->url != NULL) {
-        snprintf(r->url, url_len, "http://%.*s%s%.*s", (int)(end - hostport), hostport, slash ? "" : "/", (int)path_len,
-                 end);
+        snprintf(r->url, url_len, "%s%.*s%s%.*s", scheme, (int)(end - hostport), hostport, slash ? "" : "/",
+                 (int)path_len, end);
     }
     if (r->host == NULL || r->authority == NULL || r->target == NULL || r->url == NULL) {
         return E_OUT_OF_MEMORY;
@@ -2060,7 +2120,71 @@ static bool names(const char *header, const char *name) {
     return strncasecmp(header, name, n) == 0 && (header[n] == ':' || header[n] == ';');
 }
 
+static char *str_or_null(PyObject *o, bool *failed) {
+    if (o == Py_None) {
+        return NULL;
+    }
+    const char *s = PyUnicode_AsUTF8(o);
+    char *d = s != NULL ? strdup(s) : NULL;
+    if (d == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_NoMemory();
+        }
+        *failed = true;
+    }
+    return d;
+}
+
+static int parse_tls(Request *r, PyObject *cert, PyObject *verify) {
+    if (cert != Py_None) {
+        if (!PyTuple_CheckExact(cert) || PyTuple_GET_SIZE(cert) != 2 ||
+            !PyUnicode_CheckExact(PyTuple_GET_ITEM(cert, 0)) || !PyUnicode_CheckExact(PyTuple_GET_ITEM(cert, 1))) {
+            PyErr_SetString(PyExc_ValueError, "cert should be a tuple of strings (certfile, keyfile) or None");
+            return -1;
+        }
+        bool failed = false;
+        r->cert_file = str_or_null(PyTuple_GET_ITEM(cert, 0), &failed);
+        r->key_file = str_or_null(PyTuple_GET_ITEM(cert, 1), &failed);
+        if (failed) {
+            return -1;
+        }
+    }
+    PyObject *ca_file = Py_None, *ca_path = Py_None;
+    if (PyBytes_CheckExact(verify)) {
+        r->ca_pem_len = (size_t)PyBytes_GET_SIZE(verify);
+        r->ca_pem = malloc(r->ca_pem_len + 1);
+        if (r->ca_pem == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        memcpy(r->ca_pem, PyBytes_AS_STRING(verify), r->ca_pem_len);
+        verify = Py_True;
+    } else if (PyUnicode_CheckExact(verify)) {
+        ca_file = verify;
+    } else if (PyTuple_CheckExact(verify) && PyTuple_GET_SIZE(verify) == 2) {
+        ca_file = PyTuple_GET_ITEM(verify, 0);
+        ca_path = PyTuple_GET_ITEM(verify, 1);
+    }
+    if ((verify != Py_True && verify != Py_False && ca_file == Py_None && ca_path == Py_None) ||
+        (ca_file != Py_None && !PyUnicode_CheckExact(ca_file)) ||
+        (ca_path != Py_None && !PyUnicode_CheckExact(ca_path))) {
+        PyErr_SetString(PyExc_ValueError,
+                        "verify should be True, False, a CA bundle path or a (CA file, CA directory) tuple");
+        return -1;
+    }
+    r->verify = verify != Py_False;
+    bool failed = false;
+    if (r->verify) {
+        r->ca_file = str_or_null(ca_file, &failed);
+        r->ca_path = str_or_null(ca_path, &failed);
+    }
+    return failed ? -1 : 0;
+}
+
 static int use_proxy(Session *self, Request *r) {
+    if (r->tls) {
+        return self->https_proxy && !no_proxy_for(self->no_proxy, r->host) ? -3 : 0;
+    }
     if ((self->proxy_host == NULL && !self->proxy_unsupported) || r->bad_scheme ||
         no_proxy_for(self->no_proxy, r->host)) {
         return 0;
@@ -2223,8 +2347,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
     char *user = NULL, *password = NULL;
     int code = parse_url(r, url, &user, &password);
     bool has_accept = false, has_encoding = false, has_cookie = false;
-    if (code == -1 || add_headers(r, headers, &has_accept, &has_encoding, &has_cookie) == -1 ||
-        add_cookies(self, cookies) == -1) {
+    if (code == -1 || parse_tls(r, cert, verify) == -1 ||
+        add_headers(r, headers, &has_accept, &has_encoding, &has_cookie) == -1 || add_cookies(self, cookies) == -1) {
         free(user);
         free(password);
         request_free(r);
@@ -2273,6 +2397,7 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         return PyErr_NoMemory();
     }
     r->loop = loop;
+    r->tls_cache = self->tls_cache;
     r->send_cookies = !has_cookie;
     r->path = copy(r->target, strcspn(r->target, "?#"));
     int proxy = r->path != NULL ? use_proxy(self, r) : -1;
@@ -2280,6 +2405,10 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         request_free(r);
         if (proxy == -2) {
             PyErr_SetString(PyExc_NotImplementedError, "the hx backend only does http:// proxies so far");
+            return NULL;
+        }
+        if (proxy == -3) {
+            PyErr_SetString(PyExc_NotImplementedError, "https through a proxy isn't on the hx backend yet");
             return NULL;
         }
         return PyErr_NoMemory();

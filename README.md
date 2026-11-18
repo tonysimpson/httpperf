@@ -409,7 +409,7 @@ make distclean          # also remove .venv
 
 Each target first creates `.venv` with uv, if needed, and installs httpperf in editable mode with the dev tools. It reinstalls when `setup.py`, `pyproject.toml` or the C sources change, so C edits are rebuilt automatically. `make venv` does only that step.
 
-There are two backends, each its own extension module with the same API: `_httpperf` on curl, the default, and `_httpperf_hx` on [hx](hx/README.md), the start of a replacement for curl. So far hx does plain HTTP/1.1, with streamed responses and uploads, cookies, connection limits, per-host stats and HTTP proxies from the environment. It has no TLS, HTTP/2 or 3, or WebSockets yet. `HTTPPERF_BACKEND=hx` picks it when httpperf is imported. `make test` runs the suite on both; on `hx`, the tests listed in `tests/hx_todo.txt` are skipped (`HTTPPERF_HX_ALL=1` runs them anyway). `make hx-test` runs hx's own C tests.
+There are two backends, each its own extension module with the same API: `_httpperf` on curl, the default, and `_httpperf_hx` on [hx](hx/README.md), the start of a replacement for curl. So far hx does HTTP/1.1 over TCP or TLS, with streamed responses and uploads, cookies, connection limits, per-host stats and HTTP proxies from the environment. It has no HTTP/2 or 3, WebSockets or HTTPS through a proxy yet. `HTTPPERF_BACKEND=hx` picks it when httpperf is imported. `make test` runs the suite on both; on `hx`, the tests listed in `tests/hx_todo.txt` are skipped (`HTTPPERF_HX_ALL=1` runs them anyway). `make hx-test` runs hx's own C tests.
 
 `make venv PY_VERSION=3.8 VENV=.venv-3.8` builds another venv, and `VENV=.venv-3.8` on `make test` or `make lint` uses it.
 

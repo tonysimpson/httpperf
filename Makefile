@@ -2,7 +2,7 @@ PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 C_SOURCES := src/httpperf.c src/parse_headers.h src/hx/module.c $(wildcard hx/include/*.h hx/src/*.[ch] hx/tests/*.c)
-HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h1.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
+HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h1.c hx/src/tls.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
@@ -24,14 +24,19 @@ HX_TEST_CFLAGS := -std=c11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parame
 
 hx-test:
 	mkdir -p build/hx
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -lz -o build/hx/test_h1
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -lz -o build/hx/test_client
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) -lz -o build/hx/test_decode
-	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) -lz -o build/hx/test_cookie
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h1.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_h1
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_client.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_client
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_decode
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_cookie
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) -lz -lssl -lcrypto -o build/hx/test_tls
+	for name in tls tls-other; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+		-keyout build/hx/$$name-key.pem -out build/hx/$$name-cert.pem 2>/dev/null; done
 	build/hx/test_h1
 	build/hx/test_client
 	build/hx/test_decode
 	build/hx/test_cookie
+	build/hx/test_tls
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest

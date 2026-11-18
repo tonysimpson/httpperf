@@ -36,11 +36,12 @@ setup(
                 "hx/src/decode.c",
                 "hx/src/dns.c",
                 "hx/src/h1.c",
+                "hx/src/tls.c",
                 "hx/vendor/llhttp/llhttp.c",
                 "hx/vendor/llhttp/api.c",
                 "hx/vendor/llhttp/http.c",
             ],
-            libraries=["z"],
+            libraries=["z", "ssl", "crypto"],
             extra_compile_args=compile_args,
         ),
     ]
