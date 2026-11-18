@@ -37,6 +37,7 @@ setup(
                 "hx/src/dns.c",
                 "hx/src/h1.c",
                 "hx/src/tls.c",
+                "hx/src/ws.c",
                 "hx/vendor/llhttp/llhttp.c",
                 "hx/vendor/llhttp/api.c",
                 "hx/vendor/llhttp/http.c",

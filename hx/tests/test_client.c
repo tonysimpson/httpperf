@@ -70,6 +70,19 @@ static void *serve_one(void *arg) {
             echo(fd, buf, (size_t)n);
             continue;
         }
+        if (strstr(buf, " /upgrade ") != NULL) {
+            const char *r = strstr(buf, "Transfer-Encoding") == NULL
+                                ? "HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\nConnection: Upgrade\r\n\r\nhi"
+                                : "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+            send(fd, r, strlen(r), MSG_NOSIGNAL);
+            while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
+                send(fd, buf, (size_t)n, MSG_NOSIGNAL);
+                if (memchr(buf, '.', (size_t)n) != NULL) {
+                    break;
+                }
+            }
+            break;
+        }
         if (strstr(buf, " /close ") != NULL) {
             const char *r = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
             send(fd, r, strlen(r), MSG_NOSIGNAL);
@@ -704,6 +717,20 @@ static void test_many_requests_at_once(void) {
     finish_client(c);
 }
 
+static void test_an_upgraded_connection_carries_raw_bytes_both_ways(void) {
+    hx_client *c = client(0);
+    outcome o = {0};
+    hx_request r = get("/upgrade");
+    r.upgrade = true;
+    hx_req *q = hx_request_start(c, &r, &o);
+    run(c, &o, 1, 200);
+    hx_request_send(q, "bye.", 4);
+    run(c, &o, 1, 2000);
+    CHECK(o.status == 101 && o.body_len == 6 && memcmp(o.body, "hibye.", 6) == 0);
+    CHECK(o.done == 1 && o.last.error == HX_OK && o.last.connection_closed);
+    finish_client(c);
+}
+
 int main(void) {
     start_server();
     test_a_get_gives_status_body_and_done();
@@ -741,6 +768,7 @@ int main(void) {
     test_an_upload_does_not_reuse_a_connection_the_server_closed();
     test_times_are_in_order();
     test_many_requests_at_once();
+    test_an_upgraded_connection_carries_raw_bytes_both_ways();
     printf(failures ? "%d failed\n" : "all passed\n", failures);
     return failures != 0;
 }

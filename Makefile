@@ -2,7 +2,7 @@ PY_VERSION ?= 3.13
 VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 C_SOURCES := src/httpperf.c src/parse_headers.h src/hx/module.c $(wildcard hx/include/*.h hx/src/*.[ch] hx/tests/*.c)
-HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h1.c hx/src/tls.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
+HX_CORE := hx/src/client.c hx/src/cookie.c hx/src/decode.c hx/src/dns.c hx/src/h1.c hx/src/tls.c hx/src/ws.c hx/vendor/llhttp/llhttp.c hx/vendor/llhttp/api.c hx/vendor/llhttp/http.c
 INSTALLED := $(VENV)/.installed
 UV ?= $(or $(shell command -v uv),.tools/bin/uv)
 GROUPS := --group dev $(if $(filter %t,$(PY_VERSION)),,--group http3)
@@ -29,6 +29,7 @@ hx-test:
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_decode.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_decode
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_cookie.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_cookie
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_tls.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_tls
+	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_ws.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_ws
 	$(CC) $(HX_TEST_CFLAGS) hx/tests/test_h2.c $(HX_CORE) -lz -lssl -lcrypto -lnghttp2 -o build/hx/test_h2
 	for name in tls tls-other; do openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
 		-subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
@@ -39,6 +40,7 @@ hx-test:
 	build/hx/test_cookie
 	build/hx/test_tls
 	build/hx/test_h2
+	build/hx/test_ws
 
 test: $(INSTALLED)
 	$(PYTHON) -m pytest

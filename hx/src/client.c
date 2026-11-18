@@ -58,6 +58,7 @@ typedef struct conn {
     const char *tls_detail;
     size_t tunnel_len;
     bool may_h2;
+    bool raw;
     bool h2;
     bool in_ng;
     bool dirty;
@@ -122,6 +123,7 @@ struct hx_req {
     uint16_t proxy_port;
     char *proxy_auth;
     int64_t connect_timeout;
+    bool upgrade;
     bool h2_offer;
     int32_t stream_id;
     bool stream_closed;
@@ -365,7 +367,7 @@ static void finish(struct hx_req *q, hx_error error, int sys_errno, bool closed)
     }
     conn *k = q->conn;
     bool on_h2 = k != NULL && k->h2;
-    if (!closed && k != NULL && q->upload && !q->body_done) {
+    if (!closed && k != NULL && ((q->upload && !q->body_done) || q->upgrade)) {
         closed = true;
     }
     if (!closed && k != NULL && (k->closing || (c->cfg.max_idle > 0 && c->idle >= c->cfg.max_idle))) {
@@ -851,7 +853,7 @@ hx_req *hx_request_start(hx_client *c, const hx_request *r, void *user) {
 
 static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
     hx_request plain;
-    if (r->h2 && (r->upload || !r->tls)) {
+    if (r->h2 && (r->upload || r->upgrade || !r->tls)) {
         plain = *r;
         plain.h2 = false;
         r = &plain;
@@ -861,8 +863,9 @@ static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
     q->decode = r->decode;
     q->max_age = r->max_age_ns;
     q->pool = r->pool;
-    q->upload = r->upload;
-    q->chunked = r->upload && r->upload_size < 0;
+    q->upload = r->upload || r->upgrade;
+    q->upgrade = r->upgrade;
+    q->chunked = r->upload && !r->upgrade && r->upload_size < 0;
     q->fresh = r->fresh_connection;
     q->close_after = r->close_after;
     q->port = r->port;
@@ -894,10 +897,14 @@ static void start(hx_client *c, const hx_request *r, struct hx_req *q) {
         snprintf(q->key, sizeof(q->key), "%llu/%s:%u", (unsigned long long)r->pool, r->host, r->port);
     }
     hx_h1_request h = {
-        r->method,       r->target,
-        r->authority,    r->headers,
-        r->header_count, r->upload ? NULL : r->body,
-        r->body_len,     !r->upload ? HX_H1_NO_UPLOAD : r->upload_size < 0 ? HX_H1_CHUNKED : r->upload_size};
+        r->method,
+        r->target,
+        r->authority,
+        r->headers,
+        r->header_count,
+        r->upload ? NULL : r->body,
+        r->body_len,
+        !r->upload || r->upgrade ? HX_H1_NO_UPLOAD : r->upload_size < 0 ? HX_H1_CHUNKED : r->upload_size};
     int rc = hx_h1_write_request(&q->request, &h);
     if (rc != 0) {
         finish(q, rc == HX_EINVAL ? HX_ERR_INVALID : HX_ERR_NOMEM, 0, false);
@@ -1698,6 +1705,32 @@ static int h2_init(hx_client *c) {
     return 0;
 }
 
+static void raw_body(conn *k, struct hx_req *q, const char *data, size_t len) {
+    q->received += len;
+    queued *e = enqueue(k->client, q, HX_EV_BODY);
+    if (e == NULL) {
+        fail(k, HX_ERR_NOMEM, 0);
+        return;
+    }
+    e->ev.data = data;
+    e->ev.len = len;
+    e->ev.status = k->h1.status;
+    e->ev.version = k->h1.version;
+    e->pin = k;
+    k->queued++;
+    k->pinned = true;
+}
+
+static void receive_raw(conn *k, struct hx_req *q, ssize_t n) {
+    if (n == 0) {
+        finish(q, HX_OK, 0, true);
+    } else if (n < 0) {
+        fail(k, HX_ERR_RECEIVE, errno);
+    } else {
+        raw_body(k, q, k->rbuf, (size_t)n);
+    }
+}
+
 static void receive(conn *k) {
     hx_client *c = k->client;
     ssize_t n;
@@ -1714,6 +1747,10 @@ static void receive(conn *k) {
     struct hx_req *q = k->req;
     if (q == NULL) {
         conn_close(k);
+        return;
+    }
+    if (k->raw) {
+        receive_raw(k, q, n);
         return;
     }
     if (n <= 0) {
@@ -1745,6 +1782,13 @@ static void receive(conn *k) {
         at += used;
         q->received += used;
         for (int i = 0; i < count; i++) {
+            if (events[i].type == HX_H1_DONE && q->upgrade && k->h1.status == 101) {
+                k->raw = true;
+                if (at < (size_t)n) {
+                    raw_body(k, q, k->rbuf + at, (size_t)n - at);
+                }
+                return;
+            }
             if (events[i].type == HX_H1_DONE) {
                 if (k->decoding) {
                     if (flush_decoded(k, q) == -1) {

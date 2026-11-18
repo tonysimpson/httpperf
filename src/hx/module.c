@@ -6,12 +6,14 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <strings.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "../../hx/include/hx.h"
 #include "../../hx/src/buf.h"
 #include "../../hx/src/cookie.h"
+#include "../../hx/src/ws.h"
 #include "../ae/ae.h"
 #include "../parse_headers.h"
 
@@ -197,6 +199,9 @@ struct Request {
     size_t ca_pem_len;
     uint64_t tls_cache;
     bool h2;
+    bool websocket, ws_open, ws_bad;
+    hx_ws_writer ws_out;
+    hx_ws_reader ws_in;
     char *path;
 };
 
@@ -613,6 +618,68 @@ static void stream_finish(EventLoop *loop, Request *r) {
     request_decref(held);
 }
 
+static void ring_take(Upload *u, char *dst, size_t n) {
+    size_t first = STREAM_BUFFER - u->head < n ? STREAM_BUFFER - u->head : n;
+    memcpy(dst, u->ring + u->head, first);
+    memcpy(dst + first, u->ring, n - first);
+    u->head = (u->head + n) % STREAM_BUFFER;
+    u->len -= n;
+}
+
+static bool ws_pump(Request *r, Upload *u) {
+    hx_ws_writer *w = &r->ws_out;
+    bool any = false;
+    char buf[16384];
+    for (;;) {
+        if (w->left == 0) {
+            if (u->len < 12) {
+                return any;
+            }
+            uint32_t flags;
+            uint64_t length;
+            ring_take(u, (char *)&flags, sizeof(flags));
+            ring_take(u, (char *)&length, sizeof(length));
+            uint8_t head[14];
+            size_t n = hx_ws_begin_frame(w, head, flags, length);
+            hx_request_send(r->hx, (const char *)head, n);
+            any = true;
+            continue;
+        }
+        if (u->len == 0) {
+            return any;
+        }
+        size_t n = u->len < w->left ? u->len : (size_t)w->left;
+        n = n < sizeof(buf) ? n : sizeof(buf);
+        ring_take(u, buf, n);
+        hx_ws_mask(w, buf, n);
+        hx_request_send(r->hx, buf, n);
+        u->total += (long long)n;
+        any = true;
+    }
+}
+
+typedef struct {
+    EventLoop *loop;
+    Request *r;
+} WsTarget;
+
+static void ws_record(void *ctx, uint32_t flags, const char *data, size_t len) {
+    WsTarget *t = ctx;
+    uint32_t head[2] = {flags, (uint32_t)len};
+    stream_append(t->loop, t->r, (const char *)head, sizeof(head));
+    if (len > 0) {
+        stream_append(t->loop, t->r, data, len);
+    }
+}
+
+static void ws_receive(EventLoop *loop, Request *r, const char *data, size_t len) {
+    WsTarget t = {loop, r};
+    if (!r->ws_bad && hx_ws_read(&r->ws_in, data, len, ws_record, &t) == -1) {
+        r->ws_bad = true;
+        hx_request_cancel(r->hx);
+    }
+}
+
 static void upload_pump(EventLoop *loop, Request *r, bool asked) {
     Upload *u = r->upload;
     if (r->hx == NULL || r->finished) {
@@ -627,8 +694,8 @@ static void upload_pump(EventLoop *loop, Request *r, bool asked) {
         u->paused_ns += clock_ns() - u->paused_since;
         u->hungry = false;
     }
-    bool sent = u->len > 0;
-    while (u->len > 0) {
+    bool sent = r->websocket ? ws_pump(r, u) : u->len > 0;
+    while (!r->websocket && u->len > 0) {
         size_t n = STREAM_BUFFER - u->head < u->len ? STREAM_BUFFER - u->head : u->len;
         hx_request_send(r->hx, u->ring + u->head, n);
         u->head = (u->head + n) % STREAM_BUFFER;
@@ -709,6 +776,7 @@ again:
             }
             if (e->type == HX_EV_HEADERS) {
                 slot_mode(loop, r, e->version);
+                r->ws_open = r->websocket && e->status == 101;
                 r->header.len = 0;
                 hx_buf_append(&r->header, e->data, e->len);
                 if (r->session != NULL) {
@@ -723,7 +791,9 @@ again:
                 }
             } else if (e->type == HX_EV_BODY) {
                 r->body_bytes += e->len;
-                if (r->stream != NULL) {
+                if (r->ws_open) {
+                    ws_receive(loop, r, e->data, e->len);
+                } else if (r->stream != NULL) {
                     stream_append(loop, r, e->data, e->len);
                 } else if (!r->discard_body) {
                     hx_buf_append(&r->received, e->data, e->len);
@@ -733,6 +803,9 @@ again:
                     upload_pump(loop, r, true);
                 }
             } else {
+                if (r->ws_bad) {
+                    e->error = HX_ERR_RECEIVE;
+                }
                 r->done = *e;
                 r->done.data = NULL;
                 r->finished = true;
@@ -1177,7 +1250,8 @@ static void begin_request(EventLoop *loop, Request *r) {
         .idle_timeout_ns = r->idle_timeout_ns,
         .timeout_ns = r->timeout_ns,
         .connect_timeout_ns = r->connect_timeout_ns,
-        .decode = true,
+        .decode = !r->websocket,
+        .upgrade = r->websocket,
         .max_age_ns = r->max_age_ns,
         .upload = r->upload != NULL,
         .upload_size = r->upload_size,
@@ -2052,6 +2126,30 @@ static char *basic_auth(const char *user, const char *password) {
     return header;
 }
 
+static int add_header(Request *r, char *header);
+
+static int add_websocket_headers(Request *r) {
+    unsigned char key[18] = {0};
+    if (getrandom(key, 16, 0) != 16) {
+        return -1;
+    }
+    char header[64];
+    char *o = header + sprintf(header, "Sec-WebSocket-Key: ");
+    for (size_t i = 0; i < 16; i += 3) {
+        unsigned v = key[i] << 16 | key[i + 1] << 8 | key[i + 2];
+        *o++ = BASE64[v >> 18 & 63];
+        *o++ = BASE64[v >> 12 & 63];
+        *o++ = i + 1 < 16 ? BASE64[v >> 6 & 63] : '=';
+        *o++ = i + 2 < 16 ? BASE64[v & 63] : '=';
+    }
+    *o = '\0';
+    r->websocket = true;
+    return add_header(r, strdup("Upgrade: websocket")) == 0 && add_header(r, strdup("Connection: Upgrade")) == 0 &&
+                   add_header(r, strdup("Sec-WebSocket-Version: 13")) == 0 && add_header(r, strdup(header)) == 0
+               ? 0
+               : -1;
+}
+
 static char *copy(const char *s, size_t len) {
     char *out = malloc(len + 1);
     if (out != NULL) {
@@ -2068,8 +2166,13 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
             return -1;
         }
     }
-    bool tls = strncasecmp(url, "https://", 8) == 0;
-    if (!tls && strncasecmp(url, "http://", 7) != 0) {
+    static const char *const schemes[] = {"http://", "https://", "ws://", "wss://"};
+    int which = -1;
+    for (int i = 0; i < 4 && which < 0; i++) {
+        which = strncasecmp(url, schemes[i], strlen(schemes[i])) == 0 ? i : -1;
+    }
+    bool tls = which == 1 || which == 3;
+    if (which < 0) {
         size_t n = strspn(url, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-");
         if (n == 0 || url[n] != ':') {
             return E_URL_MALFORMAT;
@@ -2080,7 +2183,7 @@ static int parse_url(Request *r, const char *url, char **user, char **password) 
         return r->host != NULL && r->target != NULL ? 0 : E_OUT_OF_MEMORY;
     }
     r->tls = tls;
-    const char *scheme = tls ? "https://" : "http://";
+    const char *scheme = schemes[which];
     const long default_port = tls ? 443 : 80;
     const char *authority = url + strlen(scheme);
     const char *end = authority + strcspn(authority, "/?#");
@@ -2375,8 +2478,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
                                      &discard_body, &stream, &upload_size, &websocket)) {
         return NULL;
     }
-    if (websocket) {
-        PyErr_SetString(PyExc_NotImplementedError, "WebSockets aren't on the hx backend yet");
+    if (websocket && (!stream || upload_size < -1)) {
+        PyErr_SetString(PyExc_ValueError, "a websocket needs stream and upload_size");
         return NULL;
     }
     if (cookies != Py_None && !PyTuple_CheckExact(cookies)) {
@@ -2438,7 +2541,8 @@ static PyObject *Session_request(Session *self, PyObject *args, PyObject *kwds) 
         password = strdup(p);
     }
     bool ok = code == 0 && (has_accept || add_header(r, strdup("Accept: */*")) == 0) &&
-              (has_encoding || add_header(r, strdup("Accept-Encoding: deflate, gzip")) == 0) &&
+              (has_encoding || websocket || add_header(r, strdup("Accept-Encoding: deflate, gzip")) == 0) &&
+              (!websocket || add_websocket_headers(r) == 0) &&
               (user == NULL || add_header(r, basic_auth(user, password != NULL ? password : "")) == 0);
     free(user);
     free(password);
@@ -3068,7 +3172,7 @@ PyMODINIT_FUNC PyInit__httpperf_hx(void) {
     if (PyModule_AddObject(m, "EventLoop", (PyObject *)&EventLoopType) < 0 ||
         PyModule_AddObject(m, "Session", (PyObject *)&SessionType) < 0 ||
         PyModule_AddObject(m, "Response", (PyObject *)&ResponseType) < 0 ||
-        PyModule_AddIntConstant(m, "websockets", 0) < 0) {
+        PyModule_AddIntConstant(m, "websockets", 1) < 0) {
         Py_DECREF(m);
         return NULL;
     }
