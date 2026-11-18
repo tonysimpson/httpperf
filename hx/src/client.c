@@ -144,6 +144,7 @@ struct hx_req {
     lookup *lookup;
     struct hx_req *dns_next;
     struct hx_req *prev, *next;
+    struct hx_req *retired_next;
 };
 
 typedef struct {
@@ -167,6 +168,7 @@ struct hx_client {
     size_t queue_len, queue_cap, queue_pos;
     conn **released;
     size_t released_len, released_cap;
+    struct hx_req *retired;
     int64_t timer;
     hx_dns *dns;
     uint64_t next_lookup_id;
@@ -2003,7 +2005,16 @@ static bool release_later(hx_client *c, conn *k) {
     return true;
 }
 
+static void free_retired(hx_client *c) {
+    while (c->retired != NULL) {
+        struct hx_req *q = c->retired;
+        c->retired = q->retired_next;
+        req_free(q);
+    }
+}
+
 int hx_client_events(hx_client *c, hx_event *out, int max) {
+    free_retired(c);
     size_t released = c->released_len;
     for (size_t i = 0; i < released; i++) {
         conn *k = c->released[i];
@@ -2028,7 +2039,8 @@ int hx_client_events(hx_client *c, hx_event *out, int max) {
             release_later(c, e->pin);
         }
         if (e->done != NULL) {
-            req_free(e->done);
+            e->done->retired_next = c->retired;
+            c->retired = e->done;
         }
     }
     if (c->queue_pos == c->queue_len) {
@@ -2093,6 +2105,13 @@ void hx_client_free(hx_client *c) {
         UNLINK(c->reqs, q);
         req_free(q);
     }
+    free_retired(c);
+    for (size_t i = 0; i < c->released_len; i++) {
+        if (c->released[i]->state == CONN_CLOSED) {
+            conn_free(c->released[i]);
+        }
+    }
+    c->released_len = 0;
     while (c->conns != NULL) {
         conn *k = c->conns;
         k->pinned = false;
@@ -2104,11 +2123,6 @@ void hx_client_free(hx_client *c) {
     for (size_t i = c->queue_pos; i < c->queue_len; i++) {
         if (c->queue[i].done != NULL) {
             req_free(c->queue[i].done);
-        }
-    }
-    for (size_t i = 0; i < c->released_len; i++) {
-        if (c->released[i]->state == CONN_CLOSED) {
-            conn_free(c->released[i]);
         }
     }
     hx_tls_free(&c->tls);

@@ -270,6 +270,34 @@ static void test_a_get_gives_status_body_and_done(void) {
     finish_client(c);
 }
 
+static bool done_in_next_batch(hx_client *c) {
+    for (int64_t end = clock_ns(NULL) + 2000000000; clock_ns(NULL) < end;) {
+        hx_event events[16];
+        int count = hx_client_events(c, events, 16);
+        for (int i = 0; i < count; i++) {
+            if (events[i].type == HX_EV_DONE) {
+                return true;
+            }
+        }
+        struct epoll_event ready[16];
+        int n = epoll_wait(the_loop.epoll, ready, 16, 10);
+        for (int i = 0; i < n; i++) {
+            hx_client_on_socket(c, ready[i].data.fd, HX_READ | HX_WRITE);
+        }
+    }
+    return false;
+}
+
+static void test_a_finished_request_refuses_more_body_until_the_next_events_call(void) {
+    hx_client *c = client(0);
+    hx_request r = get("/");
+    hx_req *q = hx_request_start(c, &r, NULL);
+    CHECK(done_in_next_batch(c));
+    CHECK(hx_request_send(q, "x", 1) == -1 && hx_request_end_body(q) == -1);
+    hx_request_cancel(q);
+    finish_client(c);
+}
+
 static void test_the_next_request_reuses_the_connection(void) {
     hx_client *c = client(0);
     outcome a = {0}, b = {0};
@@ -734,6 +762,7 @@ static void test_an_upgraded_connection_carries_raw_bytes_both_ways(void) {
 int main(void) {
     start_server();
     test_a_get_gives_status_body_and_done();
+    test_a_finished_request_refuses_more_body_until_the_next_events_call();
     test_the_next_request_reuses_the_connection();
     test_a_fresh_connection_is_not_reused();
     test_another_pool_gets_its_own_connection();
