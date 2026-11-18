@@ -164,6 +164,11 @@ static void test_a_status_without_a_reason(void) {
     CHECK(strcmp(r.head, "200 11 HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n") == 0);
 }
 
+static void test_an_http_1_0_status_line_keeps_its_version(void) {
+    result r = parse("HTTP/1.0 404 Not Found\r\n\r\n", 1000, false, 8);
+    CHECK(strcmp(r.head, "404 10 HTTP/1.0 404 Not Found\r\n\r\n") == 0);
+}
+
 static void test_a_second_response_on_the_connection_is_parsed(void) {
     const char *two =
         "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 404 Not Found\r\nContent-Length: 1\r\n\r\nb";
@@ -201,6 +206,7 @@ int main(void) {
     test_a_body_can_end_with_the_connection();
     test_bytes_after_the_response_are_left();
     test_a_status_without_a_reason();
+    test_an_http_1_0_status_line_keeps_its_version();
     test_a_second_response_on_the_connection_is_parsed();
     test_garbage_is_an_error();
     test_a_response_cut_short_is_an_error();

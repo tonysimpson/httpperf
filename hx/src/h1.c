@@ -70,6 +70,15 @@ static int start_line(hx_h1 *h) {
         return 0;
     }
     h->line_started = true;
+    unsigned minor = h->parser.http_minor, status = h->parser.status_code;
+    if (h->parser.http_major == 1 && minor <= 9 && status >= 100 && status <= 999) {
+        char fast[] = "HTTP/1.0 000 ";
+        fast[7] = (char)('0' + minor);
+        fast[9] = (char)('0' + status / 100);
+        fast[10] = (char)('0' + status / 10 % 10);
+        fast[11] = (char)('0' + status % 10);
+        return append(h, fast, sizeof(fast) - 1);
+    }
     char line[32];
     hx_text t = hx_text_on(line, sizeof(line));
     hx_text_str(&t, "HTTP/");
