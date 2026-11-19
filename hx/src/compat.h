@@ -1,9 +1,6 @@
 #ifndef HX_COMPAT_H
 #define HX_COMPAT_H
 
-/* Portable stand-ins for the Linux-only calls hx uses, so it also builds on
-   macOS and the BSDs. */
-
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -12,14 +9,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#if defined(__linux__)
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#define HX_ARC4RANDOM 1
+#else
 #include <sys/random.h>
 #endif
 
-/* Fills buf with len cryptographically random bytes. Returns 0, or -1 on
-   failure. */
 static inline int hx_random_bytes(void *buf, size_t len) {
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#ifdef HX_ARC4RANDOM
     arc4random_buf(buf, len);
     return 0;
 #else
@@ -27,9 +24,6 @@ static inline int hx_random_bytes(void *buf, size_t len) {
 #endif
 }
 
-/* socket(), returning a non-blocking, close-on-exec socket. Linux does both in
-   one call with SOCK_NONBLOCK and SOCK_CLOEXEC; elsewhere they're set with
-   fcntl afterwards. */
 static inline int hx_open_socket(int domain, int type, int protocol) {
 #if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
     return socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
