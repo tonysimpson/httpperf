@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import concurrent.futures
+import copy
 import inspect
 import json
 import math
@@ -134,9 +135,15 @@ class Plan:
         self.rate = rate
         self.workers = workers
         self.duration = duration
-        self.t_start = time.monotonic()
+        self.t_start = time.time()
         self.t_meas = self.t_start + warmup
         self.t_end = self.t_meas + duration
+
+    def local(self):
+        shift = time.monotonic() - time.time()
+        plan = copy.copy(self)
+        plan.t_start, plan.t_meas, plan.t_end = self.t_start + shift, self.t_meas + shift, self.t_end + shift
+        return plan
 
 
 def share(total, workers, index):
@@ -176,7 +183,7 @@ def close():
 
 def run_step(plan):
     worker = local.worker
-    return worker.loop.run_until_complete(worker.run(plan))
+    return worker.loop.run_until_complete(worker.run(plan.local()))
 
 
 class Worker:

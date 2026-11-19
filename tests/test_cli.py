@@ -1,9 +1,10 @@
 import json
 import sys
+import time
 
 import pytest
 
-from httpperf._cli import Histogram, best_step, duration, main, notes
+from httpperf._cli import Histogram, Plan, best_step, duration, main, notes
 
 QUICK = ["-t", "1", "-w", "100ms", "-d", "300ms"]
 
@@ -18,6 +19,11 @@ def script(tmp_path, source):
     path = tmp_path / "script.py"
     path.write_text(source)
     return str(path)
+
+
+def test_a_plan_starts_now_on_the_workers_clock():
+    plan = Plan(1, None, 1, 0.3, 0.1).local()
+    assert plan.t_start == pytest.approx(time.monotonic(), abs=0.05)
 
 
 @pytest.mark.parametrize("text, seconds", [("500ms", 0.5), ("10s", 10), ("2m", 120), ("3", 3)])
