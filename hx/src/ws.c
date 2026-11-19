@@ -1,6 +1,6 @@
 #include "ws.h"
 
-#include <sys/random.h>
+#include "compat.h"
 
 static uint8_t opcode(hx_ws_writer *w, uint32_t flags, bool *fin) {
     *fin = true;
@@ -36,7 +36,7 @@ size_t hx_ws_begin_frame(hx_ws_writer *w, uint8_t out[14], uint32_t flags, uint6
             out[n++] = (uint8_t)(len >> (i * 8));
         }
     }
-    if (getrandom(w->mask, sizeof(w->mask), 0) != (ssize_t)sizeof(w->mask)) {
+    if (hx_random_bytes(w->mask, sizeof(w->mask)) != 0) {
         w->mask[0] = (uint8_t)(len * 31 + 7);
     }
     for (int i = 0; i < 4; i++) {

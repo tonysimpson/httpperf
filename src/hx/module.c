@@ -6,7 +6,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <strings.h>
-#include <sys/random.h>
+#include "../../hx/src/compat.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -2158,7 +2158,7 @@ static int add_header(Request *r, char *header);
 
 static int add_websocket_headers(Request *r) {
     unsigned char key[18] = {0};
-    if (getrandom(key, 16, 0) != 16) {
+    if (hx_random_bytes(key, 16) != 0) {
         return -1;
     }
     char header[64];

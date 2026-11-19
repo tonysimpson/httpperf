@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "../include/hx.h"
+#include "compat.h"
 #include "decode.h"
 #include "dns.h"
 #include "h1.h"
@@ -703,8 +704,7 @@ static int connect_next(conn *k) {
     while (k->addr_next < k->addr_count) {
         int i = k->addr_next++;
         struct sockaddr *sa = (struct sockaddr *)&k->addrs[i];
-        int fd =
-            socket(sa->sa_family, (k->http == HX_HTTP3 ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        int fd = hx_open_socket(sa->sa_family, k->http == HX_HTTP3 ? SOCK_DGRAM : SOCK_STREAM, 0);
         if (fd < 0) {
             k->connect_errno = errno;
             continue;
