@@ -2,7 +2,7 @@ name: test
 
 on:
   push:
-    branches: [main, macos-ci]
+    branches: [main]
     paths-ignore: ["README.md", "docs/**"]
   pull_request:
     paths-ignore: ["README.md", "docs/**"]
@@ -78,20 +78,12 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
       - run: brew install curl libnghttp2 libngtcp2 libnghttp3
       - run: |
-          brew deps libngtcp2 curl
-          otool -L "$(brew --prefix libngtcp2)"/lib/libngtcp2_crypto_ossl*.dylib
           ssl=$(brew deps libngtcp2 | grep '^openssl' | head -1)
-          echo "using $ssl"
-          echo "CFLAGS=-g -I$(brew --prefix curl)/include -I$(brew --prefix $ssl)/include -I$(brew --prefix)/include" >> "$GITHUB_ENV"
+          echo "CFLAGS=-I$(brew --prefix curl)/include -I$(brew --prefix $ssl)/include -I$(brew --prefix)/include" >> "$GITHUB_ENV"
           echo "LDFLAGS=-L$(brew --prefix curl)/lib -L$(brew --prefix $ssl)/lib -L$(brew --prefix)/lib" >> "$GITHUB_ENV"
       - run: make test DEPS= PY_VERSION=3.13
       - run: .venv/bin/python -c "import httpperf._httpperf as m; assert m.websockets, 'no WebSockets'; print(hex(m.libcurl_version_num))"
       - run: HTTPPERF_BACKEND=hx .venv/bin/python -c "import httpperf; httpperf.Session(http_version='HTTP/3')"
-      - if: failure()
-        run: >-
-          HTTPPERF_BACKEND=hx lldb --batch -o "process handle SIGALRM SIGPIPE SIGUSR1 SIGCHLD -n false -p true -s false"
-          -o run -o continue -o "bt all" -- .venv/bin/python -m pytest -v -p no:cacheprovider -p no:timeout -x tests 2>&1
-          | grep -v PASSED | tail -250
 
   lint:
     runs-on: ubuntu-24.04

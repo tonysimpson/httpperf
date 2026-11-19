@@ -33,6 +33,15 @@ sudo apt install libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev   # D
 pip install httpperf
 ```
 
+On macOS, with Homebrew, build against the OpenSSL that Homebrew's ngtcp2 uses, so that hx has HTTP/3 and only one OpenSSL is loaded:
+
+```sh
+brew install curl libnghttp2 libngtcp2 libnghttp3
+ssl=$(brew deps libngtcp2 | grep '^openssl' | head -1)
+CFLAGS="-I$(brew --prefix curl)/include -I$(brew --prefix $ssl)/include -I$(brew --prefix)/include" \
+LDFLAGS="-L$(brew --prefix curl)/lib -L$(brew --prefix $ssl)/lib -L$(brew --prefix)/lib" pip install httpperf
+```
+
 To build against your own libcurl even where a wheel exists, skip the wheel, point the build at it and make sure it is found at run time:
 
 ```sh
