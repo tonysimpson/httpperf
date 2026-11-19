@@ -27,9 +27,9 @@ static inline int hx_random_bytes(void *buf, size_t len) {
 #endif
 }
 
-/* socket(), returning a non-blocking, close-on-exec socket that never raises
-   SIGPIPE. Linux does the first two in one call with SOCK_NONBLOCK and
-   SOCK_CLOEXEC; elsewhere they're set with fcntl afterwards. */
+/* socket(), returning a non-blocking, close-on-exec socket. Linux does both in
+   one call with SOCK_NONBLOCK and SOCK_CLOEXEC; elsewhere they're set with
+   fcntl afterwards. */
 static inline int hx_open_socket(int domain, int type, int protocol) {
 #if defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
     return socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
@@ -45,11 +45,6 @@ static inline int hx_open_socket(int domain, int type, int protocol) {
         errno = saved;
         return -1;
     }
-#ifdef SO_NOSIGPIPE
-    /* MSG_NOSIGNAL covers hx's own send() calls, but not OpenSSL's writes */
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-#endif
     return fd;
 #endif
 }
