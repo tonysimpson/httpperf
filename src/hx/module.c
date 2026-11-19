@@ -6,12 +6,12 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <strings.h>
-#include "../../hx/src/compat.h"
 #include <time.h>
 #include <unistd.h>
 
 #include "../../hx/include/hx.h"
 #include "../../hx/src/buf.h"
+#include "../../hx/src/compat.h"
 #include "../../hx/src/cookie.h"
 #include "../../hx/src/ws.h"
 #include "../ae/ae.h"
