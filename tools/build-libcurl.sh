@@ -4,7 +4,15 @@
 set -eux
 
 PREFIX=${PREFIX:-/usr/local}
-JOBS=${JOBS:-$(nproc)}
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN)}
+SYMBOL_VERSIONING=
+if [ "$(uname)" = Linux ]; then
+    SYMBOL_VERSIONING="-DENABLE_SYMBOL_VERSIONING=ON -DSYMBOL_VERSION_NAMESPACE=HTTPPERF"
+fi
+
+sha256_check() {
+    if command -v sha256sum >/dev/null; then sha256sum -c -; else shasum -a 256 -c -; fi
+}
 
 AWSLC_VERSION=5.12.0
 AWSLC_SHA256=52c7f98ffd296d267cc015ad4653d1ffae399db65b14421da4f5f7efc44becd2
@@ -25,21 +33,21 @@ fi
 
 cd "$(mktemp -d)"
 curl -fsSLo aws-lc.tar.gz "https://github.com/aws/aws-lc/archive/refs/tags/v$AWSLC_VERSION.tar.gz"
-echo "$AWSLC_SHA256  aws-lc.tar.gz" | sha256sum -c -
+echo "$AWSLC_SHA256  aws-lc.tar.gz" | sha256_check
 curl -fsSLo nghttp2.tar.xz "https://github.com/nghttp2/nghttp2/releases/download/v$NGHTTP2_VERSION/nghttp2-$NGHTTP2_VERSION.tar.xz"
-echo "$NGHTTP2_SHA256  nghttp2.tar.xz" | sha256sum -c -
+echo "$NGHTTP2_SHA256  nghttp2.tar.xz" | sha256_check
 curl -fsSLo nghttp3.tar.xz "https://github.com/ngtcp2/nghttp3/releases/download/v$NGHTTP3_VERSION/nghttp3-$NGHTTP3_VERSION.tar.xz"
-echo "$NGHTTP3_SHA256  nghttp3.tar.xz" | sha256sum -c -
+echo "$NGHTTP3_SHA256  nghttp3.tar.xz" | sha256_check
 curl -fsSLo ngtcp2.tar.xz "https://github.com/ngtcp2/ngtcp2/releases/download/v$NGTCP2_VERSION/ngtcp2-$NGTCP2_VERSION.tar.xz"
-echo "$NGTCP2_SHA256  ngtcp2.tar.xz" | sha256sum -c -
+echo "$NGTCP2_SHA256  ngtcp2.tar.xz" | sha256_check
 curl -fsSLo curl.tar.gz "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
-echo "$CURL_SHA256  curl.tar.gz" | sha256sum -c -
+echo "$CURL_SHA256  curl.tar.gz" | sha256_check
 
 tar xf aws-lc.tar.gz
 cmake -S "aws-lc-$AWSLC_VERSION" -B aws-lc-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-    -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF -DBUILD_TOOL=OFF \
+    -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_INSTALL_NAME_DIR="$PREFIX/lib" -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF -DBUILD_TOOL=OFF \
     -DDISABLE_GO=ON -DDISABLE_PERL=ON \
-    -DENABLE_PRE_SONAME_BUILD=OFF -DENABLE_SYMBOL_VERSIONING=ON -DSYMBOL_VERSION_NAMESPACE=HTTPPERF
+    -DENABLE_PRE_SONAME_BUILD=OFF $SYMBOL_VERSIONING
 cmake --build aws-lc-build -j"$JOBS"
 cmake --install aws-lc-build
 

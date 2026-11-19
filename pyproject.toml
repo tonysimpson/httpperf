@@ -64,6 +64,9 @@ test-command = [
 manylinux-x86_64-image = "manylinux_2_34"
 manylinux-aarch64-image = "manylinux_2_34"
 
+[tool.cibuildwheel.macos]
+environment = { PREFIX = "/tmp/httpperf-deps", CPATH = "/tmp/httpperf-deps/include", LDFLAGS = "-L/tmp/httpperf-deps/lib", MACOSX_DEPLOYMENT_TARGET = "11.0" }
+
 [tool.ruff]
 line-length = 120
 target-version = "py38"

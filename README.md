@@ -24,7 +24,7 @@ Bytes are read off the wire as they arrive, whatever Python is doing. If Python 
 pip install httpperf
 ```
 
-Wheels are published for Linux on x86_64 and aarch64, for Python 3.9 to 3.15 and free-threaded 3.14 and 3.15 (`python3.14t`, `python3.15t`), with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine). They include their own libcurl, with HTTP/2 and HTTP/3.
+Wheels are published for Python 3.9 to 3.15 and free-threaded 3.14 and 3.15 (`python3.14t`, `python3.15t`): for Linux on x86_64 and aarch64, with glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and later) or musl (Alpine), and for macOS 11 or later on Apple silicon and Intel. They include their own libcurl, with HTTP/2 and HTTP/3.
 
 Anywhere else, including Python 3.8, pip builds from source against the system's libcurl, which needs a C compiler and the development headers for libcurl, OpenSSL, nghttp2 and zlib. That libcurl decides whether HTTP/3 is available: `curl -V` lists `HTTP3` under Features when it does.
 
@@ -33,7 +33,7 @@ sudo apt install libcurl4-openssl-dev libssl-dev libnghttp2-dev zlib1g-dev   # D
 pip install httpperf
 ```
 
-On macOS, with Homebrew, build against the OpenSSL that Homebrew's ngtcp2 uses, so that hx has HTTP/3 and only one OpenSSL is loaded:
+To build from source on macOS with Homebrew, build against the OpenSSL that Homebrew's ngtcp2 uses, so that hx has HTTP/3 and only one OpenSSL is loaded:
 
 ```sh
 brew install curl libnghttp2 libngtcp2 libnghttp3
