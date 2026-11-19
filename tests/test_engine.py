@@ -3,6 +3,7 @@ import errno
 import gc
 import os
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -19,9 +20,9 @@ REFUSED = "http://127.0.0.1:1/"
 
 def open_fds():
     fds = 0
-    for fd in os.listdir("/proc/self/fd"):
+    for fd in os.listdir("/dev/fd"):
         try:
-            fds += not os.readlink("/proc/self/fd/" + fd).startswith("socket:")
+            fds += not stat.S_ISSOCK(os.fstat(int(fd)).st_mode)
         except OSError:
             pass
     return fds

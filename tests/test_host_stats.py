@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 import httpperf
@@ -35,7 +37,7 @@ async def test_errors_are_counted_per_host():
 async def test_every_host_is_kept():
     async with httpperf.Engine(host_stats=True) as engine:
         session = httpperf.Session(engine=engine)
-        for i in range(1, 201):
-            with pytest.raises(httpperf.RequestError):
-                await session.get("http://127.0.0.%d:1/" % i)
+        urls = ["http://127.0.0.%d:1/" % i for i in range(1, 201)]
+        results = await asyncio.gather(*(session.get(url, connect_timeout=0.5) for url in urls), return_exceptions=True)
+        assert all(isinstance(r, httpperf.RequestError) for r in results)
         assert len(engine.host_stats()) == 200

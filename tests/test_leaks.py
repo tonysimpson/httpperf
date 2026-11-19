@@ -5,10 +5,12 @@ import sys
 import pytest
 
 PROBE = """
-import asyncio, gc, json, sys
+import asyncio, gc, json, os, subprocess, sys
 import httpperf
 
 def rss():
+    if not os.path.exists("/proc/self/status"):
+        return int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])) * 1024
     with open("/proc/self/status") as f:
         for line in f:
             if line.startswith("VmRSS"):

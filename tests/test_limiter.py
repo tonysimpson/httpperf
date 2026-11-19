@@ -48,9 +48,9 @@ def refused_urls(n):
     return urls
 
 
-async def fail(session, url):
+async def fail(session, url, **options):
     with pytest.raises(httpperf.RequestError):
-        await session.get(url)
+        await session.get(url, **options)
 
 
 @pytest.fixture
@@ -198,7 +198,7 @@ async def test_host_keys_of_unusual_urls():
     ]
     async with limited_session(1) as s:
         for url in urls * 2:
-            await fail(s, url)
+            await fail(s, url, connect_timeout=0.2)
         assert sorted(limiter_state(s)["hosts"]) == [
             "http://127.0.0.1:9",
             "http://127.0.0.1:90",

@@ -11,6 +11,9 @@ from helpers import BIG
 
 import httpperf
 
+if sys.platform == "darwin":
+    socket.getfqdn = lambda name="": name
+
 
 class TestHTTPServer(http.server.ThreadingHTTPServer):
     request_queue_size = 1024
@@ -158,6 +161,13 @@ class Wire:
 
 @pytest.fixture
 def wire():
+    w = Wire()
+    yield w
+    w.sock.close()
+
+
+@pytest.fixture
+def other_wire():
     w = Wire()
     yield w
     w.sock.close()

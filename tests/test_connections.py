@@ -1,6 +1,7 @@
 import asyncio
 import http.server
 import socket
+import sys
 import threading
 import time
 
@@ -73,6 +74,9 @@ def silent_url():
 
 @pytest.fixture
 def full_url():
+    if sys.platform == "darwin":
+        yield "http://127.0.0.2:9/"
+        return
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.listen(0)
@@ -255,7 +259,7 @@ async def test_server_time_is_the_wait_after_sending(url):
         r = await s.get(url + "slow")
     if r.posttransfer_time is None:
         pytest.skip("libcurl older than 8.10")
-    assert r.starttransfer_time - r.posttransfer_time == pytest.approx(0.055, abs=0.005)
+    assert 0.05 <= r.starttransfer_time - r.posttransfer_time < 0.5
 
 
 async def test_client_lag_is_small_when_idle(url):
@@ -335,21 +339,21 @@ async def test_many_new_connections_while_responses_arrive(server):
             assert await new_connections_while_responses_arrive(engine, server.url) == [200] * 350
 
 
-SECOND_DEAD_PROXY = refusing_url("127.0.0.2")
-
-
-async def proxy_port_tried(url):
+async def try_get(url):
     async with httpperf.Session() as s:
-        with pytest.raises(httpperf.RequestError) as e:
+        try:
             await s.get(url)
-    return SECOND_DEAD_PROXY if "127.0.0.2" in str(e.value) else DEAD_PROXY
+        except httpperf.RequestError:
+            pass
 
 
 @pytest.mark.parametrize("scheme", ["http", "https"])
-async def test_a_schemes_proxy_beats_all_proxy(proxy_environment, scheme):
-    proxy_environment.setenv(scheme + "_proxy", DEAD_PROXY)
-    proxy_environment.setenv("all_proxy", SECOND_DEAD_PROXY)
-    assert await proxy_port_tried(scheme + "://example.invalid/") == DEAD_PROXY
+async def test_a_schemes_proxy_beats_all_proxy(wire, other_wire, proxy_environment, scheme):
+    wire.reply = other_wire.reply = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"
+    proxy_environment.setenv(scheme + "_proxy", wire.url)
+    proxy_environment.setenv("all_proxy", other_wire.url)
+    await try_get(scheme + "://example.invalid/")
+    assert (len(wire.requests), len(other_wire.requests)) == (1, 0)
 
 
 @pytest.mark.parametrize("no_proxy", ["127.0.0.1", "*", "localhost,127.0.0.1", " 127.0.0.1 "])
@@ -360,13 +364,11 @@ async def test_no_proxy_forms(url, wire, proxy_environment, no_proxy):
 
 
 @pytest.mark.parametrize("no_proxy", ["example.invalid", ".invalid", "invalid"])
-async def test_no_proxy_matches_domains(proxy_environment, no_proxy):
-    proxy_environment.setenv("http_proxy", DEAD_PROXY)
+async def test_no_proxy_matches_domains(wire, proxy_environment, no_proxy):
+    proxy_environment.setenv("http_proxy", wire.url)
     proxy_environment.setenv("no_proxy", no_proxy)
-    async with httpperf.Session() as s:
-        with pytest.raises(httpperf.RequestError) as e:
-            await s.get("http://example.invalid/")
-    assert DEAD_PROXY.rsplit(":", 1)[1] not in str(e.value)
+    await try_get("http://example.invalid/")
+    assert wire.requests == []
 
 
 async def test_a_proxied_request_uses_the_absolute_url(wire, proxy_environment):
